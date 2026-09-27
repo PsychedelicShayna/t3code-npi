@@ -99,5 +99,9 @@
       "entry": ["test/fixtures/*.ts"],
       "ignoreIssues": { "src/_generated/**": ["exports", "types"] },
     },
+    "packages/effect-neopi-rpc": {
+      "includeEntryExports": true,
+      "entry": ["test/fixtures/*.ts"],
+    },
   },
 }
