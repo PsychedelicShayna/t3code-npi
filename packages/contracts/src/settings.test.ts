@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { DEFAULT_MODEL_BY_PROVIDER, NEOPI_CURRENT_MODEL, PROVIDER_DISPLAY_NAMES } from "./model.ts";
+import { RuntimeEventRaw } from "./providerRuntime.ts";
 import {
   ClientSettingsSchema,
   ClientSettingsPatch,
@@ -769,6 +771,7 @@ describe("provider enabled defaults", () => {
     expect(decoded.providers.claudeAgent.enabled).toBe(true);
     expect(decoded.providers.cursor.enabled).toBe(false);
     expect(decoded.providers.grok.enabled).toBe(false);
+    expect(decoded.providers.neopi.enabled).toBe(false);
     expect(decoded.providers.opencode.enabled).toBe(false);
   });
 
@@ -1008,4 +1011,75 @@ it("validates remote device hosts and rejects ambiguous host ids", () => {
     decodeDeviceHostSettings({ deviceHosts: [{ ...host, target: "-oProxyCommand=bad" }] }),
   ).toThrow();
   expect(() => decodeDeviceHostSettings({ deviceHosts: [{ ...host, port: 0 }] })).toThrow();
+});
+
+describe("NeoPi/OMP provider settings", () => {
+  const neopi = ProviderDriverKind.make("neopi");
+
+  it("decodes an empty config as disabled with an empty profile", () => {
+    const decoded = decodeServerSettings({});
+    expect(decoded.providers.neopi.enabled).toBe(false);
+    // makeBinaryPathSetting("npi") substitutes the command name for a missing path.
+    expect(decoded.providers.neopi.binaryPath).toBe("npi");
+    expect(decoded.providers.neopi.profile).toBe("");
+    expect(decoded.providers.neopi.launchArgs).toBe("");
+    expect(decoded.providers.neopi.customModels).toEqual([]);
+    expect(PROVIDER_DISPLAY_NAMES[neopi]).toBe("NeoPi/OMP");
+    expect(NEOPI_CURRENT_MODEL).toBe("neopi-current");
+    expect(DEFAULT_MODEL_BY_PROVIDER[neopi]).toBe(NEOPI_CURRENT_MODEL);
+  });
+
+  it("treats a blank binary path as the npi command", () => {
+    expect(
+      decodeServerSettings({ providers: { neopi: { binaryPath: "  " } } }).providers.neopi
+        .binaryPath,
+    ).toBe("npi");
+  });
+
+  it("round-trips a profile patch", () => {
+    const patch = decodeServerSettingsPatch({
+      providers: { neopi: { profile: "  work  " } },
+    });
+    expect(patch.providers?.neopi?.profile).toBe("work");
+    expect(Schema.encodeSync(ServerSettingsPatch)(patch).providers?.neopi?.profile).toBe("work");
+
+    const decoded = decodeServerSettings({ providers: { neopi: { profile: "work" } } });
+    expect(decoded.providers.neopi.profile).toBe("work");
+    expect(encodeServerSettings(decoded).providers?.neopi?.profile).toBe("work");
+  });
+
+  it("rejects unknown keys the same way grok does", () => {
+    const grok = decodeServerSettings({
+      providers: { grok: { notAField: true, enabled: true } },
+    });
+    expect(grok.providers.grok.enabled).toBe(true);
+    expect("notAField" in grok.providers.grok).toBe(false);
+
+    const neopi = decodeServerSettings({
+      providers: { neopi: { notAField: true, profile: "work" } },
+    });
+    expect(neopi.providers.neopi.profile).toBe("work");
+    expect("notAField" in neopi.providers.neopi).toBe(false);
+
+    const grokPatch = decodeServerSettingsPatch({
+      providers: { grok: { notAField: true, enabled: true } },
+    });
+    expect(grokPatch.providers?.grok?.enabled).toBe(true);
+    expect(grokPatch.providers?.grok && "notAField" in grokPatch.providers.grok).toBe(false);
+
+    const neopiPatch = decodeServerSettingsPatch({
+      providers: { neopi: { notAField: true, profile: "work" } },
+    });
+    expect(neopiPatch.providers?.neopi?.profile).toBe("work");
+    expect(neopiPatch.providers?.neopi && "notAField" in neopiPatch.providers.neopi).toBe(false);
+  });
+
+  it("accepts neopi.rpc as a raw event source", () => {
+    expect(
+      Schema.decodeSync(RuntimeEventRaw)({
+        source: "neopi.rpc",
+        payload: { type: "ready" },
+      }).source,
+    ).toBe("neopi.rpc");
+  });
 });
