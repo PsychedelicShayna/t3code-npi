@@ -1,0 +1,448 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import { strict as assert } from "node:assert";
+import { it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import type { ThreadId, TurnId } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
+import * as Sink from "effect/Sink";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "./NeoPiSessionRuntime.ts";
+
+const root = "/tmp/neopi-runtime-tests";
+const sessionDir = `${root}/neopi/sessions/default/test`;
+const sessionFile = `${sessionDir}/session.jsonl`;
+type Command = { id?: string; type: string; [key: string]: unknown };
+type Emitter = (frame: unknown) => Effect.Effect<void>;
+const testPeer = Effect.fn("testPeer")(function* (
+  handler: (cmd: Command, emit: Emitter) => Effect.Effect<void>,
+) {
+  const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+  const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+  const exited = yield* Deferred.make<string | null>();
+  const commands: Command[] = [];
+  const signals: string[] = [];
+  const emit: Emitter = (frame) =>
+    Queue.offer(stdout, new TextEncoder().encode(`${JSON.stringify(frame)}\n`)).pipe(Effect.asVoid);
+  const finish = (signal: string | null) =>
+    Effect.gen(function* () {
+      yield* Queue.end(stdout).pipe(Effect.ignore);
+      yield* Deferred.succeed(exited, signal).pipe(Effect.ignore);
+    });
+  yield* emit({ type: "ready", protocolVersion: 1, capabilities: ["rpc-ui"] });
+  yield* Effect.gen(function* () {
+    let pending = "";
+    while (true) {
+      pending += new TextDecoder().decode(yield* Queue.take(stdin));
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        const command = JSON.parse(line) as Command;
+        commands.push(command);
+        yield* handler(command, emit);
+      }
+    }
+  }).pipe(
+    Effect.catch(() => Effect.void),
+    Effect.forkScoped,
+  );
+  const handle = ChildProcessSpawner.makeHandle({
+    pid: ChildProcessSpawner.ProcessId(123),
+    exitCode: Deferred.await(exited).pipe(
+      Effect.flatMap((signal) =>
+        signal
+          ? Effect.fail(
+              PlatformError.systemError({
+                _tag: "Unknown",
+                module: "ChildProcess",
+                method: "exitCode",
+                cause: new Error(`Process interrupted due to receipt of signal: '${signal}'`),
+              }),
+            )
+          : Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+      ),
+    ),
+    isRunning: Deferred.isDone(exited).pipe(Effect.map((done) => !done)),
+    kill: (options) =>
+      Effect.gen(function* () {
+        signals.push(options?.killSignal ?? "SIGTERM");
+        if (options?.forceKillAfter) {
+          yield* Effect.sleep(options.forceKillAfter);
+          signals.push("SIGKILL");
+          yield* finish("SIGKILL");
+        } else yield* finish(options?.killSignal ?? "SIGTERM");
+      }),
+    stdin: Sink.forEach((chunk: Uint8Array) => Queue.offer(stdin, chunk)),
+    stdout: Stream.fromQueue(stdout),
+    stderr: Stream.empty,
+    all: Stream.empty,
+    getInputFd: () => Sink.drain,
+    getOutputFd: () => Stream.empty,
+    unref: Effect.succeed(Effect.void),
+  });
+  return { handle, commands, emit, finish, signals };
+});
+const answer = (cmd: Command, emit: Emitter, data: unknown = {}) =>
+  emit({ type: "response", id: cmd.id, command: cmd.type, success: true, data });
+const basicHandler = (cmd: Command, emit: Emitter) =>
+  cmd.type === "get_state"
+    ? answer(cmd, emit, { sessionId: "s1", sessionFile, messageCount: 0 })
+    : cmd.type === "get_entries"
+      ? answer(cmd, emit, { entries: [], leafId: null })
+      : answer(cmd, emit);
+const make = (
+  spawn: NeoPiRuntimeInput["spawn"],
+  cursor?: { sessionId: string; sessionFile: string; sessionDir: string; v: 1; turnBoundaries: [] },
+  hostBridge?: NeoPiRuntimeInput["hostBridge"],
+) =>
+  makeNeoPiSessionRuntime({
+    threadId: "thread-test" as ThreadId,
+    binary: "npi",
+    cwd: "/tmp",
+    t3Home: root,
+    projectId: "test",
+    runtimeMode: "approval-required",
+    spawn,
+    ...(cursor ? { cursor } : {}),
+    ...(hostBridge ? { hostBridge } : {}),
+    closeGraceMs: 20,
+  });
+const turn = (id: string) => ({ turnId: id as TurnId, text: "hello", images: [] });
+const capture = (runtime: Effect.Success<ReturnType<typeof make>>) =>
+  Effect.gen(function* () {
+    const frames: Array<Record<string, unknown>> = [];
+    yield* Stream.runForEach(runtime.frames, (frame) =>
+      Effect.sync(() => {
+        frames.push(frame as Record<string, unknown>);
+      }),
+    ).pipe(Effect.forkScoped);
+    return frames;
+  });
+const awaitOutcomes = (frames: Array<Record<string, unknown>>, count: number) =>
+  Effect.gen(function* () {
+    for (let i = 0; i < 200; i++) {
+      const outcomes = frames.filter((frame) => frame.type === "t3.turn.outcome");
+      if (outcomes.length >= count) return outcomes;
+      yield* Effect.sleep("5 millis");
+    }
+    throw new Error(
+      `Expected ${count} outcomes, observed ${frames.filter((frame) => frame.type === "t3.turn.outcome").length}`,
+    );
+  });
+
+it.live("rejects auto-resumed fresh sessions and mismatched resume ids, closing both peers", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const cursor of [
+        undefined,
+        { v: 1 as const, sessionFile, sessionId: "expected", sessionDir, turnBoundaries: [] as [] },
+      ]) {
+        const peer = yield* testPeer((cmd, emit) =>
+          cmd.type === "get_state"
+            ? answer(cmd, emit, { sessionId: "unexpected", sessionFile, messageCount: 3 })
+            : basicHandler(cmd, emit),
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle), cursor);
+        const failure = yield* runtime.start.pipe(Effect.flip);
+        assert.equal(failure.code, "identity_mismatch");
+        assert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
+        assert.ok(peer.signals.includes("SIGKILL"));
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live(
+  "settles late rejection, local response, local prompt_result and terminal agent_end exactly once",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const peer = yield* testPeer((cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type !== "prompt") return yield* basicHandler(cmd, emit);
+            if (cmd.message === "reject") {
+              yield* answer(cmd, emit);
+              yield* emit({
+                type: "response",
+                id: cmd.id,
+                command: "prompt",
+                success: false,
+                error: "denied",
+              });
+            } else if (cmd.message === "data-local")
+              yield* answer(cmd, emit, { agentInvoked: false });
+            else if (cmd.message === "event-local") {
+              yield* answer(cmd, emit);
+              yield* emit({ type: "command_output", text: "local output" });
+              yield* emit({ type: "prompt_result", id: cmd.id, agentInvoked: false });
+            } else {
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "agent_end", isTerminal: false, hasFinalResponse: true });
+              yield* emit({ type: "agent_end", isTerminal: true });
+            }
+          }),
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        for (const [i, text] of ["reject", "data-local", "event-local", "agent"].entries()) {
+          yield* runtime.startTurn({ ...turn(`turn-${i}`), text });
+          const outcomes = yield* awaitOutcomes(frames, i + 1);
+          assert.equal(outcomes[i]?.state, i === 0 ? "failed" : "completed");
+          assert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
+        }
+        assert.equal(frames.filter((frame) => frame.type === "t3.turn.outcome").length, 4);
+        assert.ok(
+          frames.findIndex((frame) => frame.type === "command_output") <
+            frames.findIndex(
+              (frame) => frame.turnId === "turn-2" && frame.type === "t3.turn.outcome",
+            ),
+        );
+        yield* runtime.stop;
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live(
+  "steers only running turns, interrupts at terminal end and captures one user boundary per prompt",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let ordinal = 0;
+        const peer = yield* testPeer((cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "get_entries")
+              return yield* answer(cmd, emit, {
+                entries: [{ type: "message", id: `user-${ordinal}`, message: { role: "user" } }],
+                leafId: `leaf-${ordinal}`,
+              });
+            if (cmd.type === "prompt") {
+              ordinal++;
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              return;
+            }
+            return yield* basicHandler(cmd, emit);
+          }),
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        assert.equal((yield* runtime.steer(turn("unused")).pipe(Effect.flip)).code, "not_running");
+        yield* runtime.startTurn(turn("t1"));
+        yield* runtime.steer(turn("steer-not-a-turn"));
+        assert.equal(
+          (yield* runtime.restart("runtime-mode-change").pipe(Effect.flip)).code,
+          "not_ready",
+        );
+        yield* peer.emit({ type: "agent_end", isTerminal: true });
+        yield* awaitOutcomes(frames, 1);
+        yield* runtime.startTurn(turn("t2"));
+        yield* runtime.interrupt;
+        yield* peer.emit({ type: "agent_end", isTerminal: true });
+        const outcomes = yield* awaitOutcomes(frames, 2);
+        assert.deepEqual(
+          outcomes.map((event) => [event.turnId, event.state]),
+          [
+            ["t1", "completed"],
+            ["t2", "interrupted"],
+          ],
+        );
+        const cursor = yield* SubscriptionRef.get(runtime.cursor);
+        assert.deepEqual(
+          cursor.turnBoundaries.map((boundary) => boundary.userEntryId),
+          ["user-1", "user-2"],
+        );
+        assert.equal(peer.commands.filter((cmd) => cmd.type === "steer").length, 1);
+        assert.equal(peer.commands.filter((cmd) => cmd.type === "abort").length, 1);
+        yield* runtime.stop;
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live("restarts with the verified cursor and updated approval mode", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peers = [yield* testPeer(basicHandler), yield* testPeer(basicHandler)];
+      const args: string[][] = [];
+      let index = 0;
+      const runtime = yield* make((cmd) =>
+        Effect.sync(() => {
+          assert.equal(cmd._tag, "StandardCommand");
+          if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
+          args.push([...cmd.args]);
+          return peers[index++]!.handle;
+        }),
+      );
+      yield* runtime.start;
+      yield* runtime.setRuntimeMode("auto");
+      assert.equal(args.length, 2);
+      assert.equal(args[1]?.[args[1]!.indexOf("--session") + 1], sessionFile);
+      assert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live(
+  "fails one running turn on unexpected process exit and cancels pending UI and host requests",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const peer = yield* testPeer((cmd, emit) =>
+          cmd.type === "prompt"
+            ? answer(cmd, emit, { agentInvoked: true })
+            : basicHandler(cmd, emit),
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("exit-turn"));
+        yield* peer.emit({
+          type: "extension_ui_request",
+          id: "ui1",
+          method: "select",
+          title: "Approve",
+        });
+        yield* peer.finish("SIGKILL");
+        const outcomes = yield* awaitOutcomes(frames, 1);
+        assert.equal(outcomes[0]?.state, "failed");
+        assert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
+        assert.ok(
+          frames.some((frame) => frame.type === "t3.session.exited" && frame.recoverable === true),
+        );
+        assert.ok(frames.some((frame) => frame.method === "cancel" && frame.targetId === "ui1"));
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGTERM", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(basicHandler);
+      const signals: AbortSignal[] = [];
+      const runtime = yield* make(() => Effect.succeed(peer.handle), undefined, {
+        definitions: [{ name: "preview", description: "preview", parameters: {} }],
+        handle: (_call, signal) =>
+          Effect.sync(() => {
+            signals.push(signal);
+          }).pipe(Effect.andThen(Effect.never)),
+      });
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* peer.emit({
+        type: "extension_ui_request",
+        id: "select-pending",
+        method: "select",
+        title: "Approve?",
+      });
+      yield* peer.emit({
+        type: "host_tool_call",
+        id: "host-pending",
+        toolCallId: "tc1",
+        toolName: "preview",
+        arguments: {},
+      });
+      for (
+        let i = 0;
+        i < 100 && (signals.length === 0 || !frames.some((frame) => frame.id === "select-pending"));
+        i++
+      )
+        yield* Effect.sleep("5 millis");
+      assert.equal(signals.length, 1);
+      yield* runtime.stop;
+      assert.equal(yield* SubscriptionRef.get(runtime.state), "stopped");
+      assert.ok(peer.signals.includes("SIGKILL"));
+      assert.equal(signals[0]?.aborted, true);
+      assert.ok(
+        frames.some((frame) => frame.method === "cancel" && frame.targetId === "select-pending"),
+      );
+      assert.ok(
+        frames.some(
+          (frame) => frame.type === "host_tool_cancel" && frame.targetId === "host-pending",
+        ),
+      );
+      assert.ok(
+        peer.commands.some(
+          (cmd) =>
+            cmd.type === "extension_ui_response" &&
+            cmd.id === "select-pending" &&
+            cmd.cancelled === true,
+        ),
+      );
+      for (let i = 0; i < 100 && !frames.some((frame) => frame.type === "t3.session.exited"); i++)
+        yield* Effect.sleep("5 millis");
+      assert.ok(
+        frames.some(
+          (frame) =>
+            frame.type === "t3.session.exited" &&
+            frame.recoverable === false &&
+            frame.signal === "SIGKILL",
+        ),
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live(
+  "defers a running mode change until the following turn and classifies streamed errors",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let ordinal = 0;
+        const handler = (cmd: Command, emit: Emitter) =>
+          Effect.gen(function* () {
+            if (cmd.type === "get_entries")
+              return yield* answer(cmd, emit, {
+                entries: [{ id: `user-${ordinal}`, type: "message", message: { role: "user" } }],
+                leafId: `leaf-${ordinal}`,
+              });
+            if (cmd.type === "prompt") {
+              ordinal++;
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          });
+        const peers = [yield* testPeer(handler), yield* testPeer(handler)];
+        const args: string[][] = [];
+        let index = 0;
+        const runtime = yield* make((cmd) =>
+          Effect.sync(() => {
+            assert.equal(cmd._tag, "StandardCommand");
+            if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
+            args.push([...cmd.args]);
+            return peers[index++]!.handle;
+          }),
+        );
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("first"));
+        const deferred = yield* runtime.setRuntimeMode("full-access").pipe(Effect.flip);
+        assert.equal(deferred.code, "runtime_mode_deferred");
+        assert.ok(deferred.message.includes("takes effect after the current turn"));
+        yield* peers[0]!.emit({
+          type: "message_update",
+          assistantMessageEvent: {
+            type: "error",
+            reason: "error",
+            error: { errorMessage: "upstream failed" },
+          },
+        });
+        yield* peers[0]!.emit({ type: "agent_end", isTerminal: true });
+        assert.equal((yield* awaitOutcomes(frames, 1))[0]?.state, "failed");
+        yield* runtime.startTurn(turn("second"));
+        assert.equal(args.length, 2);
+        assert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
+        yield* peers[1]!.emit({
+          type: "message_update",
+          assistantMessageEvent: { type: "error", reason: "aborted", error: {} },
+        });
+        yield* peers[1]!.emit({ type: "agent_end", isTerminal: true });
+        assert.equal((yield* awaitOutcomes(frames, 2))[1]?.state, "interrupted");
+        yield* runtime.stop;
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
