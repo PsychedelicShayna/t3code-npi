@@ -9,6 +9,7 @@ const object = (value: unknown): Record<string, unknown> =>
     : {};
 
 export class NeoPiRollbackError extends Error {}
+export class NeoPiRollbackIntegrityError extends NeoPiRollbackError {}
 
 /** NeoPi branch takes the user entry to REMOVE, not the entry preceding it. */
 export async function rollbackNeoPiConversation(input: {
@@ -78,14 +79,21 @@ export async function rollbackNeoPiConversation(input: {
     sessionId: state.sessionId,
     turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns),
   };
-  // The branch has already mutated the native session. Save its new identity even if
-  // NeoPi's branch hook kept the old in-memory conversation or verification fails.
+  // Save the branch identity before checking the live conversation; the adapter
+  // can then restart on the original cursor if the new session proves inconsistent.
   await onBranched?.(next);
-  const after = await readMessages(request);
-  if (JSON.stringify(after) !== JSON.stringify(retained))
-    throw new NeoPiRollbackError(
-      "NeoPi/OMP rollback integrity error: branched conversation still contains removed or unexpected messages",
+  try {
+    const after = await readMessages(request);
+    if (JSON.stringify(after) !== JSON.stringify(retained))
+      throw new NeoPiRollbackIntegrityError(
+        "NeoPi/OMP rollback integrity error: branched conversation still contains removed or unexpected messages",
+      );
+  } catch (cause) {
+    if (cause instanceof NeoPiRollbackIntegrityError) throw cause;
+    throw new NeoPiRollbackIntegrityError(
+      `NeoPi/OMP rollback integrity error: cannot verify branched conversation: ${String(cause)}`,
     );
+  }
   return next;
 }
 

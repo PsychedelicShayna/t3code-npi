@@ -296,6 +296,8 @@ for (const skipConversationRestore of [false, true])
             { id: "compact", parentId: "summary", type: "compaction", summary: "compressed" },
           ];
           let branched = false;
+          let preserveLiveMessages = skipConversationRestore;
+          const resumedSessions: string[] = [];
           const requests: string[] = [];
           let runningTurnId: TurnId | undefined;
           const runtime: NeoPiSessionRuntimeShape = {
@@ -335,7 +337,7 @@ for (const skipConversationRestore of [false, true])
                   return { sessionFile: `${home}/new.jsonl`, sessionId: "new" };
                 return {
                   messages:
-                    branched && !skipConversationRestore
+                    branched && !preserveLiveMessages
                       ? []
                       : [
                           ...entries
@@ -348,7 +350,13 @@ for (const skipConversationRestore of [false, true])
                 };
               }),
             frames: Stream.fromQueue(frames),
-            restart: () => Effect.void,
+            restart: () =>
+              Effect.gen(function* () {
+                const original = yield* SubscriptionRef.get(cursor);
+                resumedSessions.push(original.sessionFile);
+                branched = false;
+                yield* SubscriptionRef.set(state, "ready");
+              }),
             stop: Effect.void,
             setRuntimeMode: () => Effect.void,
             onSessionIdentityMayHaveChanged: Effect.void,
@@ -385,6 +393,19 @@ for (const skipConversationRestore of [false, true])
             assert.equal(rewind._tag, "Failure");
             if (rewind._tag === "Failure")
               assert.match(Cause.pretty(rewind.cause), /rollback integrity error/);
+            assert.deepEqual(resumedSessions, [`${home}/old.jsonl`]);
+            const original = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
+            assert.equal(original.sessionFile, `${home}/old.jsonl`);
+            assert.equal(original.sessionId, "old");
+            assert.equal(original.turnBoundaries.length, 1);
+            assert.deepEqual(
+              (yield* adapter.readThread(threadId)).turns.map((turn) => turn.items.length),
+              [5],
+            );
+            yield* adapter.sendTurn({ threadId, input: "retry after failed rewind" });
+            preserveLiveMessages = false;
+            const retried = yield* adapter.rollbackThread(threadId, 1);
+            assert.deepEqual(retried.turns, []);
           } else {
             assert.equal(rewind._tag, "Success");
             if (rewind._tag === "Success") assert.deepEqual(rewind.value.turns, []);
@@ -394,7 +415,6 @@ for (const skipConversationRestore of [false, true])
           assert.equal(saved.sessionFile, `${home}/new.jsonl`);
           assert.equal(saved.sessionId, "new");
           assert.deepEqual(saved.turnBoundaries, []);
-          yield* adapter.stopAll();
           const resumedState = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
           const resumedCursor = yield* SubscriptionRef.make(saved);
           const resumed = yield* makeNeoPiAdapter({
@@ -426,9 +446,7 @@ for (const skipConversationRestore of [false, true])
             runtimeMode: "auto",
             resumeCursor: saved,
           });
-          if (!skipConversationRestore)
-            assert.deepEqual((yield* resumed.readThread(threadId)).turns, []);
-          yield* resumed.stopAll();
+          assert.deepEqual((yield* resumed.readThread(threadId)).turns, []);
         }),
       ).pipe(Effect.provide(NodeServices.layer)),
   );

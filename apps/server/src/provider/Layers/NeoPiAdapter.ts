@@ -44,7 +44,11 @@ import { NEOPI_CAPABILITIES } from "../neopi/NeoPiCompatibility.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import { makeNeoPiHostToolBridge, type NeoPiHostToolBridge } from "../neopi/NeoPiHostToolBridge.ts";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "../neopi/NeoPiSessionRuntime.ts";
-import { groupNeoPiHistory, rollbackNeoPiConversation } from "../neopi/NeoPiRollback.ts";
+import {
+  groupNeoPiHistory,
+  NeoPiRollbackIntegrityError,
+  rollbackNeoPiConversation,
+} from "../neopi/NeoPiRollback.ts";
 import type {
   NeoPiResumeCursor,
   NeoPiRuntimeFrame,
@@ -676,16 +680,32 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         const cursor = yield* SubscriptionRef.get(session.runtime.cursor);
         const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
         const next = yield* Effect.tryPromise({
-          try: () =>
-            rollbackNeoPiConversation({
-              cursor,
-              numTurns,
-              request: (command) => runPromise(session.runtime.request(command)),
-              onBranched: async (branched) => {
-                await runPromise(SubscriptionRef.set(session.runtime.cursor, branched));
-                session.session = { ...session.session, resumeCursor: branched };
-              },
-            }),
+          try: async () => {
+            try {
+              return await rollbackNeoPiConversation({
+                cursor,
+                numTurns,
+                request: (command) => runPromise(session.runtime.request(command)),
+                onBranched: async (branched) => {
+                  await runPromise(SubscriptionRef.set(session.runtime.cursor, branched));
+                  session.session = { ...session.session, resumeCursor: branched };
+                },
+              });
+            } catch (cause) {
+              if (cause instanceof NeoPiRollbackIntegrityError) {
+                await runPromise(SubscriptionRef.set(session.runtime.cursor, cursor));
+                session.session = { ...session.session, resumeCursor: cursor };
+                try {
+                  await runPromise(session.runtime.restart("runtime-mode-change"));
+                } catch (restartCause) {
+                  throw new NeoPiRollbackIntegrityError(
+                    `${cause.message}; restoring original session failed: ${String(restartCause)}`,
+                  );
+                }
+              }
+              throw cause;
+            }
+          },
           catch: (cause) =>
             rpcError(
               threadId,
