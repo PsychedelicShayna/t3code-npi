@@ -147,6 +147,8 @@ export function mapCoreFrame(
     case "command_output":
       return mapCommandOutput(ctx, record, state);
     case "subagent_lifecycle":
+    case "subagent_progress":
+    case "subagent_event":
       return { events: [], state: { ...state, hasSubagents: true } };
     case "notice":
       return mapNotice(ctx, record, state);
