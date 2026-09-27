@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as Fs from "node:fs";
+import * as Os from "node:os";
+import * as Path from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import type { NeoPiSettings } from "@t3tools/contracts";
@@ -9,6 +13,7 @@ import {
   buildInitialNeoPiProviderSnapshot,
   checkNeoPiProviderStatus,
   modelsFromNeoPiRpc,
+  resolveNeoPiBinary,
 } from "./NeoPiProvider.ts";
 
 const settings: NeoPiSettings = {
@@ -33,6 +38,10 @@ it.effect(
         "authenticated",
       );
       assert.equal(
+        authFromLoginProviders({ providers: [{ id: "openai", authenticated: true }] }, "local"),
+        "unknown",
+      );
+      assert.equal(
         authFromLoginProviders({ providers: [{ id: "local", available: true }] }),
         "unknown",
       );
@@ -47,7 +56,11 @@ it.effect(
             shortName: "gpt-6-luna",
             subProvider: "openai-codex",
             isCustom: false,
-            capabilities: null,
+            capabilities: {
+              optionDescriptors: [
+                { id: "fastMode", type: "boolean", label: "Fast mode", currentValue: false },
+              ],
+            },
           },
         ],
       );
@@ -79,6 +92,33 @@ it.live(
         );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+it.live("falls back only when the default npi executable is missing", () =>
+  Effect.gen(function* () {
+    const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "t3-neopi-bin-"));
+    try {
+      const omp = Path.join(dir, "omp");
+      Fs.writeFileSync(omp, "#!/bin/sh\necho 'omp v1.2.3'\n", { mode: 0o755 });
+      const env = { PATH: dir };
+      const fallback = yield* resolveNeoPiBinary({ binaryPath: "npi" }, env, dir);
+      assert.equal(fallback?.binary, "omp");
+      assert.equal(fallback?.version, "1.2.3");
+      const npi = Path.join(dir, "npi");
+      Fs.writeFileSync(npi, "#!/bin/sh\nexit 17\n", { mode: 0o755 });
+      const failure = yield* resolveNeoPiBinary({ binaryPath: "npi" }, env, dir);
+      assert.equal(failure?.binary, "npi");
+      assert.match(failure?.error ?? "", /exited 17/);
+      const explicit = yield* resolveNeoPiBinary(
+        { binaryPath: Path.join(dir, "absent") },
+        env,
+        dir,
+      );
+      assert.equal(explicit?.binary, Path.join(dir, "absent"));
+      assert.notEqual(explicit?.error, null);
+    } finally {
+      Fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("live commands take precedence over an older full-loadout probe", () =>

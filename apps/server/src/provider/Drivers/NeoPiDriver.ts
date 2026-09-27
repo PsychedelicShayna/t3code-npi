@@ -15,6 +15,7 @@ import {
   checkNeoPiProviderStatus,
   resolveNeoPiBinary,
 } from "../Layers/NeoPiProvider.ts";
+import { applyUsageLimits } from "../Layers/neopiUsageLimits.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import {
@@ -120,6 +121,23 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.map(stamp),
         ),
+        enrichSnapshot: ({ snapshot: probed, getSnapshot, publishSnapshot }) =>
+          Effect.gen(function* () {
+            if (!probed.installed || probed.status === "error") return;
+            const activeProvider =
+              probed.models.find((model) => model.isDefault)?.subProvider ?? "";
+            if (!activeProvider && probed.status === "warning") return;
+            const previous = (yield* getSnapshot).usageLimits;
+            const usageLimits = yield* applyUsageLimits({
+              binary,
+              activeProvider,
+              profile: config.profile,
+              cwd: serverConfig.cwd,
+              environment: env,
+              ...(previous ? { previous } : {}),
+            }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
+            yield* publishSnapshot({ ...probed, usageLimits });
+          }),
       }).pipe(
         Effect.mapError(
           (cause) =>

@@ -6,7 +6,7 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { NEOPI_CURRENT_MODEL, ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderInstanceId } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -30,7 +30,7 @@ const TEST_MODEL = createModelSelection(
   ProviderInstanceId.make("neopi"),
   "openai-codex/gpt-5.6-luna",
 );
-const CURRENT_MODEL = createModelSelection(ProviderInstanceId.make("neopi"), NEOPI_CURRENT_MODEL);
+const CURRENT_MODEL = createModelSelection(ProviderInstanceId.make("neopi"), "");
 const PROFILE = "neopi-text-generation-test";
 const GENERATED_REPLY = {
   subject:
@@ -322,7 +322,6 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
         expect(captures[0]?.args).toContain("--model");
         expect(captures[0]?.args).toContain("openai-codex/gpt-5.6-luna");
         const titleArgs = captures[3]?.args ?? [];
-        expect(titleArgs).not.toContain(NEOPI_CURRENT_MODEL);
         expect(titleArgs).not.toContain("--model");
       }),
     ),

@@ -1,5 +1,5 @@
 import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
-import { NEOPI_CURRENT_MODEL, TextGenerationError, type ModelSelection } from "@t3tools/contracts";
+import { TextGenerationError, type ModelSelection } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import * as Deferred from "effect/Deferred";
@@ -269,8 +269,7 @@ export const makeNeoPiTextGeneration = (
 
 const modelArg = (selection: ModelSelection): string | undefined => {
   const model = selection.model.trim();
-  // `neopi-current` is a T3 sentinel, not a catalog id. Never send it.
-  if (model.length === 0 || model === NEOPI_CURRENT_MODEL) {
+  if (model.length === 0) {
     return undefined;
   }
   return model;

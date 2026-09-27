@@ -95,6 +95,23 @@ checkpoints but cannot roll back its conversation. The [checkpoint boundary](./o
 therefore rejects revert before touching files. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.
 
+NeoPi/OMP (oh-my-pi compatible) uses JSONL `rpc-ui` with a required negotiated
+protocol-v2 transport. The `ready` handshake determines optional features;
+unknown or older peers must not be treated as fully compatible. Native `agent_end`
+can be nonterminal (`isTerminal: false`), so a T3 turn ends only after a terminal
+outcome. Until upstream #102 supplies structured `tool_approval_request`, tool
+approvals arrive as `select` extension dialogs with Approve/Deny replies. Approval
+mode is selected at process launch; changing modes requires restart and resume,
+not a fictitious mid-session RPC setter. A rollback `branch` creates a new native
+session file and its new cursor must be saved before T3 reports completion.
+
+NeoPi session files live under the T3 home, isolated from the normal NeoPi/OMP
+session picker. Sharing the CLI's session directory requires a cooperating
+session lease (#106) and an explicit fresh-session flag (#107); merely advertising
+one capability must not enable sharing. A profile sets `OMP_PROFILE` independently
+for each provider instance. Provider probes do not create shared user sessions,
+and OAuth login metadata does not establish API-key or local-model access.
+
 ## Attachments and stored history
 
 Attachments live outside the project workspace. [ProviderService](../../apps/server/src/provider/Layers/ProviderService.ts)

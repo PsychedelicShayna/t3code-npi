@@ -764,7 +764,7 @@ export const NeoPiSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Binary path",
         description:
-          "Path to the NeoPi/OMP (oh-my-pi compatible) CLI. Leave empty to use `npi`, then `omp`, from PATH.",
+          "Path to the NeoPi/OMP (oh-my-pi compatible) CLI. Leave empty or use `npi` to search PATH for `npi`, then `omp` only when `npi` is not found. Other paths never fall back.",
         providerSettingsForm: { placeholder: "npi", clearWhenEmpty: "omit" },
       }),
     ),

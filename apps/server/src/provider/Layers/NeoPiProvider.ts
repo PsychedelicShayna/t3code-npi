@@ -1,5 +1,4 @@
 import type { NeoPiSettings, ServerProviderModel } from "@t3tools/contracts";
-import { NEOPI_CURRENT_MODEL } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import type { SpawnFn } from "effect-neopi-rpc/client";
 import { make as makeClient } from "effect-neopi-rpc/client";
@@ -12,12 +11,15 @@ import type { ChildProcessSpawner } from "effect/unstable/process";
 import {
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
+  isCommandMissingCause,
   parseGenericCliVersion,
   spawnAndCollect,
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { providerModelsFromSettings } from "../providerSnapshot.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
+import { neopiCompatibility } from "../neopi/NeoPiCompatibility.ts";
+import { toServerProviderModels } from "../neopi/NeoPiModelCatalog.ts";
 
 const PRESENTATION = {
   displayName: "NeoPi/OMP",
@@ -26,16 +28,9 @@ const PRESENTATION = {
   reportsContextWindow: true,
   supportsConversationRollback: false,
 } as const;
-const DEFAULT_MODEL: ServerProviderModel = {
-  slug: NEOPI_CURRENT_MODEL,
-  name: "Current model",
-  isCustom: false,
-  isDefault: true,
-  capabilities: null,
-};
 const fallbackModels = (settings: NeoPiSettings) =>
   providerModelsFromSettings(
-    [DEFAULT_MODEL],
+    [],
     settings.customModels ?? [],
     createModelCapabilities({ optionDescriptors: [] }),
   );
@@ -50,10 +45,11 @@ const fromProbe = (
     auth?: "unknown" | "authenticated";
     message?: string;
     models?: ReadonlyArray<ServerProviderModel>;
+    compatibilityAdvisory?: ReturnType<typeof neopiCompatibility>;
   },
-): ServerProviderDraft =>
-  buildServerProvider({
-    presentation: PRESENTATION,
+): ServerProviderDraft => ({
+  ...buildServerProvider({
+    presentation: { ...PRESENTATION, reportsContextWindow: input.status === "ready" },
     enabled: settings.enabled,
     checkedAt,
     models: input.models ?? fallbackModels(settings),
@@ -65,7 +61,18 @@ const fromProbe = (
       auth: { status: input.auth ?? "unknown" },
       ...(input.message ? { message: input.message } : {}),
     },
-  });
+  }),
+  versionAdvisory: {
+    status: "unknown",
+    currentVersion: input.version ?? null,
+    latestVersion: null,
+    updateCommand: "npi update",
+    canUpdate: false,
+    checkedAt,
+    message: "Update NeoPi/OMP manually with the CLI that owns this installation.",
+  },
+  ...(input.compatibilityAdvisory ? { compatibilityAdvisory: input.compatibilityAdvisory } : {}),
+});
 
 export const buildInitialNeoPiProviderSnapshot = (settings: NeoPiSettings) =>
   DateTime.now.pipe(
@@ -88,7 +95,11 @@ export const buildInitialNeoPiProviderSnapshot = (settings: NeoPiSettings) =>
     ),
   );
 
-export function modelsFromNeoPiRpc(data: unknown): ReadonlyArray<ServerProviderModel> {
+export function modelsFromNeoPiRpc(
+  data: unknown,
+  current?: unknown,
+  fastModeEnabled = false,
+): ReadonlyArray<ServerProviderModel> {
   if (
     typeof data !== "object" ||
     data === null ||
@@ -96,28 +107,7 @@ export function modelsFromNeoPiRpc(data: unknown): ReadonlyArray<ServerProviderM
     !Array.isArray(data.models)
   )
     return [];
-  return data.models.flatMap((model: unknown) => {
-    if (
-      typeof model !== "object" ||
-      model === null ||
-      !("provider" in model) ||
-      !("id" in model) ||
-      typeof model.provider !== "string" ||
-      typeof model.id !== "string"
-    )
-      return [];
-    const name = "name" in model && typeof model.name === "string" ? model.name : model.id;
-    return [
-      {
-        slug: `${model.provider}/${model.id}`,
-        name,
-        shortName: model.id,
-        subProvider: model.provider,
-        isCustom: false,
-        capabilities: null,
-      },
-    ];
-  });
+  return toServerProviderModels(data.models, current, fastModeEnabled);
 }
 
 export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
@@ -125,7 +115,8 @@ export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
   environment: Record<string, string>,
   cwd: string,
 ) {
-  const commands = settings.binaryPath ? [settings.binaryPath] : ["npi", "omp"];
+  const useDefaultSearch = !settings.binaryPath || settings.binaryPath === "npi";
+  const commands = useDefaultSearch ? ["npi", "omp"] : [settings.binaryPath];
   for (const candidate of commands) {
     const probe = yield* spawnAndCollect(
       candidate,
@@ -135,13 +126,33 @@ export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
       return {
         binary: candidate,
         version: parseGenericCliVersion(probe.success.value.stdout + probe.success.value.stderr),
+        error: null,
       };
     }
+    if (
+      useDefaultSearch &&
+      candidate === "npi" &&
+      Result.isFailure(probe) &&
+      isCommandMissingCause(probe.failure)
+    )
+      continue;
+    return {
+      binary: candidate,
+      version: null,
+      error: Result.isSuccess(probe)
+        ? Option.isNone(probe.success)
+          ? "version probe timed out"
+          : `version probe exited ${probe.success.value.code}`
+        : String(probe.failure),
+    };
   }
   return null;
 });
 
-export function authFromLoginProviders(data: unknown): "authenticated" | "unknown" {
+export function authFromLoginProviders(
+  data: unknown,
+  activeProvider?: string,
+): "authenticated" | "unknown" {
   const providers =
     typeof data === "object" &&
     data !== null &&
@@ -154,7 +165,8 @@ export function authFromLoginProviders(data: unknown): "authenticated" | "unknow
       typeof entry === "object" &&
       entry !== null &&
       "authenticated" in entry &&
-      entry.authenticated === true,
+      entry.authenticated === true &&
+      (activeProvider === undefined || ("id" in entry && entry.id === activeProvider)),
   )
     ? "authenticated"
     : "unknown";
@@ -173,13 +185,15 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
     return fromProbe(settings, checkedAt, { installed: false, status: "warning" });
   const env = { ...environment, ...(settings.profile ? { OMP_PROFILE: settings.profile } : {}) };
   const resolved = yield* resolveNeoPiBinary(settings, env, cwd);
-  if (!resolved)
+  if (!resolved || resolved.error)
     return fromProbe(settings, checkedAt, {
       installed: false,
       status: "error",
-      message: settings.binaryPath
-        ? `Configured NeoPi/OMP binary '${settings.binaryPath}' could not be executed.`
-        : "NeoPi/OMP CLI (`npi` or `omp`) is not installed or not on PATH.",
+      message: resolved?.error
+        ? `NeoPi/OMP binary '${resolved.binary}' could not be probed: ${resolved.error}.`
+        : !settings.binaryPath || settings.binaryPath === "npi"
+          ? "NeoPi/OMP CLI (`npi` or `omp`) is not installed or not on PATH."
+          : `Configured NeoPi/OMP binary '${settings.binaryPath}' could not be executed.`,
     });
   const { binary: selected, version } = resolved;
   const metadata = yield* Effect.scoped(
@@ -202,11 +216,15 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
         cwd,
         env,
       });
-      const [login, models] = yield* Effect.all([
+      const compatibility = neopiCompatibility(client.ready, client.capabilities.has("v2"));
+      if (compatibility.status === "unsupported")
+        return { login: null, models: null, state: null, compatibility };
+      const [login, models, state] = yield* Effect.all([
         client.request({ type: "get_login_providers" }),
         client.request({ type: "get_available_models" }),
+        client.request({ type: "get_state" }),
       ]);
-      return { login, models };
+      return { login, models, state, compatibility };
     }),
   ).pipe(Effect.timeoutOption("20 seconds"), Effect.result);
   if (Result.isFailure(metadata) || Option.isNone(metadata.success))
@@ -216,21 +234,44 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
       status: "warning",
       message: "NeoPi/OMP RPC metadata probe failed; check the CLI and profile.",
     });
-  const { login, models } = metadata.success.value;
-  const auth = authFromLoginProviders(login);
-  const available = modelsFromNeoPiRpc(models);
-  const discovery = yield* hub.latest(cwd);
+  const { login, models, state, compatibility } = metadata.success.value;
+  const current =
+    typeof state === "object" && state !== null && "model" in state ? state.model : undefined;
+  const currentProvider =
+    typeof current === "object" &&
+    current !== null &&
+    "provider" in current &&
+    typeof current.provider === "string"
+      ? current.provider
+      : "";
+  const auth = authFromLoginProviders(login, currentProvider);
+  const fastModeEnabled =
+    typeof state === "object" &&
+    state !== null &&
+    "fastModeEnabled" in state &&
+    state.fastModeEnabled === true;
+  const available = modelsFromNeoPiRpc(models, current, fastModeEnabled);
+  const missingCurrent = available.some((model) => model.isCustom);
   const snapshot = fromProbe(settings, checkedAt, {
     installed: true,
     version,
-    status: "ready",
+    status: compatibility.status === "unsupported" ? "error" : missingCurrent ? "warning" : "ready",
+    ...(compatibility.message || missingCurrent
+      ? {
+          message:
+            compatibility.message ??
+            "Current NeoPi/OMP model is not in the refreshed catalog; it remains selectable as a custom model.",
+        }
+      : {}),
+    compatibilityAdvisory: compatibility,
     auth,
     models: providerModelsFromSettings(
-      available.length ? available : [DEFAULT_MODEL],
+      available,
       settings.customModels ?? [],
       createModelCapabilities({ optionDescriptors: [] }),
     ),
   });
+  const discovery = yield* hub.latest(cwd);
   return {
     ...snapshot,
     slashCommands: [

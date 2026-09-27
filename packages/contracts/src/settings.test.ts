@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
-import { DEFAULT_MODEL_BY_PROVIDER, NEOPI_CURRENT_MODEL, PROVIDER_DISPLAY_NAMES } from "./model.ts";
+import { PROVIDER_DISPLAY_NAMES } from "./model.ts";
 import { RuntimeEventRaw } from "./providerRuntime.ts";
 import {
   ClientSettingsSchema,
@@ -1025,8 +1025,6 @@ describe("NeoPi/OMP provider settings", () => {
     expect(decoded.providers.neopi.launchArgs).toBe("");
     expect(decoded.providers.neopi.customModels).toEqual([]);
     expect(PROVIDER_DISPLAY_NAMES[neopi]).toBe("NeoPi/OMP");
-    expect(NEOPI_CURRENT_MODEL).toBe("neopi-current");
-    expect(DEFAULT_MODEL_BY_PROVIDER[neopi]).toBe(NEOPI_CURRENT_MODEL);
   });
 
   it("treats a blank binary path as the npi command", () => {
