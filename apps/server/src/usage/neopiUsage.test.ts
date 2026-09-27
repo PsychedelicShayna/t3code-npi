@@ -6,6 +6,15 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+
+import { deriveServerPaths } from "../config.ts";
+import {
+  neopiLegacySessionRoot,
+  neopiProjectSessionDir,
+  neopiSessionRoot,
+} from "../provider/neopi/NeoPiPaths.ts";
 
 import { discoverNeoPiSessionRoots, readNeoPiUsage } from "./neopiUsage.ts";
 
@@ -289,11 +298,13 @@ describe("readNeoPiUsage", () => {
 });
 
 describe("discoverNeoPiSessionRoots", () => {
-  it("includes the shared omp sessions dir, T3 session dir, and existing profile dirs", async () => {
+  it("includes the shared omp sessions dir, both T3 roots, and existing profile dirs", async () => {
     const home = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "neopi-usage-roots-"));
     try {
-      const stateDir = NodePath.join(home, "t3");
+      const baseDir = NodePath.join(home, "t3");
+      const stateDir = NodePath.join(baseDir, "userdata");
       const xdg = NodePath.join(home, "xdg");
+      await NodeFSP.mkdir(NodePath.join(stateDir, "neopi", "sessions"), { recursive: true });
       await NodeFSP.mkdir(NodePath.join(home, ".omp", "profiles", "work", "agent", "sessions"), {
         recursive: true,
       });
@@ -302,19 +313,97 @@ describe("discoverNeoPiSessionRoots", () => {
       });
       const roots = await discoverNeoPiSessionRoots({
         home,
+        baseDir,
         stateDir,
         env: { XDG_DATA_HOME: xdg },
       });
       expect(roots).toContain(NodePath.join(home, ".omp", "agent", "sessions"));
-      expect(roots).toContain(NodePath.join(stateDir, "neopi", "sessions"));
+      expect(roots).toContain(neopiSessionRoot({ baseDir }));
+      expect(roots).toContain(neopiLegacySessionRoot({ stateDir }));
       expect(roots).toContain(NodePath.join(home, ".omp", "profiles", "work", "agent", "sessions"));
       expect(roots).toContain(NodePath.join(xdg, "omp", "sessions"));
       expect(roots).toContain(
         NodePath.join(xdg, "omp", "profiles", "xdgwork", "agent", "sessions"),
       );
-      expect(roots).toHaveLength(5);
+      expect(roots).toHaveLength(6);
     } finally {
       await NodeFSP.rm(home, { recursive: true, force: true });
     }
   });
+
+  it.effect("uses a real server config and still reads an existing legacy stateDir root", () =>
+    Effect.gen(function* () {
+      const baseDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "neopi-config-roots-")),
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => NodeFSP.rm(baseDir, { recursive: true, force: true })),
+      );
+      const userdata = yield* deriveServerPaths(baseDir, undefined);
+      const dev = yield* deriveServerPaths(baseDir, new URL("http://127.0.0.1:3773/"));
+      expect(userdata.stateDir).toBe(NodePath.join(baseDir, "userdata"));
+      expect(dev.stateDir).toBe(NodePath.join(baseDir, "dev"));
+      expect(neopiSessionRoot({ baseDir })).toBe(NodePath.join(baseDir, "neopi", "sessions"));
+      expect(neopiSessionRoot({ baseDir })).not.toBe(
+        neopiLegacySessionRoot({ stateDir: userdata.stateDir }),
+      );
+
+      const canonical = neopiProjectSessionDir({
+        baseDir,
+        profile: "work",
+        projectId: "proj",
+      });
+      const legacy = neopiLegacySessionRoot({ stateDir: userdata.stateDir });
+      const header = (id: string) => ({
+        type: "session",
+        id,
+        timestamp: "2026-08-01T12:00:00.000Z",
+        cwd: "/redacted",
+      });
+      const entry = (id: string) =>
+        assistant({
+          id,
+          provider: "openai-codex",
+          model: "gpt-5.4",
+          timestampMs: Date.parse("2026-08-01T12:00:00.000Z"),
+          inputTokens: 10,
+          outputTokens: 2,
+          cost: 0.01,
+        });
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(canonical, { recursive: true });
+        await NodeFSP.mkdir(legacy, { recursive: true });
+        await writeSession(canonical, "live.jsonl", header("live"), [entry("live-entry")]);
+        await writeSession(legacy, "old.jsonl", header("old"), [entry("old-entry")]);
+      });
+
+      const devRoots = yield* Effect.promise(() =>
+        discoverNeoPiSessionRoots({
+          home: baseDir,
+          baseDir,
+          stateDir: dev.stateDir,
+          env: {},
+        }),
+      );
+      expect(devRoots).toContain(neopiSessionRoot({ baseDir }));
+      expect(devRoots).not.toContain(neopiLegacySessionRoot({ stateDir: dev.stateDir }));
+
+      const roots = yield* Effect.promise(() =>
+        discoverNeoPiSessionRoots({
+          home: baseDir,
+          baseDir,
+          stateDir: userdata.stateDir,
+          env: {},
+        }),
+      );
+      expect(roots).toContain(neopiSessionRoot({ baseDir }));
+      expect(roots).toContain(legacy);
+      const records = yield* Effect.promise(async () =>
+        (await readNeoPiUsage(roots, 0)).roots.flatMap((root) =>
+          root.files.flatMap((file) => file.records),
+        ),
+      );
+      expect(records.map((record) => record.sessionId).sort()).toEqual(["live", "old"]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

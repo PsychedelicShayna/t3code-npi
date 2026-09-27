@@ -588,6 +588,7 @@ export const make = Effect.gen(function* () {
     const neoPiRoots = yield* Effect.promise(() =>
       discoverNeoPiSessionRoots({
         home: neoPiHome,
+        baseDir: config.baseDir,
         stateDir: config.stateDir,
         env: hostEnvironment,
       }),

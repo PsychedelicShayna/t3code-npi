@@ -8,6 +8,7 @@ import * as NodeReadline from "node:readline";
 import * as NodeTimersPromises from "node:timers/promises";
 
 import type { UsageRecord } from "./usageTranscripts.ts";
+import { resolveNeoPiSessionRoots } from "../provider/neopi/NeoPiPaths.ts";
 
 const CONFIG_DIR_NAME = ".omp";
 const XDG_DIR_NAME = "omp";
@@ -391,28 +392,40 @@ async function existingProfileSessionDirs(profilesRoot: string): Promise<readonl
 
 export interface NeoPiSessionRootInput {
   readonly home: string;
+  readonly baseDir: string;
   readonly stateDir: string;
   readonly env: NodeJS.ProcessEnv;
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await NodeFSP.stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Directories the usage scan should open.
  *
  * Always includes `~/.omp/agent/sessions` (or `PI_CONFIG_DIR`) and the Tier 1
- * T3 directory `<stateDir>/neopi/sessions/<profile>/<projectId>`. Named-profile
- * and XDG session dirs are included only when they already exist, so an unused
- * profile does not show up as a missing source.
+ * write root `<baseDir>/neopi/sessions`. The old `<stateDir>/neopi/sessions`
+ * root is included only when that directory already exists, so a cutover does
+ * not hide files and a missing legacy path is not reported as a source.
+ * Named-profile and XDG session dirs are included only when they already exist.
  */
 export async function discoverNeoPiSessionRoots(
   input: NeoPiSessionRootInput,
 ): Promise<readonly string[]> {
   const configDirName = input.env.PI_CONFIG_DIR?.trim() || CONFIG_DIR_NAME;
   const homeConfig = NodePath.resolve(input.home, configDirName);
+  const { canonical, legacy } = resolveNeoPiSessionRoots(input);
   const roots = [
     NodePath.join(input.home, CONFIG_DIR_NAME, "agent", "sessions"),
     NodePath.join(homeConfig, "agent", "sessions"),
-    NodePath.join(input.stateDir, "neopi", "sessions"),
+    canonical,
   ];
+  if (legacy !== canonical && (await isDirectory(legacy))) roots.push(legacy);
   const agentDir = input.env.PI_CODING_AGENT_DIR?.trim();
   if (agentDir) roots.push(NodePath.join(agentDir, "sessions"));
 
