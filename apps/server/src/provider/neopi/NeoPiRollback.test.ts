@@ -43,17 +43,37 @@ for (const numTurns of [1, 3])
   it(`branches the captured user entry when rewinding ${numTurns} turns`, async () => {
     const sent: string[] = [];
     const target = numTurns === 1 ? "third" : "first";
+    let branched = false;
     const result = await rollbackNeoPiConversation({
       cursor,
       numTurns,
       request: async ({ type, entryId }) => {
         sent.push(`${type}:${entryId ?? ""}`);
         if (type === "get_entries") return { entries, leafId: "a5" };
-        if (type === "branch") return { cancelled: false, text: "removed" };
+        if (type === "get_messages_page")
+          return {
+            messages: (branched
+              ? entries.slice(
+                  0,
+                  entries.findIndex((entry) => entry.id === target),
+                )
+              : entries
+            ).map((entry) => entry.message),
+          };
+        if (type === "branch") {
+          branched = true;
+          return { cancelled: false, text: "removed" };
+        }
         return { sessionId: `new-${numTurns}`, sessionFile: `/tmp/new-${numTurns}.jsonl` };
       },
     });
-    assert.deepEqual(sent, ["get_entries:", `branch:${target}`, "get_state:"]);
+    assert.deepEqual(sent, [
+      "get_entries:",
+      "get_messages_page:",
+      `branch:${target}`,
+      "get_state:",
+      "get_messages_page:",
+    ]);
     assert.equal(result.sessionFile, `/tmp/new-${numTurns}.jsonl`);
     assert.equal(result.sessionId, `new-${numTurns}`);
     assert.equal(result.turnBoundaries.length, 3 - numTurns);
@@ -94,22 +114,33 @@ it("does not branch a missing ancestry entry, a hidden entry, or a cancelled req
       numTurns: 1,
       request: async ({ type }) => {
         sent.push(type);
-        return type === "get_entries" ? { entries, leafId: "a5" } : { cancelled: true };
+        if (type === "get_entries") return { entries, leafId: "a5" };
+        if (type === "get_messages_page")
+          return { messages: entries.map((entry) => entry.message) };
+        return { cancelled: true };
       },
     }),
     /cancelled/,
   );
-  assert.deepEqual(sent, ["get_entries", "branch"]);
+  assert.deepEqual(sent, ["get_entries", "get_messages_page", "branch"]);
   assert.equal(cursor.sessionFile, "/tmp/old.jsonl");
 });
 
 it("accepts a carried label after branch and rejects stale session identity", async () => {
+  let branched = false;
   const result = await rollbackNeoPiConversation({
     cursor,
     numTurns: 1,
     request: async ({ type }) => {
       if (type === "get_entries") return { entries, leafId: "a5" };
-      if (type === "branch") return { cancelled: false };
+      if (type === "get_messages_page")
+        return {
+          messages: (branched ? entries.slice(0, 8) : entries).map((entry) => entry.message),
+        };
+      if (type === "branch") {
+        branched = true;
+        return { cancelled: false };
+      }
       return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
     },
   });
@@ -120,11 +151,50 @@ it("accepts a carried label after branch and rejects stale session identity", as
       numTurns: 1,
       request: async ({ type }) => {
         if (type === "get_entries") return { entries, leafId: "a5" };
+        if (type === "get_messages_page")
+          return { messages: entries.map((entry) => entry.message) };
         if (type === "branch") return { cancelled: false };
         return { sessionId: "old", sessionFile: "/tmp/old.jsonl" };
       },
     }),
     /branched session identity/,
+  );
+});
+
+it("persists the new identity before failing a branch that leaves removed messages in memory", async () => {
+  let saved: NeoPiResumeCursor | undefined;
+  await rejects(
+    rollbackNeoPiConversation({
+      cursor,
+      numTurns: 1,
+      request: async ({ type }) => {
+        if (type === "get_entries") return { entries, leafId: "a5" };
+        if (type === "get_messages_page")
+          return { messages: entries.map((entry) => entry.message) };
+        if (type === "branch") return { cancelled: false };
+        return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
+      },
+      onBranched: async (next) => {
+        saved = next;
+      },
+    }),
+    /rollback integrity error: branched conversation still contains removed/,
+  );
+  assert.equal(saved?.sessionId, "new");
+  assert.equal(saved?.sessionFile, "/tmp/new.jsonl");
+  assert.deepEqual(saved?.turnBoundaries, cursor.turnBoundaries.slice(0, -1));
+});
+
+it("rejects unmatched native messages rather than attaching them to a retained turn", () => {
+  assert.throws(
+    () =>
+      groupNeoPiHistory(
+        [...entries.map((entry) => entry.message), { role: "user", content: "unmatched" }],
+        entries,
+        "a5",
+        cursor,
+      ),
+    /unmatched native messages/,
   );
 });
 
@@ -138,10 +208,16 @@ it("rewinds local turns without mutating native history and branches only the fi
     ],
   };
   const requests: string[] = [];
+  let branched = false;
   const request = async ({ type, entryId }: { type: string; entryId?: string }) => {
     requests.push(`${type}:${entryId ?? ""}`);
     if (type === "get_entries") return { entries, leafId: "a5" };
-    if (type === "branch") return { cancelled: false };
+    if (type === "get_messages_page")
+      return { messages: (branched ? entries.slice(0, 4) : entries).map((entry) => entry.message) };
+    if (type === "branch") {
+      branched = true;
+      return { cancelled: false };
+    }
     return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
   };
   const localLast = { ...mixed, turnBoundaries: mixed.turnBoundaries.slice(0, 2) };
@@ -152,6 +228,7 @@ it("rewinds local turns without mutating native history and branches only the fi
   assert.equal(withoutC.turnBoundaries.length, 2);
   assert.ok(requests.includes("branch:second"));
   requests.length = 0;
+  branched = false;
   const withoutBC = await rollbackNeoPiConversation({ cursor: mixed, numTurns: 2, request });
   assert.deepEqual(withoutBC.turnBoundaries, [cursor.turnBoundaries[0]!]);
   assert.ok(requests.includes("branch:second"));
@@ -262,6 +339,12 @@ it("rewinds the next prompt without removing a prior steer", async () => {
     request: async ({ type, entryId }) => {
       if (type === "get_entries")
         return { entries: throughSecond, leafId: branchedLeaf ? "a2" : "a3" };
+      if (type === "get_messages_page")
+        return {
+          messages: (branchedLeaf ? throughSecond.slice(0, 4) : throughSecond).map(
+            (entry) => entry.message,
+          ),
+        };
       if (type === "branch") {
         assert.equal(entryId, "second");
         branchedLeaf = true;

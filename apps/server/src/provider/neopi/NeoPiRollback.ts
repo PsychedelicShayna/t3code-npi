@@ -15,8 +15,9 @@ export async function rollbackNeoPiConversation(input: {
   cursor: NeoPiResumeCursor;
   numTurns: number;
   request: (command: { type: string; entryId?: string }) => Promise<unknown>;
+  onBranched?: (cursor: NeoPiResumeCursor) => Promise<void>;
 }): Promise<NeoPiResumeCursor> {
-  const { cursor, numTurns, request } = input;
+  const { cursor, numTurns, request, onBranched } = input;
   if (!Number.isSafeInteger(numTurns) || numTurns < 1 || numTurns > cursor.turnBoundaries.length)
     throw new NeoPiRollbackError("rollback unavailable for turns before boundary capture");
   const removed = cursor.turnBoundaries.slice(-numTurns);
@@ -51,6 +52,13 @@ export async function rollbackNeoPiConversation(input: {
   if (!selected || selected.type !== "message" || object(selected.message).role !== "user")
     throw new NeoPiRollbackError("Rollback boundary is not a user entry on the active ancestry");
 
+  const before = await readMessages(request);
+  const grouped = groupNeoPiHistory(before, entries, leafId, cursor);
+  const firstRemoved = grouped.findIndex((turn) => turn.id === target.turnId);
+  if (firstRemoved < 0)
+    throw new NeoPiRollbackError("Rollback boundary is missing from native conversation history");
+  const retained = grouped.slice(0, firstRemoved).flatMap((turn) => turn.items);
+
   const branch = object(await request({ type: "branch", entryId: target.userEntryId }));
   if (branch.cancelled !== false)
     throw new NeoPiRollbackError("NeoPi/OMP cancelled conversation rollback");
@@ -64,12 +72,42 @@ export async function rollbackNeoPiConversation(input: {
     state.sessionId === cursor.sessionId
   )
     throw new NeoPiRollbackError("NeoPi/OMP did not report the branched session identity");
-  return {
+  const next = {
     ...cursor,
     sessionFile: resolve(state.sessionFile),
     sessionId: state.sessionId,
     turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns),
   };
+  // The branch has already mutated the native session. Save its new identity even if
+  // NeoPi's branch hook kept the old in-memory conversation or verification fails.
+  await onBranched?.(next);
+  const after = await readMessages(request);
+  if (JSON.stringify(after) !== JSON.stringify(retained))
+    throw new NeoPiRollbackError(
+      "NeoPi/OMP rollback integrity error: branched conversation still contains removed or unexpected messages",
+    );
+  return next;
+}
+
+async function readMessages(
+  request: (command: { type: string; cursor?: string }) => Promise<unknown>,
+): Promise<unknown[]> {
+  const messages: unknown[] = [];
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  do {
+    const page = object(
+      await request({ type: "get_messages_page", ...(cursor ? { cursor } : {}) }),
+    );
+    if (!Array.isArray(page.messages))
+      throw new NeoPiRollbackError("NeoPi/OMP did not return a valid conversation page");
+    messages.push(...page.messages);
+    cursor = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : undefined;
+    if (cursor && seen.has(cursor))
+      throw new NeoPiRollbackError("NeoPi/OMP conversation pagination contains a cycle");
+    if (cursor) seen.add(cursor);
+  } while (cursor);
+  return messages;
 }
 
 /** Align native history with captured prompt boundaries, not every user message (steers/extensions). */
@@ -125,11 +163,7 @@ export function groupNeoPiHistory(
     if (turns.length === 0) turns.push({ id: TurnId.make("neopi-history-1"), items: [] });
     turns[turns.length - 1]!.items.push(messages[messageIndex++]);
   }
-  // Compaction can replace the discarded prefix with synthesized context messages;
-  // native pages are authoritative for display, even when old entry bodies differ.
-  while (messageIndex < messages.length) {
-    if (turns.length === 0) turns.push({ id: TurnId.make("neopi-history-1"), items: [] });
-    turns[turns.length - 1]!.items.push(messages[messageIndex++]);
-  }
+  if (messageIndex !== messages.length)
+    throw new NeoPiRollbackError("NeoPi/OMP transcript contains unmatched native messages");
   return turns;
 }

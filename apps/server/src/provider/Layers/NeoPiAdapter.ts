@@ -681,6 +681,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
               cursor,
               numTurns,
               request: (command) => runPromise(session.runtime.request(command)),
+              onBranched: async (branched) => {
+                await runPromise(SubscriptionRef.set(session.runtime.cursor, branched));
+                session.session = { ...session.session, resumeCursor: branched };
+              },
             }),
           catch: (cause) =>
             rpcError(

@@ -9,6 +9,7 @@ import {
   type NeoPiSettings,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Queue from "effect/Queue";
@@ -253,167 +254,184 @@ it.live("streams a turn, steers the same turn, routes UI responses, and stops it
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("aborts running turn before rollback and persists the branched cursor", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const home = yield* fs.makeTempDirectoryScoped({ prefix: "neopi-rollback-adapter-" });
-      const hub = yield* makeNeoPiDiscoveryHub();
-      const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
-      const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
-      const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
-        v: 1,
-        sessionId: "old",
-        sessionFile: `${home}/old.jsonl`,
-        sessionDir: home,
-        turnBoundaries: [{ turnId: TurnId.make("first"), userEntryId: "u1" }],
-      });
-      const entries = [
-        {
-          id: "u1",
-          parentId: null,
-          type: "message",
-          message: { role: "user", content: [{ type: "text", text: "first" }] },
-        },
-        {
-          id: "a1",
-          parentId: "u1",
-          type: "message",
-          message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
-        },
-        { id: "custom", parentId: "a1", type: "custom_message", content: "notice" },
-        { id: "summary", parentId: "custom", type: "branch_summary", summary: "earlier branch" },
-        { id: "compact", parentId: "summary", type: "compaction", summary: "compressed" },
-      ];
-      let branched = false;
-      const requests: string[] = [];
-      let runningTurnId: TurnId | undefined;
-      const runtime: NeoPiSessionRuntimeShape = {
-        threadId,
-        state,
-        cursor,
-        capabilities: new Set(["v2"]),
-        start: SubscriptionRef.set(state, "ready"),
-        startTurn: (input) =>
-          Effect.sync(() => {
-            runningTurnId = input.turnId;
-            return { turnId: input.turnId };
-          }).pipe(Effect.tap(() => SubscriptionRef.set(state, "running"))),
-        steer: () => Effect.void,
-        interrupt: Effect.gen(function* () {
-          requests.push("abort");
-          yield* SubscriptionRef.set(state, "ready");
-          yield* Queue.offer(frames, {
-            type: "t3.turn.outcome",
-            state: "interrupted",
-            ...(runningTurnId ? { turnId: runningTurnId } : {}),
+for (const skipConversationRestore of [false, true])
+  it.live(
+    `rollback ${skipConversationRestore ? "rejects preserved live messages" : "persists the branched cursor"}`,
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const home = yield* fs.makeTempDirectoryScoped({ prefix: "neopi-rollback-adapter-" });
+          const hub = yield* makeNeoPiDiscoveryHub();
+          const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
+          const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+          const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
+            v: 1,
+            sessionId: "old",
+            sessionFile: `${home}/old.jsonl`,
+            sessionDir: home,
+            turnBoundaries: [{ turnId: TurnId.make("first"), userEntryId: "u1" }],
           });
+          const entries = [
+            {
+              id: "u1",
+              parentId: null,
+              type: "message",
+              message: { role: "user", content: [{ type: "text", text: "first" }] },
+            },
+            {
+              id: "a1",
+              parentId: "u1",
+              type: "message",
+              message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
+            },
+            { id: "custom", parentId: "a1", type: "custom_message", content: "notice" },
+            {
+              id: "summary",
+              parentId: "custom",
+              type: "branch_summary",
+              summary: "earlier branch",
+            },
+            { id: "compact", parentId: "summary", type: "compaction", summary: "compressed" },
+          ];
+          let branched = false;
+          const requests: string[] = [];
+          let runningTurnId: TurnId | undefined;
+          const runtime: NeoPiSessionRuntimeShape = {
+            threadId,
+            state,
+            cursor,
+            capabilities: new Set(["v2"]),
+            start: SubscriptionRef.set(state, "ready"),
+            startTurn: (input) =>
+              Effect.sync(() => {
+                runningTurnId = input.turnId;
+                return { turnId: input.turnId };
+              }).pipe(Effect.tap(() => SubscriptionRef.set(state, "running"))),
+            steer: () => Effect.void,
+            interrupt: Effect.gen(function* () {
+              requests.push("abort");
+              yield* SubscriptionRef.set(state, "ready");
+              yield* Queue.offer(frames, {
+                type: "t3.turn.outcome",
+                state: "interrupted",
+                ...(runningTurnId ? { turnId: runningTurnId } : {}),
+              });
+            }),
+            compact: () => Effect.void,
+            respondUi: () => Effect.void,
+            writeFrame: () => Effect.void,
+            request: (cmd) =>
+              Effect.sync(() => {
+                requests.push(`${cmd.type}:${"entryId" in cmd ? String(cmd.entryId) : ""}`);
+                if (cmd.type === "get_entries")
+                  return { entries: branched ? [] : entries, leafId: branched ? null : "compact" };
+                if (cmd.type === "branch") {
+                  branched = true;
+                  return { cancelled: false };
+                }
+                if (cmd.type === "get_state")
+                  return { sessionFile: `${home}/new.jsonl`, sessionId: "new" };
+                return {
+                  messages:
+                    branched && !skipConversationRestore
+                      ? []
+                      : [
+                          ...entries
+                            .slice(0, 2)
+                            .flatMap((entry) => ("message" in entry ? [entry.message] : [])),
+                          { role: "custom", content: "notice" },
+                          { role: "branchSummary", summary: "earlier branch" },
+                          { role: "compactionSummary", summary: "compressed" },
+                        ],
+                };
+              }),
+            frames: Stream.fromQueue(frames),
+            restart: () => Effect.void,
+            stop: Effect.void,
+            setRuntimeMode: () => Effect.void,
+            onSessionIdentityMayHaveChanged: Effect.void,
+            applyModelSelection: () => Effect.void,
+          };
+          const adapter = yield* makeNeoPiAdapter({
+            settings,
+            instanceId,
+            binary: "npi",
+            cwd: home,
+            t3Home: home,
+            attachmentsDir: home,
+            environment: {},
+            spawn: spawner.spawn,
+            discovery: hub,
+            makeRuntime: () => Effect.succeed(runtime),
+          });
+          yield* adapter.startSession({
+            threadId,
+            provider: ProviderDriverKind.make("neopi"),
+            providerInstanceId: instanceId,
+            cwd: home,
+            runtimeMode: "auto",
+          });
+          assert.deepEqual(
+            (yield* adapter.readThread(threadId)).turns.map((turn) => turn.items.length),
+            [5],
+          );
+          yield* adapter.sendTurn({ threadId, input: "first" });
+          const rewind = yield* Effect.exit(adapter.rollbackThread(threadId, 1));
+          assert.ok(requests.indexOf("abort") >= 0);
+          assert.ok(requests.indexOf("abort") < requests.indexOf("branch:u1"));
+          if (skipConversationRestore) {
+            assert.equal(rewind._tag, "Failure");
+            if (rewind._tag === "Failure")
+              assert.match(Cause.pretty(rewind.cause), /rollback integrity error/);
+          } else {
+            assert.equal(rewind._tag, "Success");
+            if (rewind._tag === "Success") assert.deepEqual(rewind.value.turns, []);
+          }
+          assert.ok(requests.includes("branch:u1"));
+          const saved = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
+          assert.equal(saved.sessionFile, `${home}/new.jsonl`);
+          assert.equal(saved.sessionId, "new");
+          assert.deepEqual(saved.turnBoundaries, []);
+          yield* adapter.stopAll();
+          const resumedState = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
+          const resumedCursor = yield* SubscriptionRef.make(saved);
+          const resumed = yield* makeNeoPiAdapter({
+            settings,
+            instanceId,
+            binary: "npi",
+            cwd: home,
+            t3Home: home,
+            attachmentsDir: home,
+            environment: {},
+            spawn: spawner.spawn,
+            discovery: hub,
+            makeRuntime: (input) => {
+              assert.deepEqual(input.cursor, saved);
+              return Effect.succeed({
+                ...runtime,
+                state: resumedState,
+                cursor: resumedCursor,
+                start: SubscriptionRef.set(resumedState, "ready"),
+                frames: Stream.empty,
+              });
+            },
+          });
+          yield* resumed.startSession({
+            threadId,
+            provider: ProviderDriverKind.make("neopi"),
+            providerInstanceId: instanceId,
+            cwd: home,
+            runtimeMode: "auto",
+            resumeCursor: saved,
+          });
+          if (!skipConversationRestore)
+            assert.deepEqual((yield* resumed.readThread(threadId)).turns, []);
+          yield* resumed.stopAll();
         }),
-        compact: () => Effect.void,
-        respondUi: () => Effect.void,
-        writeFrame: () => Effect.void,
-        request: (cmd) =>
-          Effect.sync(() => {
-            requests.push(`${cmd.type}:${"entryId" in cmd ? String(cmd.entryId) : ""}`);
-            if (cmd.type === "get_entries")
-              return { entries: branched ? [] : entries, leafId: branched ? null : "compact" };
-            if (cmd.type === "branch") {
-              branched = true;
-              return { cancelled: false };
-            }
-            if (cmd.type === "get_state")
-              return { sessionFile: `${home}/new.jsonl`, sessionId: "new" };
-            return {
-              messages: branched
-                ? []
-                : [
-                    ...entries
-                      .slice(0, 2)
-                      .flatMap((entry) => ("message" in entry ? [entry.message] : [])),
-                    { role: "custom", content: "notice" },
-                    { role: "branchSummary", summary: "earlier branch" },
-                    { role: "compactionSummary", summary: "compressed" },
-                  ],
-            };
-          }),
-        frames: Stream.fromQueue(frames),
-        restart: () => Effect.void,
-        stop: Effect.void,
-        setRuntimeMode: () => Effect.void,
-        onSessionIdentityMayHaveChanged: Effect.void,
-        applyModelSelection: () => Effect.void,
-      };
-      const adapter = yield* makeNeoPiAdapter({
-        settings,
-        instanceId,
-        binary: "npi",
-        cwd: home,
-        t3Home: home,
-        attachmentsDir: home,
-        environment: {},
-        spawn: spawner.spawn,
-        discovery: hub,
-        makeRuntime: () => Effect.succeed(runtime),
-      });
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("neopi"),
-        providerInstanceId: instanceId,
-        cwd: home,
-        runtimeMode: "auto",
-      });
-      assert.deepEqual(
-        (yield* adapter.readThread(threadId)).turns.map((turn) => turn.items.length),
-        [5],
-      );
-      yield* adapter.sendTurn({ threadId, input: "first" });
-      const rewind = yield* adapter.rollbackThread(threadId, 1);
-      assert.ok(requests.indexOf("abort") >= 0);
-      assert.ok(requests.indexOf("abort") < requests.indexOf("branch:u1"));
-      assert.deepEqual(rewind.turns, []);
-      assert.ok(requests.includes("branch:u1"));
-      const saved = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
-      assert.equal(saved.sessionFile, `${home}/new.jsonl`);
-      assert.equal(saved.sessionId, "new");
-      assert.deepEqual(saved.turnBoundaries, []);
-      yield* adapter.stopAll();
-      const resumedState = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
-      const resumedCursor = yield* SubscriptionRef.make(saved);
-      const resumed = yield* makeNeoPiAdapter({
-        settings,
-        instanceId,
-        binary: "npi",
-        cwd: home,
-        t3Home: home,
-        attachmentsDir: home,
-        environment: {},
-        spawn: spawner.spawn,
-        discovery: hub,
-        makeRuntime: (input) => {
-          assert.deepEqual(input.cursor, saved);
-          return Effect.succeed({
-            ...runtime,
-            state: resumedState,
-            cursor: resumedCursor,
-            start: SubscriptionRef.set(resumedState, "ready"),
-            frames: Stream.empty,
-          });
-        },
-      });
-      yield* resumed.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("neopi"),
-        providerInstanceId: instanceId,
-        cwd: home,
-        runtimeMode: "auto",
-        resumeCursor: saved,
-      });
-      assert.deepEqual((yield* resumed.readThread(threadId)).turns, []);
-      yield* resumed.stopAll();
-    }),
-  ).pipe(Effect.provide(NodeServices.layer)),
-);
+      ).pipe(Effect.provide(NodeServices.layer)),
+  );
 
 it.live("seeds host tool names before startup and renews permissions on credential rotation", () =>
   Effect.scoped(
