@@ -27,7 +27,10 @@ export type NeoPiResumeCursor = {
   readonly sessionFile: string;
   readonly sessionId: string;
   readonly sessionDir: string;
-  readonly turnBoundaries: ReadonlyArray<{ readonly turnId: TurnId; readonly userEntryId: string }>;
+  readonly turnBoundaries: ReadonlyArray<
+    | { readonly turnId: TurnId; readonly userEntryId: string }
+    | { readonly turnId: TurnId; readonly kind: "local" | "unknown" }
+  >;
 };
 
 export type NeoPiRuntimeState =

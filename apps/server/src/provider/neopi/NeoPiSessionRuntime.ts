@@ -20,6 +20,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { buildNeoPiLaunchPlan } from "./NeoPiLaunchArgs.ts";
+import { neopiCompatibility } from "./NeoPiCompatibility.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 import type {
   NeoPiResumeCursor,
@@ -91,8 +92,7 @@ const activeUiMethods = new Set(["select", "confirm", "input", "editor"]);
 
 type ActiveTurn = {
   readonly id: TurnId;
-  readonly text: string;
-  readonly baselineLeaf?: string;
+  readonly baselineLeaf: string | null;
   readonly boundaryDone: Deferred.Deferred<void>;
   boundaryStarted: boolean;
   promptId?: string;
@@ -175,22 +175,27 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     Effect.gen(function* () {
       for (let attempt = 0; attempt < 3; attempt++) {
         const result = record(
-          yield* request({
-            type: "get_entries",
-            ...(turn.baselineLeaf ? { since: turn.baselineLeaf } : {}),
-          }).pipe(Effect.mapError(rpcError)),
+          yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
         );
         const entries = Array.isArray(result.entries) ? result.entries.map(record) : [];
-        const user = entries.find((entry) => {
-          const message = record(entry.message);
-          const content = Array.isArray(message.content) ? message.content.map(record) : [];
-          return (
-            entry.type === "message" &&
-            message.role === "user" &&
-            typeof entry.id === "string" &&
-            content.some((block) => block.type === "text" && block.text === turn.text)
-          );
-        });
+        const byId = new Map(
+          entries.filter((entry) => typeof entry.id === "string").map((entry) => [entry.id, entry]),
+        );
+        const descendants: Record<string, unknown>[] = [];
+        let id = typeof result.leafId === "string" ? result.leafId : null;
+        const seen = new Set<string>();
+        while (id !== turn.baselineLeaf && id !== null && !seen.has(id)) {
+          seen.add(id);
+          const entry = byId.get(id);
+          if (!entry) break;
+          descendants.push(entry);
+          id = typeof entry.parentId === "string" ? entry.parentId : null;
+        }
+        // Prompt text changes under templates and mentions; follow the active
+        // ancestry from the pre-admission leaf to the first new user entry.
+        const user = (id === turn.baselineLeaf ? descendants.reverse() : []).find(
+          (entry) => entry.type === "message" && record(entry.message).role === "user",
+        );
         if (user && typeof user.id === "string") {
           const previous = yield* SubscriptionRef.get(cursor);
           yield* SubscriptionRef.set(cursor, {
@@ -218,7 +223,17 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           turnId: turn.id,
         }),
       ),
-      Effect.ensuring(Deferred.succeed(turn.boundaryDone, undefined).pipe(Effect.ignore)),
+      Effect.ensuring(
+        Effect.gen(function* () {
+          const previous = yield* SubscriptionRef.get(cursor);
+          if (!previous.turnBoundaries.some((boundary) => boundary.turnId === turn.id))
+            yield* SubscriptionRef.set(cursor, {
+              ...previous,
+              turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, kind: "unknown" }],
+            });
+          yield* Deferred.succeed(turn.boundaryDone, undefined).pipe(Effect.ignore);
+        }),
+      ),
     );
   const settle = (
     turn: ActiveTurn,
@@ -231,6 +246,24 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       if (turn.agentInvoked && client && (yield* SubscriptionRef.get(state)) !== "failed") {
         if (turn.boundaryStarted) yield* Deferred.await(turn.boundaryDone);
         else yield* rememberBoundary(turn);
+      }
+      if (
+        !turn.agentInvoked ||
+        !(yield* SubscriptionRef.get(cursor)).turnBoundaries.some(
+          (boundary) => boundary.turnId === turn.id,
+        )
+      ) {
+        const previous = yield* SubscriptionRef.get(cursor);
+        yield* SubscriptionRef.set(cursor, {
+          ...previous,
+          turnBoundaries: [
+            ...previous.turnBoundaries,
+            {
+              turnId: turn.id,
+              kind: !turn.agentInvoked && outcome === "completed" ? "local" : "unknown",
+            },
+          ],
+        });
       }
       if ((yield* SubscriptionRef.get(state)) === "running") yield* setState("ready");
       yield* emit({
@@ -414,10 +447,10 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           Effect.gen(function* () {
             earlyUi = transport;
             yield* transport.transportReady.pipe(
-              Effect.matchEffect({
-                onFailure: () => Effect.void,
-                onSuccess: (ready) => emit({ ...ready, type: "ready" }),
-              }),
+              Effect.flatMap((ready) => emit({ ...ready, type: "ready" })),
+              Effect.ignore,
+              Effect.forkScoped,
+              Effect.provideService(Scope.Scope, scope),
             );
             yield* Stream.runForEach(transport.events, handleEvent).pipe(
               Effect.forkScoped,
@@ -451,6 +484,12 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           }),
       }).pipe(Effect.provideService(Scope.Scope, scope));
       client = peer;
+      if (neopiCompatibility(peer.ready, peer.capabilities.has("v2")).status !== "supported") {
+        return yield* new NeoPiRuntimeError({
+          code: "startup",
+          message: "NeoPi/OMP RPC peer requires protocol v2. Update the CLI to continue.",
+        });
+      }
       earlyUi = undefined;
       capabilities.clear();
       for (const item of peer.capabilities) capabilities.add(item);
@@ -576,8 +615,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       );
       const entry: ActiveTurn = {
         id: turn.turnId,
-        text: turn.text,
-        ...(typeof baseline.leafId === "string" ? { baselineLeaf: baseline.leafId } : {}),
+        baselineLeaf: typeof baseline.leafId === "string" ? baseline.leafId : null,
         boundaryDone: yield* Deferred.make<void>(),
         boundaryStarted: false,
         agentInvoked: false,

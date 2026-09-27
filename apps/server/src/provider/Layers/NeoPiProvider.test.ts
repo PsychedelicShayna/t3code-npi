@@ -86,6 +86,7 @@ it.live(
         assert.match(result.message ?? "", /\/no\/such\/npi-binary/);
         const initial = yield* buildInitialNeoPiProviderSnapshot({ ...settings, enabled: false });
         assert.equal(initial.status, "disabled");
+        assert.equal(initial.supportsConversationRollback, true);
         assert.deepEqual(
           initial.slashCommands.map((command) => command.name),
           ["compact"],

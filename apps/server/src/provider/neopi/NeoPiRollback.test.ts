@@ -43,18 +43,17 @@ for (const numTurns of [1, 3])
   it(`branches the captured user entry when rewinding ${numTurns} turns`, async () => {
     const sent: string[] = [];
     const target = numTurns === 1 ? "third" : "first";
-    const parent = numTurns === 1 ? "a4" : null;
     const result = await rollbackNeoPiConversation({
       cursor,
       numTurns,
       request: async ({ type, entryId }) => {
         sent.push(`${type}:${entryId ?? ""}`);
-        if (type === "get_entries") return { entries, leafId: sent.length === 4 ? parent : "a5" };
+        if (type === "get_entries") return { entries, leafId: "a5" };
         if (type === "branch") return { cancelled: false, text: "removed" };
         return { sessionId: `new-${numTurns}`, sessionFile: `/tmp/new-${numTurns}.jsonl` };
       },
     });
-    assert.deepEqual(sent, ["get_entries:", `branch:${target}`, "get_state:", "get_entries:"]);
+    assert.deepEqual(sent, ["get_entries:", `branch:${target}`, "get_state:"]);
     assert.equal(result.sessionFile, `/tmp/new-${numTurns}.jsonl`);
     assert.equal(result.sessionId, `new-${numTurns}`);
     assert.equal(result.turnBoundaries.length, 3 - numTurns);
@@ -104,31 +103,69 @@ it("does not branch a missing ancestry entry, a hidden entry, or a cancelled req
   assert.equal(cursor.sessionFile, "/tmp/old.jsonl");
 });
 
-it("rejects stale post-branch state or an incorrect branch leaf", async () => {
-  for (const failure of ["identity", "leaf"]) {
-    const sent: string[] = [];
-    await rejects(
-      rollbackNeoPiConversation({
-        cursor,
-        numTurns: 1,
-        request: async ({ type }) => {
-          sent.push(type);
-          if (type === "get_entries")
-            return {
-              entries,
-              leafId:
-                sent.length === 4 && failure === "leaf" ? "a5" : sent.length === 4 ? "a4" : "a5",
-            };
-          if (type === "branch") return { cancelled: false };
-          return failure === "identity"
-            ? { sessionId: "old", sessionFile: "/tmp/old.jsonl" }
-            : { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
-        },
-      }),
-      failure === "identity" ? /branched session identity/ : /did not end before/,
-    );
-    assert.equal(cursor.sessionId, "old");
-  }
+it("accepts a carried label after branch and rejects stale session identity", async () => {
+  const result = await rollbackNeoPiConversation({
+    cursor,
+    numTurns: 1,
+    request: async ({ type }) => {
+      if (type === "get_entries") return { entries, leafId: "a5" };
+      if (type === "branch") return { cancelled: false };
+      return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
+    },
+  });
+  assert.equal(result.sessionId, "new");
+  await rejects(
+    rollbackNeoPiConversation({
+      cursor,
+      numTurns: 1,
+      request: async ({ type }) => {
+        if (type === "get_entries") return { entries, leafId: "a5" };
+        if (type === "branch") return { cancelled: false };
+        return { sessionId: "old", sessionFile: "/tmp/old.jsonl" };
+      },
+    }),
+    /branched session identity/,
+  );
+});
+
+it("rewinds local turns without mutating native history and branches only the first removed native turn", async () => {
+  const mixed: NeoPiResumeCursor = {
+    ...cursor,
+    turnBoundaries: [
+      cursor.turnBoundaries[0]!,
+      { turnId: TurnId.make("local-B"), kind: "local" },
+      cursor.turnBoundaries[1]!,
+    ],
+  };
+  const requests: string[] = [];
+  const request = async ({ type, entryId }: { type: string; entryId?: string }) => {
+    requests.push(`${type}:${entryId ?? ""}`);
+    if (type === "get_entries") return { entries, leafId: "a5" };
+    if (type === "branch") return { cancelled: false };
+    return { sessionId: "new", sessionFile: "/tmp/new.jsonl" };
+  };
+  const localLast = { ...mixed, turnBoundaries: mixed.turnBoundaries.slice(0, 2) };
+  const withoutB = await rollbackNeoPiConversation({ cursor: localLast, numTurns: 1, request });
+  assert.deepEqual(withoutB.turnBoundaries, [cursor.turnBoundaries[0]!]);
+  assert.deepEqual(requests, []);
+  const withoutC = await rollbackNeoPiConversation({ cursor: mixed, numTurns: 1, request });
+  assert.equal(withoutC.turnBoundaries.length, 2);
+  assert.ok(requests.includes("branch:second"));
+  requests.length = 0;
+  const withoutBC = await rollbackNeoPiConversation({ cursor: mixed, numTurns: 2, request });
+  assert.deepEqual(withoutBC.turnBoundaries, [cursor.turnBoundaries[0]!]);
+  assert.ok(requests.includes("branch:second"));
+  await rejects(
+    rollbackNeoPiConversation({
+      cursor: {
+        ...mixed,
+        turnBoundaries: [...mixed.turnBoundaries, { turnId: TurnId.make("gap"), kind: "unknown" }],
+      },
+      numTurns: 2,
+      request,
+    }),
+    /unknown native history/,
+  );
 });
 
 it("groups steers and hidden extension messages with captured prompt turns", () => {
@@ -141,6 +178,67 @@ it("groups steers and hidden extension messages with captured prompt turns", () 
       [TurnId.make("turn-2"), 4],
       [TurnId.make("turn-3"), 2],
     ],
+  );
+});
+
+it("groups converted custom, branch summary and compacted context without losing retained turns", () => {
+  const custom = { id: "custom", parentId: "a1", type: "custom_message", content: "notice" };
+  const summary = {
+    id: "summary",
+    parentId: "custom",
+    type: "branch_summary",
+    summary: "prior path",
+  };
+  const compaction = {
+    id: "compact",
+    parentId: "summary",
+    type: "compaction",
+    summary: "compressed",
+  };
+  const laterUser = user("later", "compact", "after compaction");
+  const laterAssistant = assistant("later-answer", "later", "reply");
+  const history = [
+    entries[0]!,
+    entries[1]!,
+    custom,
+    summary,
+    compaction,
+    laterUser,
+    laterAssistant,
+  ];
+  const messages = [
+    { role: "compactionSummary", summary: "compressed" },
+    laterUser.message,
+    laterAssistant.message,
+  ];
+  const turns = groupNeoPiHistory(messages, history, "later-answer", {
+    ...cursor,
+    turnBoundaries: [
+      cursor.turnBoundaries[0]!,
+      { turnId: TurnId.make("later-turn"), userEntryId: "later" },
+    ],
+  });
+  assert.deepEqual(
+    turns.map((turn) => [turn.id, turn.items.length]),
+    [
+      [TurnId.make("turn-1"), 1],
+      [TurnId.make("later-turn"), 2],
+    ],
+  );
+  const uncollapsed = groupNeoPiHistory(
+    [
+      entries[0]!.message,
+      entries[1]!.message,
+      { role: "custom", content: "notice" },
+      { role: "branchSummary", summary: "prior path" },
+    ],
+    history,
+    "summary",
+    cursor,
+  );
+  assert.deepEqual(
+    uncollapsed.map((turn) => turn.items.length),
+    [4],
   );
 });
 
@@ -173,7 +271,9 @@ it("rewinds the next prompt without removing a prior steer", async () => {
     },
   });
   assert.deepEqual(
-    branched.turnBoundaries.map((boundary) => boundary.userEntryId),
+    branched.turnBoundaries.map((boundary) =>
+      "userEntryId" in boundary ? boundary.userEntryId : boundary.kind,
+    ),
     ["first"],
   );
   const after = groupNeoPiHistory(

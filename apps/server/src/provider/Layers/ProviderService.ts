@@ -32,6 +32,7 @@ import {
   type ProviderInstanceId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type RuntimeMode,
   type ProviderSession,
   type ServerSettings as ServerSettingsValue,
 } from "@t3tools/contracts";
@@ -43,6 +44,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -497,6 +499,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const pendingCompactions = new Map<ThreadId, PendingCompaction>();
   const timedOutNativeCompactions = new Set<ThreadId>();
+  const pendingStarts = new Map<
+    ThreadId,
+    {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      readonly instanceId: ProviderInstanceId;
+      readonly runtimeMode: RuntimeMode;
+    }
+  >();
   const settleCompaction = (threadId: ThreadId, pending: PendingCompaction, terminal: string) =>
     Effect.gen(function* () {
       if (pendingCompactions.get(threadId) !== pending) return false;
@@ -1321,7 +1331,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     readonly threadId: ThreadId;
     readonly operation: string;
     readonly allowRecovery: boolean;
+    readonly allowPendingStart?: boolean;
   }) {
+    if (input.allowPendingStart) {
+      const pending = pendingStarts.get(input.threadId);
+      if (pending) {
+        return {
+          ...pending,
+          threadId: input.threadId,
+          isActive: true,
+        } as const;
+      }
+    }
     const bindingOption = yield* directory.getBinding(input.threadId);
     const binding = Option.getOrUndefined(bindingOption);
     if (!binding) {
@@ -1415,6 +1436,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         parsed,
       );
       let metricProvider = parsed.provider ?? String(resolvedInstanceId);
+      let pendingStart:
+        | {
+            readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+            readonly instanceId: ProviderInstanceId;
+            readonly runtimeMode: RuntimeMode;
+          }
+        | undefined;
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "start-session",
         "provider.instance_id": resolvedInstanceId,
@@ -1509,6 +1537,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
+        pendingStart = {
+          adapter,
+          instanceId: resolvedInstanceId,
+          runtimeMode: input.runtimeMode,
+        };
+        pendingStarts.set(threadId, pendingStart);
         const session = yield* adapter
           .startSession({
             ...input,
@@ -1563,6 +1597,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         return sessionWithInstance;
       }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (pendingStarts.get(threadId) === pendingStart) pendingStarts.delete(threadId);
+          }),
+        ),
         withMetrics({
           counter: providerSessionsTotal,
           attributes: () =>
@@ -1976,6 +2015,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.respondToRequest",
           allowRecovery: true,
+          allowPendingStart: true,
         });
         metricProvider = routed.adapter.provider;
         yield* Effect.annotateCurrentSpan({
@@ -2015,6 +2055,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         operation: "ProviderService.respondToUserInput",
         allowRecovery: true,
+        allowPendingStart: true,
       });
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
@@ -2238,7 +2279,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.rollback_turns": input.numTurns,
       });
-      yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
+      const rollbackResult = yield* Effect.exit(
+        routed.adapter.rollbackThread(routed.threadId, input.numTurns),
+      );
       const session = (yield* routed.adapter.listSessions()).find(
         (session) => session.threadId === routed.threadId,
       );
@@ -2248,6 +2291,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.threadId,
         );
       }
+      // A provider may successfully branch its native session and then fail while
+      // projecting the history. Save its cursor even when projection reports an error.
+      if (Exit.isFailure(rollbackResult)) return yield* Effect.failCause(rollbackResult.cause);
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         turns: input.numTurns,

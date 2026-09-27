@@ -1618,6 +1618,87 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("routes first-session startup UI through the pending provider before binding", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-startup-ui-pending");
+      const started = yield* Deferred.make<void>();
+      const answered = yield* Deferred.make<void>();
+      const originalStart = routing.codex.startSession.getMockImplementation()!;
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined);
+          yield* Deferred.await(answered);
+          return yield* originalStart(input);
+        }),
+      );
+      routing.codex.respondToUserInput.mockImplementationOnce(() =>
+        Deferred.succeed(answered, undefined).pipe(Effect.asVoid),
+      );
+      const starting = yield* provider
+        .startSession(threadId, {
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(started);
+      yield* provider.respondToRequest({
+        threadId,
+        requestId: asRequestId("startup-approval"),
+        decision: "accept",
+      });
+      yield* provider.respondToUserInput({
+        threadId,
+        requestId: asRequestId("startup-confirm"),
+        answers: { resolution: "ok" },
+      });
+      const session = yield* Fiber.join(starting);
+      assert.equal(session.threadId, threadId);
+      assert.deepEqual(routing.codex.respondToUserInput.mock.calls.at(-1), [
+        threadId,
+        asRequestId("startup-confirm"),
+        { resolution: "ok" },
+      ]);
+      assert.deepEqual(routing.codex.respondToRequest.mock.calls.at(-1), [
+        threadId,
+        asRequestId("startup-approval"),
+        "accept",
+      ]);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("discards pending response routing after a failed first start", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-startup-ui-failed");
+      const originalStart = routing.codex.startSession.getMockImplementation()!;
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        originalStart(input).pipe(
+          Effect.map((session) => ({ ...session, provider: CLAUDE_AGENT_DRIVER })),
+        ),
+      );
+      yield* Effect.flip(
+        provider.startSession(threadId, {
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+      const routed = yield* Effect.flip(
+        provider.respondToUserInput({
+          threadId,
+          requestId: asRequestId("stale-startup-ui"),
+          answers: { resolution: "ok" },
+        }),
+      );
+      assert.instanceOf(routed, ProviderValidationError);
+      assert.include(routed.issue, "no persisted provider binding");
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
   it.effect.each([CODEX_DRIVER, CLAUDE_AGENT_DRIVER, CURSOR_DRIVER])(
     "rejects missing, file, and saved workspace paths before starting %s",
     (driver) =>
@@ -1753,6 +1834,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       yield* provider.interruptTurn({ threadId: session.threadId });
       assert.deepEqual(routing.codex.interruptTurn.mock.calls, [[session.threadId, undefined]]);
 
+      routing.codex.respondToRequest.mockClear();
+      routing.codex.respondToUserInput.mockClear();
       yield* provider.respondToRequest({
         threadId: session.threadId,
         requestId: asRequestId("req-1"),
@@ -1827,6 +1910,51 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(startPayload.threadId, session.threadId);
       }
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("persists a successful branch cursor even when history projection fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-branch-history-failure");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("branch-history-failure"),
+        runtimeMode: "auto",
+      });
+      const branchedCursor = { sessionFile: "/tmp/new-native-branch.jsonl" };
+      routing.codex.rollbackThread.mockImplementationOnce(() =>
+        Effect.sync(() => {
+          routing.codex.updateSession(threadId, (session) => ({
+            ...session,
+            resumeCursor: branchedCursor,
+          }));
+        }).pipe(
+          Effect.flatMap(() =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: CODEX_DRIVER,
+                method: "readThread",
+                detail: "projection failed after branch",
+              }),
+            ),
+          ),
+        ),
+      );
+      const failure = yield* provider
+        .rollbackConversation({ threadId, numTurns: 1 })
+        .pipe(Effect.flip);
+      assert.match(String(failure), /projection failed after branch/);
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const binding = yield* directory.getBinding(threadId);
+      assert(Option.isSome(binding));
+      assert.deepEqual(binding.value.resumeCursor, branchedCursor);
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      yield* provider.sendTurn({ threadId, input: "resume branched state", attachments: [] });
+      assert.deepEqual(routing.codex.startSession.mock.calls[0]?.[0]?.resumeCursor, branchedCursor);
     }),
   );
 

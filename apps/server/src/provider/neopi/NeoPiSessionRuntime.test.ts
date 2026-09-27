@@ -3,8 +3,11 @@ import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  CommandId,
+  DEFAULT_PROVIDER_INTERACTION_MODE,
   ApprovalRequestId,
   ProviderDriverKind,
+  ProjectId,
   ProviderInstanceId,
   ThreadId,
   type TurnId,
@@ -20,8 +23,10 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "./NeoPiSessionRuntime.ts";
+import type { NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
 import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
 import { makeNeoPiDiscoveryHub } from "./NeoPiDiscovery.ts";
+import { makeOrchestrationIntegrationHarness } from "../../../integration/OrchestrationEngineHarness.integration.ts";
 
 const root = "/tmp/neopi-runtime-tests";
 const sessionDir = `${root}/neopi/sessions/default/test`;
@@ -30,9 +35,15 @@ type Command = { id?: string; type: string; [key: string]: unknown };
 const decodeCommand = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeCommand = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 type Emitter = (frame: unknown) => Effect.Effect<void>;
+const defaultReady = {
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1, 2],
+  capabilities: ["rpc-ui"],
+};
 const testPeer = Effect.fn("testPeer")(function* (
   handler: (cmd: Command, emit: Emitter) => Effect.Effect<void>,
-  ready: unknown = { type: "ready", protocolVersion: 1, capabilities: ["rpc-ui"] },
+  ready: unknown = defaultReady,
 ) {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
@@ -57,7 +68,9 @@ const testPeer = Effect.fn("testPeer")(function* (
         pending = pending.slice(newline + 1);
         const command = decodeCommand(line) as Command;
         commands.push(command);
-        yield* handler(command, emit);
+        yield* ready === defaultReady && command.type === "negotiate_protocol"
+          ? answer(command, emit, { protocolVersion: 2 })
+          : handler(command, emit);
       }
     }
   }).pipe(Effect.ignore, Effect.forkScoped);
@@ -145,6 +158,22 @@ const awaitOutcomes = (frames: Array<Record<string, unknown>>, count: number) =>
     );
   });
 
+it.live("rejects a v1-only peer during live session admission", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(basicHandler, { type: "ready", protocolVersion: 1 });
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const error = yield* Effect.flip(runtime.start);
+      NodeAssert.equal(error.code, "startup");
+      NodeAssert.match(error.message, /protocol v2/);
+      NodeAssert.equal(
+        peer.commands.some((cmd) => cmd.type === "get_state"),
+        false,
+      );
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("rejects auto-resumed fresh sessions and mismatched resume ids, closing both peers", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -207,6 +236,12 @@ it.live(
           NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
         }
         NodeAssert.equal(frames.filter((frame) => frame.type === "t3.turn.outcome").length, 4);
+        NodeAssert.deepEqual(
+          (yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries.map((boundary) =>
+            "kind" in boundary ? boundary.kind : boundary.userEntryId,
+          ),
+          ["unknown", "local", "local", "unknown"],
+        );
         NodeAssert.ok(
           frames.findIndex((frame) => frame.type === "command_output") <
             frames.findIndex(
@@ -225,12 +260,14 @@ it.live(
         let ordinal = 0;
         const entries: Array<{
           id: string;
+          parentId: string | null;
           type: string;
           message: { role: string; content: Array<{ type: string; text: string }> };
         }> = [];
         const append = (id: string, text: string) => {
           entries.push({
             id,
+            parentId: entries.at(-1)?.id ?? null,
             type: "message",
             message: { role: "user", content: [{ type: "text", text }] },
           });
@@ -238,16 +275,15 @@ it.live(
         const peer = yield* testPeer((cmd, emit) =>
           Effect.gen(function* () {
             if (cmd.type === "get_entries") {
-              const since = entries.findIndex((entry) => entry.id === cmd.since);
               return yield* answer(cmd, emit, {
-                entries: entries.slice(since + 1),
+                entries,
                 leafId: entries.at(-1)?.id ?? null,
               });
             }
             if (cmd.type === "prompt") {
               ordinal++;
+              append(`user-${ordinal}`, `expanded: ${String(cmd.message)}`);
               append(`hidden-${ordinal}`, "extension instruction");
-              append(`user-${ordinal}`, String(cmd.message));
               yield* answer(cmd, emit, { agentInvoked: true });
               yield* emit({ type: "agent_start" });
               return;
@@ -284,12 +320,12 @@ it.live(
         );
         const cursor = yield* SubscriptionRef.get(runtime.cursor);
         NodeAssert.deepEqual(
-          cursor.turnBoundaries.map((boundary) => boundary.userEntryId),
+          cursor.turnBoundaries.map((boundary) =>
+            "userEntryId" in boundary ? boundary.userEntryId : boundary.kind,
+          ),
           ["user-1", "user-2"],
         );
-        NodeAssert.ok(
-          peer.commands.some((cmd) => cmd.type === "get_entries" && cmd.since === "steer-1"),
-        );
+        NodeAssert.ok(peer.commands.some((cmd) => cmd.type === "get_entries"));
         NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "steer").length, 1);
         NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "abort").length, 1);
         yield* runtime.stop;
@@ -607,7 +643,7 @@ it.live("treats recovered nonterminal errors as a successful original turn", () 
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("answers startup UI before v2 negotiation completes through the adapter", () =>
+it.live("answers first-session startup UI through ProviderService before v2 negotiation", () =>
   Effect.scoped(
     Effect.gen(function* () {
       let negotiateId: string | undefined;
@@ -651,7 +687,7 @@ it.live("answers startup UI before v2 negotiation completes through the adapter"
           launchArgs: "",
           customModels: [],
         },
-        instanceId: ProviderInstanceId.make("neopi-startup-test"),
+        instanceId: ProviderInstanceId.make("neopi"),
         binary: "npi",
         cwd: "/tmp",
         t3Home: root,
@@ -660,19 +696,49 @@ it.live("answers startup UI before v2 negotiation completes through the adapter"
         spawn: () => Effect.succeed(peer.handle),
         discovery: yield* makeNeoPiDiscoveryHub(),
       });
-      yield* Stream.runForEach(adapter.streamEvents, (event) => {
-        return event.type === "user-input.requested"
-          ? adapter.respondToUserInput(threadId, ApprovalRequestId.make(event.requestId!), {
-              "startup-input": "true",
+      const provider = ProviderDriverKind.make("neopi");
+      const instanceId = ProviderInstanceId.make("neopi");
+      const projectId = ProjectId.make("neopi-startup-test-project");
+      const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
+      yield* Effect.addFinalizer(() => harness.dispose);
+      const createdAt = "2026-09-27T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("neopi-startup-project-create"),
+        projectId,
+        title: "NeoPi startup",
+        workspaceRoot: harness.workspaceDir,
+        defaultModelSelection: { instanceId, model: "neopi-current" },
+        createdAt,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("neopi-startup-thread-create"),
+        threadId,
+        projectId,
+        title: "Startup UI",
+        modelSelection: { instanceId, model: "neopi-current" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: harness.workspaceDir,
+        createdAt,
+      });
+      yield* Stream.runForEach(harness.providerService.streamEvents, (event) =>
+        event.type === "user-input.requested"
+          ? harness.providerService.respondToUserInput({
+              threadId,
+              requestId: ApprovalRequestId.make(event.requestId!),
+              answers: { "startup-input": "true" },
             })
-          : Effect.void;
-      }).pipe(Effect.forkScoped);
-      const session = yield* adapter
-        .startSession({
+          : Effect.void,
+      ).pipe(Effect.forkScoped);
+      const session = yield* harness.providerService
+        .startSession(threadId, {
           threadId,
-          provider: ProviderDriverKind.make("neopi"),
-          providerInstanceId: ProviderInstanceId.make("neopi-startup-test"),
-          cwd: "/tmp",
+          provider,
+          providerInstanceId: instanceId,
+          cwd: harness.workspaceDir,
           runtimeMode: "approval-required",
         })
         .pipe(Effect.timeout("5 seconds"));
@@ -680,7 +746,6 @@ it.live("answers startup UI before v2 negotiation completes through the adapter"
       NodeAssert.ok(
         peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.confirmed === true),
       );
-      yield* adapter.stopAll();
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -780,6 +845,8 @@ it.live(
         let mode: "off" | "chat" | "erp" | "raw" = "off";
         const peer = yield* testPeer(
           (cmd, emit) => {
+            if (cmd.type === "get_entries") return answer(cmd, emit, { entries: [], leafId: null });
+            if (cmd.type === "get_messages_page") return answer(cmd, emit, { messages: [] });
             if (cmd.type === "negotiate_protocol") return answer(cmd, emit, { protocolVersion: 2 });
             if (cmd.type === "get_state")
               return answer(cmd, emit, {
@@ -852,6 +919,20 @@ it.live(
         );
         NodeAssert.equal(
           peer.commands.some((cmd) => cmd.type === "prompt"),
+          false,
+        );
+        const cursorBefore = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
+        NodeAssert.deepEqual(
+          cursorBefore.turnBoundaries.map((boundary) =>
+            "kind" in boundary ? boundary.kind : boundary.userEntryId,
+          ),
+          ["local", "local", "local"],
+        );
+        yield* adapter.rollbackThread(threadId, 1);
+        const cursorAfter = (yield* adapter.listSessions())[0]?.resumeCursor as NeoPiResumeCursor;
+        NodeAssert.equal(cursorAfter.turnBoundaries.length, 2);
+        NodeAssert.equal(
+          peer.commands.some((cmd) => cmd.type === "branch"),
           false,
         );
         for (let count = 0; count < 100 && warnings.length < 2; count++)

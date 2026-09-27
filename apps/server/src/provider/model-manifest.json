@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-09-24T18:40:00Z",
+  "updatedAt": "2026-09-27T00:00:00Z",
   "compatibility": [
     {
       "driver": "codex",
@@ -47,6 +47,15 @@
       "ranges": [
         { "range": ">=1.14.19", "status": "supported" },
         { "range": "<1.14.19", "status": "broken" }
+      ]
+    },
+    {
+      "driver": "neopi",
+      "t3CodeRange": ">=0.0.42",
+      "recommendedRange": ">=18.3.2",
+      "ranges": [
+        { "range": ">=18.3.2", "status": "supported" },
+        { "range": "<18.3.2", "status": "unknown" }
       ]
     },
     {

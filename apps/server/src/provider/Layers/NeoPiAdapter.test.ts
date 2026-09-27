@@ -282,6 +282,9 @@ it.live("aborts running turn before rollback and persists the branched cursor", 
           type: "message",
           message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
         },
+        { id: "custom", parentId: "a1", type: "custom_message", content: "notice" },
+        { id: "summary", parentId: "custom", type: "branch_summary", summary: "earlier branch" },
+        { id: "compact", parentId: "summary", type: "compaction", summary: "compressed" },
       ];
       let branched = false;
       const requests: string[] = [];
@@ -314,14 +317,25 @@ it.live("aborts running turn before rollback and persists the branched cursor", 
           Effect.sync(() => {
             requests.push(`${cmd.type}:${"entryId" in cmd ? String(cmd.entryId) : ""}`);
             if (cmd.type === "get_entries")
-              return { entries: branched ? [] : entries, leafId: branched ? null : "a1" };
+              return { entries: branched ? [] : entries, leafId: branched ? null : "compact" };
             if (cmd.type === "branch") {
               branched = true;
               return { cancelled: false };
             }
             if (cmd.type === "get_state")
               return { sessionFile: `${home}/new.jsonl`, sessionId: "new" };
-            return { messages: branched ? [] : entries.map((entry) => entry.message) };
+            return {
+              messages: branched
+                ? []
+                : [
+                    ...entries
+                      .slice(0, 2)
+                      .flatMap((entry) => ("message" in entry ? [entry.message] : [])),
+                    { role: "custom", content: "notice" },
+                    { role: "branchSummary", summary: "earlier branch" },
+                    { role: "compactionSummary", summary: "compressed" },
+                  ],
+            };
           }),
         frames: Stream.fromQueue(frames),
         restart: () => Effect.void,
@@ -351,7 +365,7 @@ it.live("aborts running turn before rollback and persists the branched cursor", 
       });
       assert.deepEqual(
         (yield* adapter.readThread(threadId)).turns.map((turn) => turn.items.length),
-        [2],
+        [5],
       );
       yield* adapter.sendTurn({ threadId, input: "first" });
       const rewind = yield* adapter.rollbackThread(threadId, 1);

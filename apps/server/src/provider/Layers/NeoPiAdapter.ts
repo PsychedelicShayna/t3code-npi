@@ -75,8 +75,9 @@ function parseResumeCursor(value: unknown): NeoPiResumeCursor | undefined {
       return (
         typeof entry.turnId === "string" &&
         entry.turnId.length > 0 &&
-        typeof entry.userEntryId === "string" &&
-        entry.userEntryId.length > 0
+        ((typeof entry.userEntryId === "string" && entry.userEntryId.length > 0) ||
+          entry.kind === "local" ||
+          entry.kind === "unknown")
       );
     })
   )
@@ -478,6 +479,11 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             .request({ type: "get_state" })
             .pipe(Effect.mapError((cause) => rpcError(input.threadId, "get_state", cause))),
         );
+        const previous = yield* SubscriptionRef.get(session.runtime.cursor);
+        yield* SubscriptionRef.set(session.runtime.cursor, {
+          ...previous,
+          turnBoundaries: [...previous.turnBoundaries, { turnId, kind: "local" }],
+        });
         yield* processFrame(session, { type: "agent_start", turnId });
         yield* processFrame(session, { type: "t3.state", state: updated, turnId });
         yield* processFrame(session, { type: "t3.turn.outcome", state: "completed", turnId });

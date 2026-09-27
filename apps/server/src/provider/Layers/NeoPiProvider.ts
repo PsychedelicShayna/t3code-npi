@@ -27,7 +27,7 @@ const PRESENTATION = {
   badgeLabel: "OMP RPC",
   showInteractionModeToggle: false,
   reportsContextWindow: true,
-  supportsConversationRollback: false,
+  supportsConversationRollback: true,
 } as const;
 const fallbackModels = (settings: NeoPiSettings) =>
   providerModelsFromSettings(

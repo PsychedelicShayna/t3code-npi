@@ -19,7 +19,13 @@ export async function rollbackNeoPiConversation(input: {
   const { cursor, numTurns, request } = input;
   if (!Number.isSafeInteger(numTurns) || numTurns < 1 || numTurns > cursor.turnBoundaries.length)
     throw new NeoPiRollbackError("rollback unavailable for turns before boundary capture");
-  const target = cursor.turnBoundaries[cursor.turnBoundaries.length - numTurns]!;
+  const removed = cursor.turnBoundaries.slice(-numTurns);
+  if (removed.some((turn) => "kind" in turn && turn.kind === "unknown"))
+    throw new NeoPiRollbackError("rollback unavailable across a turn with unknown native history");
+  const target = removed.find(
+    (turn): turn is Extract<typeof turn, { userEntryId: string }> => "userEntryId" in turn,
+  );
+  if (!target) return { ...cursor, turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns) };
   const { entries, leafId } = object(await request({ type: "get_entries" }));
   if (!Array.isArray(entries) || !(typeof leafId === "string" || leafId === null))
     throw new NeoPiRollbackError("NeoPi/OMP did not return a valid entry ancestry");
@@ -58,9 +64,6 @@ export async function rollbackNeoPiConversation(input: {
     state.sessionId === cursor.sessionId
   )
     throw new NeoPiRollbackError("NeoPi/OMP did not report the branched session identity");
-  const after = object(await request({ type: "get_entries" }));
-  if (after.leafId !== selected.parentId || !Array.isArray(after.entries))
-    throw new NeoPiRollbackError("NeoPi/OMP branch did not end before the removed user entry");
   return {
     ...cursor,
     sessionFile: resolve(state.sessionFile),
@@ -98,31 +101,35 @@ export function groupNeoPiHistory(
   }
   ancestry.reverse();
   const boundaries = new Map(
-    cursor.turnBoundaries.map((boundary) => [boundary.userEntryId, boundary.turnId]),
+    cursor.turnBoundaries.flatMap((boundary) =>
+      "userEntryId" in boundary ? [[boundary.userEntryId, boundary.turnId] as const] : [],
+    ),
   );
   const turns: Array<{ id: TurnId; items: unknown[] }> = [];
   let messageIndex = 0;
   for (const entry of ancestry) {
-    if (entry.type !== "message" && entry.type !== "custom_message") continue;
-    const native = object(entry.message);
-    const message = object(messages[messageIndex]);
-    // get_messages_page contains display transformations (custom messages, compaction).
-    // Match persisted messages by role/content to avoid treating hidden user entries as turns.
-    if (
-      entry.type !== "message" ||
-      native.role !== message.role ||
-      JSON.stringify(native.content) !== JSON.stringify(message.content)
-    )
-      continue;
     const turnId = boundaries.get(String(entry.id));
     if (turnId) turns.push({ id: turnId, items: [] });
+    if (messageIndex >= messages.length) continue;
+    const message = object(messages[messageIndex]);
+    const native = object(entry.message);
+    const direct =
+      entry.type === "message" &&
+      native.role === message.role &&
+      JSON.stringify(native.content) === JSON.stringify(message.content);
+    const converted =
+      (entry.type === "custom_message" && message.role === "custom") ||
+      (entry.type === "branch_summary" && message.role === "branchSummary") ||
+      (entry.type === "compaction" && message.role === "compactionSummary");
+    if (!direct && !converted) continue;
     if (turns.length === 0) turns.push({ id: TurnId.make("neopi-history-1"), items: [] });
-    turns[turns.length - 1]!.items.push(messages[messageIndex]);
-    messageIndex++;
+    turns[turns.length - 1]!.items.push(messages[messageIndex++]);
   }
-  if (messageIndex !== messages.length)
-    throw new NeoPiRollbackError(
-      "NeoPi/OMP history does not align with persisted entry boundaries",
-    );
+  // Compaction can replace the discarded prefix with synthesized context messages;
+  // native pages are authoritative for display, even when old entry bodies differ.
+  while (messageIndex < messages.length) {
+    if (turns.length === 0) turns.push({ id: TurnId.make("neopi-history-1"), items: [] });
+    turns[turns.length - 1]!.items.push(messages[messageIndex++]);
+  }
   return turns;
 }
