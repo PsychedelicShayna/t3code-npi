@@ -9,9 +9,10 @@ import {
   type HostToolCallFrame,
 } from "effect-neopi-rpc/client";
 import { NeoPiRpcError } from "effect-neopi-rpc/errors";
-import * as FileSystem from "effect/FileSystem";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Exit from "effect/Exit";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
@@ -66,7 +67,6 @@ export interface NeoPiRuntimeInput {
   readonly launchArgs?: string;
   readonly runtimeMode: RuntimeMode;
   readonly cursor?: NeoPiResumeCursor;
-  readonly knownCapabilities?: ReadonlySet<string>;
   readonly spawn: SpawnFn;
   readonly hostBridge?: HostBridge;
   readonly requestTimeoutMs?: number;
@@ -90,6 +90,8 @@ const activeUiMethods = new Set(["select", "confirm", "input", "editor"]);
 
 type ActiveTurn = {
   readonly id: TurnId;
+  readonly text: string;
+  readonly baselineLeaf?: string;
   readonly boundaryDone: Deferred.Deferred<void>;
   boundaryStarted: boolean;
   promptId?: string;
@@ -106,7 +108,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>(
     input.cursor ?? { v: 1, sessionFile: "", sessionId: "", sessionDir: "", turnBoundaries: [] },
   );
-  const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+  const frames = yield* Queue.unbounded<NeoPiRuntimeFrame, Cause.Done<void>>();
   const capabilities = new Set<string>();
   const uiPending = new Set<string>();
   const hostPending = new Map<string, Scope.Closeable>();
@@ -117,9 +119,9 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   let compacting = false;
   let mode = input.runtimeMode;
   let pendingMode = false;
-  let lastLeaf: string | undefined;
 
-  const emit = (frame: NeoPiRuntimeFrame) => Queue.offer(frames, frame).pipe(Effect.asVoid);
+  const emit = (frame: NeoPiRuntimeFrame) =>
+    Queue.offer(frames, frame).pipe(Effect.orDie, Effect.asVoid);
   const setState = (value: NeoPiRuntimeState) => SubscriptionRef.set(state, value);
   const current = () =>
     client
@@ -167,30 +169,32 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     }
     hostPending.clear();
   });
-  const captureBoundary = (turnId: TurnId) =>
+  const captureBoundary = (turn: ActiveTurn) =>
     Effect.gen(function* () {
       for (let attempt = 0; attempt < 3; attempt++) {
         const result = record(
-          yield* request({ type: "get_entries", ...(lastLeaf ? { since: lastLeaf } : {}) }).pipe(
-            Effect.mapError(rpcError),
-          ),
+          yield* request({
+            type: "get_entries",
+            ...(turn.baselineLeaf ? { since: turn.baselineLeaf } : {}),
+          }).pipe(Effect.mapError(rpcError)),
         );
         const entries = Array.isArray(result.entries) ? result.entries.map(record) : [];
-        const previous = yield* SubscriptionRef.get(cursor);
-        const seen = new Set(previous.turnBoundaries.map((boundary) => boundary.userEntryId));
-        const user = entries.find(
-          (entry) =>
+        const user = entries.find((entry) => {
+          const message = record(entry.message);
+          const content = Array.isArray(message.content) ? message.content.map(record) : [];
+          return (
             entry.type === "message" &&
-            record(entry.message).role === "user" &&
+            message.role === "user" &&
             typeof entry.id === "string" &&
-            !seen.has(entry.id),
-        );
+            content.some((block) => block.type === "text" && block.text === turn.text)
+          );
+        });
         if (user && typeof user.id === "string") {
+          const previous = yield* SubscriptionRef.get(cursor);
           yield* SubscriptionRef.set(cursor, {
             ...previous,
-            turnBoundaries: [...previous.turnBoundaries, { turnId, userEntryId: user.id }],
+            turnBoundaries: [...previous.turnBoundaries, { turnId: turn.id, userEntryId: user.id }],
           });
-          if (typeof result.leafId === "string") lastLeaf = result.leafId;
           return;
         }
         if (attempt < 2) yield* Effect.sleep("50 millis");
@@ -199,11 +203,11 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         type: "notice",
         level: "warning",
         message: "NeoPi/OMP did not expose this turn's user entry; rollback is unavailable for it",
-        turnId,
+        turnId: turn.id,
       });
     });
   const rememberBoundary = (turn: ActiveTurn) =>
-    captureBoundary(turn.id).pipe(
+    captureBoundary(turn).pipe(
       Effect.catch((error) =>
         emit({
           type: "notice",
@@ -239,20 +243,11 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const observePrompt = (turn: ActiveTurn, handle: PromptHandle) =>
     Effect.gen(function* () {
       const outcome = yield* Deferred.await(handle.outcome);
-      if (active !== turn) return;
-      if (outcome.kind === "rejected") {
-        yield* settle(turn, "failed", outcome.error);
-      } else if (outcome.kind === "local") {
-        // The client resolves prompt_result before publishing that event. Give the
-        // event pump its chance to forward preceding command_output frames first.
-        yield* Effect.sleep("10 millis");
-        yield* settle(turn, "completed");
-      } else {
-        turn.agentInvoked = true;
-        if (!turn.boundaryStarted) {
-          turn.boundaryStarted = true;
-          yield* rememberBoundary(turn).pipe(Effect.forkIn(lifetime!));
-        }
+      if (active !== turn || outcome.kind !== "agent") return;
+      turn.agentInvoked = true;
+      if (!turn.boundaryStarted) {
+        turn.boundaryStarted = true;
+        yield* rememberBoundary(turn).pipe(Effect.forkIn(lifetime!));
       }
     });
   const handleEvent = (frame: NeoPiRuntimeFrame) =>
@@ -267,14 +262,27 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       }
       if (!turn) return;
       if (
-        frame.type === "prompt_result" &&
-        frame.agentInvoked === false &&
+        (frame.type === "t3.prompt.local" ||
+          (frame.type === "prompt_result" && frame.agentInvoked === false)) &&
         (!turn.promptId || frame.id === turn.promptId)
       ) {
         yield* settle(turn, "completed");
         return;
       }
-      if (frame.type === "agent_start") turn.agentInvoked = true;
+      if (frame.type === "t3.prompt.failed" && (!turn.promptId || frame.id === turn.promptId)) {
+        yield* settle(
+          turn,
+          "failed",
+          typeof frame.error === "string" ? frame.error : "prompt failed",
+        );
+        return;
+      }
+      if (frame.type === "agent_start") {
+        turn.agentInvoked = true;
+        delete turn.error;
+      }
+      if (frame.type === "message_start" && record(frame.message).role === "assistant")
+        delete turn.error;
       if (frame.type === "message_update") {
         const event = record(frame.assistantMessageEvent);
         if (event.type === "error" && (event.reason === "aborted" || event.reason === "error")) {
@@ -293,7 +301,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
             .filter((message) => message.role === "assistant")
             .at(-1)
         : undefined;
-      const reason = turn.error?.reason ?? last?.stopReason;
+      const reason = last?.stopReason ?? turn.error?.reason;
       const message =
         turn.error?.message ??
         (typeof last?.errorMessage === "string" ? last.errorMessage : undefined);
@@ -531,8 +539,13 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         });
       if (turn.modelSelection) yield* applyModelSelection(turn.modelSelection);
       const peer = yield* current();
+      const baseline = record(
+        yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
+      );
       const entry: ActiveTurn = {
         id: turn.turnId,
+        text: turn.text,
+        ...(typeof baseline.leafId === "string" ? { baselineLeaf: baseline.leafId } : {}),
         boundaryDone: yield* Deferred.make<void>(),
         boundaryStarted: false,
         agentInvoked: false,
@@ -628,6 +641,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     yield* setState("stopped");
     if (exit && previous !== "failed")
       yield* emit({ type: "t3.session.exited", recoverable: false, ...exit });
+    yield* Queue.end(frames);
   });
   const onSessionIdentityMayHaveChanged = Effect.gen(function* () {
     const fresh = yield* getState();

@@ -2,7 +2,7 @@
 import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { ThreadId, TurnId } from "@t3tools/contracts";
+import { ProviderDriverKind, ProviderInstanceId, ThreadId, type TurnId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -14,6 +14,8 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "./NeoPiSessionRuntime.ts";
+import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
+import { makeNeoPiDiscoveryHub } from "./NeoPiDiscovery.ts";
 
 const root = "/tmp/neopi-runtime-tests";
 const sessionDir = `${root}/neopi/sessions/default/test`;
@@ -213,19 +215,36 @@ it.live(
     Effect.scoped(
       Effect.gen(function* () {
         let ordinal = 0;
+        const entries: Array<{
+          id: string;
+          type: string;
+          message: { role: string; content: Array<{ type: string; text: string }> };
+        }> = [];
+        const append = (id: string, text: string) => {
+          entries.push({
+            id,
+            type: "message",
+            message: { role: "user", content: [{ type: "text", text }] },
+          });
+        };
         const peer = yield* testPeer((cmd, emit) =>
           Effect.gen(function* () {
-            if (cmd.type === "get_entries")
+            if (cmd.type === "get_entries") {
+              const since = entries.findIndex((entry) => entry.id === cmd.since);
               return yield* answer(cmd, emit, {
-                entries: [{ type: "message", id: `user-${ordinal}`, message: { role: "user" } }],
-                leafId: `leaf-${ordinal}`,
+                entries: entries.slice(since + 1),
+                leafId: entries.at(-1)?.id ?? null,
               });
+            }
             if (cmd.type === "prompt") {
               ordinal++;
+              append(`hidden-${ordinal}`, "extension instruction");
+              append(`user-${ordinal}`, String(cmd.message));
               yield* answer(cmd, emit, { agentInvoked: true });
               yield* emit({ type: "agent_start" });
               return;
             }
+            if (cmd.type === "steer") append("steer-1", String(cmd.message));
             return yield* basicHandler(cmd, emit);
           }),
         );
@@ -259,6 +278,9 @@ it.live(
         NodeAssert.deepEqual(
           cursor.turnBoundaries.map((boundary) => boundary.userEntryId),
           ["user-1", "user-2"],
+        );
+        NodeAssert.ok(
+          peer.commands.some((cmd) => cmd.type === "get_entries" && cmd.since === "steer-1"),
         );
         NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "steer").length, 1);
         NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "abort").length, 1);
@@ -322,6 +344,88 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
+it.live("removes a dead adapter session after mock peer exit and resumes on the next send", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-test");
+      const instanceId = ProviderInstanceId.make("neopi-exit-test");
+      const adapterHandler = (cmd: Command, emit: Emitter) =>
+        cmd.type === "get_state"
+          ? answer(cmd, emit, {
+              sessionId: "s1",
+              sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
+              messageCount: 0,
+            })
+          : cmd.type === "prompt"
+            ? answer(cmd, emit, { agentInvoked: true })
+            : basicHandler(cmd, emit);
+      const peers = [yield* testPeer(adapterHandler), yield* testPeer(adapterHandler)];
+      let launches = 0;
+      const adapter = yield* makeNeoPiAdapter({
+        settings: {
+          enabled: true,
+          binaryPath: "npi",
+          profile: "",
+          launchArgs: "",
+          customModels: [],
+        },
+        instanceId,
+        binary: "npi",
+        cwd: "/tmp",
+        t3Home: root,
+        attachmentsDir: root,
+        environment: {},
+        spawn: () => Effect.succeed(peers[launches++]!.handle),
+        discovery: yield* makeNeoPiDiscoveryHub(),
+      });
+      const events: Array<{ type: string; payload: unknown }> = [];
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ).pipe(Effect.forkScoped);
+      const sessionInput = {
+        threadId,
+        provider: ProviderDriverKind.make("neopi"),
+        providerInstanceId: instanceId,
+        cwd: "/tmp",
+        runtimeMode: "approval-required" as const,
+      };
+      const first = yield* adapter.startSession(sessionInput);
+      yield* adapter.sendTurn({ threadId, input: "before exit" });
+      yield* peers[0]!.finish("SIGKILL");
+      for (
+        let attempt = 0;
+        attempt < 200 &&
+        !(
+          events.some((event) => event.type === "session.exited") &&
+          !(yield* adapter.hasSession(threadId))
+        );
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      NodeAssert.ok(
+        events.some(
+          (event) =>
+            event.type === "session.exited" &&
+            (event.payload as { recoverable?: boolean; exitKind?: string }).recoverable === true &&
+            (event.payload as { exitKind?: string }).exitKind === "error",
+        ),
+      );
+      const resumed = yield* adapter.startSession({
+        ...sessionInput,
+        resumeCursor: first.resumeCursor,
+      });
+      NodeAssert.equal(resumed.status, "ready");
+      yield* adapter.sendTurn({ threadId, input: "after exit" });
+      NodeAssert.equal(launches, 2);
+      yield* adapter.stopAll();
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGTERM", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -399,7 +503,13 @@ it.live(
           Effect.gen(function* () {
             if (cmd.type === "get_entries")
               return yield* answer(cmd, emit, {
-                entries: [{ id: `user-${ordinal}`, type: "message", message: { role: "user" } }],
+                entries: [
+                  {
+                    id: `user-${ordinal}`,
+                    type: "message",
+                    message: { role: "user", content: [{ type: "text", text: "hello" }] },
+                  },
+                ],
                 leafId: `leaf-${ordinal}`,
               });
             if (cmd.type === "prompt") {
@@ -449,4 +559,42 @@ it.live(
         yield* runtime.stop;
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("treats recovered nonterminal errors as a successful original turn", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer((cmd, emit) =>
+        cmd.type === "prompt"
+          ? answer(cmd, emit, { agentInvoked: true }).pipe(
+              Effect.andThen(emit({ type: "agent_start" })),
+            )
+          : basicHandler(cmd, emit),
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("retry-success"));
+      yield* peer.emit({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "error",
+          reason: "error",
+          error: { errorMessage: "temporary provider failure" },
+        },
+      });
+      yield* peer.emit({ type: "agent_end", isTerminal: false });
+      yield* peer.emit({ type: "agent_start" });
+      yield* peer.emit({ type: "message_start", message: { role: "assistant" } });
+      yield* peer.emit({
+        type: "agent_end",
+        isTerminal: true,
+        messages: [{ role: "assistant", stopReason: "stop" }],
+      });
+      const outcomes = yield* awaitOutcomes(frames, 1);
+      NodeAssert.equal(outcomes[0]?.state, "completed");
+      NodeAssert.equal(outcomes[0]?.errorMessage, undefined);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
 );

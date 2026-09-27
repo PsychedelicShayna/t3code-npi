@@ -8,11 +8,12 @@ import {
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
 import type { UiResponseWire } from "effect-neopi-rpc/schema";
+import { NEOPI_CAPABILITIES } from "../NeoPiCompatibility.ts";
 
-import type { MapCtx } from "./MapCtx.ts";
+import { scopedItemId, type MapCtx } from "./MapCtx.ts";
 import { approvalRequestType, parseApprovalPrompt } from "./approvalPrompt.ts";
 
-export const NEOPI_CAP_TOOL_APPROVAL = "tool_approval_request";
+export const NEOPI_CAP_TOOL_APPROVAL = NEOPI_CAPABILITIES.toolApprovalRequest;
 
 export type UiReply =
   | { readonly _tag: "ExtensionUi"; readonly frame: UiResponseWire }
@@ -94,7 +95,7 @@ function makeEvent(
     ...(id
       ? { requestId: RuntimeRequestId.make(id), providerRefs: { providerRequestId: id } }
       : {}),
-    ...(itemId ? { itemId: RuntimeItemId.make(itemId) } : {}),
+    ...(itemId ? { itemId: RuntimeItemId.make(scopedItemId(ctx, itemId)) } : {}),
     raw: { source: "neopi.rpc", payload: frame },
     type,
     payload,

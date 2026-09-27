@@ -1,6 +1,8 @@
 import { ProviderDriverKind, ProviderInstanceId, ThreadId, TurnId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
+import { scopedItemId } from "./MapCtx.ts";
+
 import {
   emptyToolState,
   mapToolFrame,
@@ -103,10 +105,10 @@ describe("NeoPi tool mapper", () => {
         .filter((event) => event.type === "content.delta")
         .map((event) => [event.itemId, event.payload.delta]),
     ).toEqual([
-      ["one", "first"],
-      ["two", "second"],
-      ["one", "!"],
-      ["two", "!"],
+      [scopedItemId(context(), "one"), "first"],
+      [scopedItemId(context(), "two"), "second"],
+      [scopedItemId(context(), "one"), "!"],
+      [scopedItemId(context(), "two"), "!"],
     ]);
   });
 
@@ -228,7 +230,10 @@ describe("NeoPi tool mapper", () => {
       withHostToolNames(emptyToolState(), ["link_pull_request"]),
     );
     expect(events.map((event) => event.type)).toEqual(["item.started", "item.completed"]);
-    expect(events.map((event) => event.itemId)).toEqual(["host-1", "host-1"]);
+    expect(events.map((event) => event.itemId)).toEqual([
+      scopedItemId(context(), "host-1"),
+      scopedItemId(context(), "host-1"),
+    ]);
     expect(events[0]?.payload).toMatchObject({
       itemType: "mcp_tool_call",
       toolSource: { key: "t3-code" },
@@ -253,7 +258,9 @@ describe("NeoPi tool mapper", () => {
       },
     ]);
     expect(events.map((event) => event.type)).toEqual(["item.started", "item.completed"]);
-    expect(new Set(events.map((event) => event.itemId))).toEqual(new Set(["late-1"]));
+    expect(new Set(events.map((event) => event.itemId))).toEqual(
+      new Set([scopedItemId(context(), "late-1")]),
+    );
     expect(events[1]?.payload).toMatchObject({
       itemType: "mcp_tool_call",
       toolSource: { key: "t3-code" },

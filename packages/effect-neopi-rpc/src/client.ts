@@ -139,6 +139,7 @@ const unsupportedUriResult = (id: string): HostUriResultWire => ({
 export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* (
   options: NeoPiRpcClientOptions,
 ) {
+  const lifetime = yield* Effect.scope;
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   const stderrTailBytes = options.stderrTailBytes ?? DEFAULT_STDERR_TAIL_BYTES;
   const command = ChildProcess.make(options.command, options.args, {
@@ -187,12 +188,19 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       }
       pending.clear();
       for (const prompt of prompts.values()) {
+        yield* Queue.offer(events, {
+          type: "t3.prompt.failed",
+          id: prompt.id,
+          error: error.message,
+          code: error.code,
+        }).pipe(Effect.ignore);
         yield* completePrompt(prompt, {
           kind: "rejected",
           error: error.message,
           ...(error.code !== undefined ? { code: error.code } : {}),
         });
       }
+      prompts.clear();
     });
 
   const writeFrame = (frame: unknown): Effect.Effect<void, NeoPiRpcError> =>
@@ -321,7 +329,13 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           error: frame.error ?? "prompt rejected",
           ...(frame.code !== undefined ? { code: frame.code } : {}),
         });
-        record.acked = true;
+        yield* Queue.offer(events, {
+          type: "t3.prompt.failed",
+          id: record.id,
+          error: frame.error ?? "prompt rejected",
+          code: frame.code,
+        }).pipe(Effect.ignore);
+        prompts.delete(record.id);
         return;
       }
       if (record.acked) {
@@ -331,6 +345,8 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       const agentInvoked = agentInvokedOf(frame.data);
       if (agentInvoked === false) {
         yield* completePrompt(record, { kind: "local", agentInvoked: false });
+        yield* Queue.offer(events, { type: "t3.prompt.local", id: record.id }).pipe(Effect.ignore);
+        prompts.delete(record.id);
         return;
       }
       if (agentInvoked === true || record.sawAgentStart) {
@@ -394,11 +410,11 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           );
         }
         const ready = frame as ReadyFrame;
-        if (typeof ready.protocolVersion !== "number") {
+        if (ready.protocolVersion !== 1) {
           return yield* failReady(
             new NeoPiRpcError({
               code: "bad_frame",
-              message: "ready frame is missing protocolVersion",
+              message: `unsupported NeoPi/OMP ready protocolVersion: ${String(ready.protocolVersion)}`,
             }),
           );
         }
@@ -438,25 +454,35 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           return yield* publishEvent(frame as SessionEventFrame);
         case "prompt_result":
           yield* onPromptResult(frame as SessionEventFrame);
-          return yield* publishEvent(frame as SessionEventFrame);
+          yield* publishEvent(frame as SessionEventFrame);
+          if (frame.agentInvoked === false && typeof frame.id === "string")
+            prompts.delete(frame.id);
+          return;
+        case "agent_end":
+          yield* publishEvent(frame as SessionEventFrame);
+          if (frame.isTerminal !== false) prompts.clear();
+          return;
         default:
           return yield* publishEvent(frame as SessionEventFrame);
       }
     });
 
-  const failReady = (error: NeoPiRpcError): Effect.Effect<void> =>
+  const abortTransport = (error: NeoPiRpcError): Effect.Effect<void> =>
     Effect.gen(function* () {
+      if (fatal) return;
       yield* failPending(error);
       yield* Deferred.fail(readyDeferred, error).pipe(Effect.ignore);
+      yield* handle
+        .kill({
+          killSignal: "SIGTERM",
+          forceKillAfter: Duration.millis(150),
+        })
+        .pipe(Effect.ignore, Effect.forkIn(lifetime));
     });
 
+  const failReady = abortTransport;
   const noteBadChunk = (message: string): Effect.Effect<void> =>
-    failPending(
-      new NeoPiRpcError({
-        code: "bad_chunk",
-        message,
-      }),
-    );
+    abortTransport(new NeoPiRpcError({ code: "bad_chunk", message }));
 
   const ingestLine = (line: string): Effect.Effect<void> =>
     Effect.gen(function* () {
@@ -513,7 +539,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   yield* Stream.fromQueue(outbound).pipe(
     Stream.run(handle.stdin),
     Effect.catch(() =>
-      failPending(
+      abortTransport(
         new NeoPiRpcError({
           code: "closed",
           message: "NeoPi/OMP stdin write failed",
@@ -611,7 +637,15 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       : [],
   );
   if (Array.isArray(supported) && supported.includes(2)) {
-    yield* request({ type: "negotiate_protocol", protocolVersion: 2 });
+    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 });
+    if (!isRecord(result) || result.protocolVersion !== 2) {
+      const error = new NeoPiRpcError({
+        code: "bad_frame",
+        message: "NeoPi/OMP peer did not confirm protocol v2 negotiation",
+      });
+      yield* abortTransport(error);
+      return yield* error;
+    }
     protocol = 2;
     capabilities.add("v2");
   }

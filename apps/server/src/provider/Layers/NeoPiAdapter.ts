@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   type ApprovalRequestId,
   ProviderDriverKind,
@@ -49,10 +50,37 @@ const record = (value: unknown): Record<string, unknown> =>
     ? (value as Record<string, unknown>)
     : {};
 
+function parseResumeCursor(value: unknown): NeoPiResumeCursor | undefined {
+  if (value === undefined || value === null) return undefined;
+  const cursor = record(value);
+  if (
+    cursor.v !== 1 ||
+    typeof cursor.sessionId !== "string" ||
+    !cursor.sessionId ||
+    typeof cursor.sessionFile !== "string" ||
+    !cursor.sessionFile ||
+    typeof cursor.sessionDir !== "string" ||
+    !cursor.sessionDir ||
+    !Array.isArray(cursor.turnBoundaries) ||
+    !cursor.turnBoundaries.every((boundary) => {
+      const entry = record(boundary);
+      return (
+        typeof entry.turnId === "string" &&
+        entry.turnId.length > 0 &&
+        typeof entry.userEntryId === "string" &&
+        entry.userEntryId.length > 0
+      );
+    })
+  )
+    throw new Error("Invalid NeoPi/OMP resume cursor: refusing to start a fresh session");
+  return cursor as NeoPiResumeCursor;
+}
+
 interface Session {
   session: ProviderSession;
   runtime: NeoPiSessionRuntimeShape;
   scope: Scope.Closeable;
+  readonly sessionKey: string;
   pending: Map<string, PendingUi>;
   ui: ReturnType<typeof emptyUiState>;
   activeTurnId?: TurnId;
@@ -84,14 +112,16 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
     PubSub.shutdown,
   );
   const sessions = new Map<ThreadId, Session>();
+  const incarnationId = randomUUID();
   let eventSequence = 0;
   const stamp = (now: string): Pick<MapCtx, "now" | "newEventId"> => ({
     now: () => now,
-    newEventId: () => `neopi-${options.instanceId}-${++eventSequence}`,
+    newEventId: () => `neopi-${options.instanceId}-${incarnationId}-${++eventSequence}`,
   });
   const context = (session: Session, now: string, turnId?: TurnId): MapCtx => ({
     provider: PROVIDER,
     providerInstanceId: options.instanceId,
+    sessionKey: session.sessionKey,
     threadId: session.session.threadId,
     ...(turnId ? { turnId } : {}),
     ...stamp(now),
@@ -151,27 +181,46 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
           resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
         };
       } else if (data.type === "t3.session.exited") {
-        delete session.activeTurnId;
-        session.session = {
-          ...session.session,
-          status: "error",
-          activeTurnId: undefined,
-          updatedAt: ctx.now(),
-        };
+        if (sessions.get(session.session.threadId) === session) {
+          sessions.delete(session.session.threadId);
+          yield* stopInternal(session).pipe(Effect.forkIn(scope));
+        }
       }
     });
   const coreState = new WeakMap<Session, ReturnType<typeof emptyCoreState>>();
   const toolState = new WeakMap<Session, ReturnType<typeof emptyToolState>>();
   const stopInternal = (session: Session) =>
     Effect.gen(function* () {
-      sessions.delete(session.session.threadId);
+      if (sessions.get(session.session.threadId) === session)
+        sessions.delete(session.session.threadId);
       yield* session.runtime.stop;
       yield* Scope.close(session.scope, Exit.void);
     });
   const startSession: NeoPiAdapterShape["startSession"] = (input) =>
     Effect.gen(function* () {
+      const requestedResume = yield* Effect.try({
+        try: () => parseResumeCursor(input.resumeCursor),
+        catch: (cause) =>
+          new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: String(cause),
+          }),
+      });
+      const cwd = input.cwd ?? options.cwd;
       const existing = sessions.get(input.threadId);
-      if (existing) {
+      if (
+        existing &&
+        (existing.session.cwd !== cwd ||
+          (requestedResume !== undefined &&
+            requestedResume.sessionFile !==
+              (yield* SubscriptionRef.get(existing.runtime.cursor)).sessionFile) ||
+          (yield* SubscriptionRef.get(existing.runtime.state)) === "failed" ||
+          (yield* SubscriptionRef.get(existing.runtime.state)) === "stopped")
+      ) {
+        yield* stopInternal(existing);
+      }
+      if (existing && sessions.get(input.threadId) === existing) {
         if (existing.session.runtimeMode !== input.runtimeMode) {
           yield* existing.runtime.setRuntimeMode(input.runtimeMode).pipe(
             Effect.catch((cause) =>
@@ -193,27 +242,12 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
                   }),
             ),
           );
-          existing.session = { ...existing.session, runtimeMode: input.runtimeMode };
+          if ((yield* SubscriptionRef.get(existing.runtime.state)) === "ready")
+            existing.session = { ...existing.session, runtimeMode: input.runtimeMode };
         }
         return existing.session;
       }
-      const cwd = input.cwd ?? options.cwd;
-      const cursor = record(input.resumeCursor);
-      const resume: NeoPiResumeCursor | undefined =
-        cursor.v === 1 &&
-        typeof cursor.sessionId === "string" &&
-        typeof cursor.sessionFile === "string" &&
-        typeof cursor.sessionDir === "string"
-          ? {
-              v: 1,
-              sessionId: cursor.sessionId,
-              sessionFile: cursor.sessionFile,
-              sessionDir: cursor.sessionDir,
-              turnBoundaries: Array.isArray(cursor.turnBoundaries)
-                ? (cursor.turnBoundaries as NeoPiResumeCursor["turnBoundaries"])
-                : [],
-            }
-          : undefined;
+      const resume = requestedResume;
       const sessionScope = yield* Scope.make();
       const runtimeInput: NeoPiRuntimeInput = {
         threadId: input.threadId,
@@ -236,6 +270,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       const entry: Session = {
         runtime,
         scope: sessionScope,
+        sessionKey: randomUUID(),
         pending: new Map(),
         ui: emptyUiState(),
         session: {
@@ -276,7 +311,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       };
       sessions.set(input.threadId, entry);
       yield* Stream.runForEach(runtime.frames, (frame) => processFrame(entry, frame)).pipe(
-        Effect.forkIn(scope),
+        Effect.forkIn(sessionScope),
       );
       return entry.session;
     });
@@ -449,7 +484,13 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
           Effect.map((resumeCursor) => ({ ...session.session, resumeCursor })),
         ),
       ),
-    hasSession: (threadId) => Effect.succeed(sessions.has(threadId)),
+    hasSession: (threadId) =>
+      Effect.gen(function* () {
+        const session = sessions.get(threadId);
+        if (!session) return false;
+        const state = yield* SubscriptionRef.get(session.runtime.state);
+        return state !== "failed" && state !== "stopped" && state !== "stopping";
+      }),
     readThread,
     rollbackThread: (threadId) =>
       Effect.flatMap(requireSession(threadId), () =>

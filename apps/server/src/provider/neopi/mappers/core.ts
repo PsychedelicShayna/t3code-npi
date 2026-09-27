@@ -5,7 +5,7 @@ import {
   type TurnTokenUsage,
 } from "@t3tools/contracts";
 
-import type { MapCtx } from "./MapCtx.ts";
+import { scopedItemId, type MapCtx } from "./MapCtx.ts";
 
 /**
  * Frames the runtime injects around native RPC events. Native `agent_end`
@@ -25,6 +25,7 @@ export interface CoreState {
   readonly model: string | undefined;
   readonly thinkingLevel: string | undefined;
   readonly nextMessageOrdinal: number;
+  readonly turnStarted: boolean;
   readonly openMessageOrdinal: number | undefined;
   readonly messages: ReadonlyArray<AssistantMessageRecord>;
   readonly openItems: Readonly<Record<string, OpenContentItem>>;
@@ -100,6 +101,7 @@ export function emptyCoreState(): CoreState {
     model: undefined,
     thinkingLevel: undefined,
     nextMessageOrdinal: 1,
+    turnStarted: false,
     openMessageOrdinal: undefined,
     messages: [],
     openItems: {},
@@ -170,6 +172,27 @@ export function mapCoreFrame(
       return mapSessionState(ctx, record, state);
     case T3_COMPACTION_TYPE:
       return mapInjectedCompaction(ctx, record, state);
+    case "t3.session.exited": {
+      const stderr =
+        typeof record.stderrTail === "string" ? record.stderrTail.trim().slice(-512) : "";
+      const processStatus = [
+        `code ${String(record.code ?? "unknown")}`,
+        ...(typeof record.signal === "string" ? [`signal ${record.signal}`] : []),
+      ].join(", ");
+      return {
+        events: [
+          emit(ctx, frame, "session.exited", {
+            reason:
+              record.recoverable === true
+                ? `NeoPi/OMP process exited (${processStatus})${stderr ? `: ${stderr}` : ""}`
+                : "NeoPi/OMP session stopped",
+            recoverable: record.recoverable === true,
+            exitKind: record.recoverable === true ? "error" : "graceful",
+          }),
+        ],
+        state,
+      };
+    }
     default:
       return { events: [], state };
   }
@@ -182,11 +205,14 @@ function mapAgentStart(
 ): { readonly events: ProviderRuntimeEvent[]; readonly state: CoreState } {
   const model = modelSlug(frame.model) ?? text(frame.model) ?? state.model;
   const effort = text(frame.effort) ?? text(frame.thinkingLevel) ?? state.thinkingLevel;
+  if (state.turnStarted) {
+    return { events: [], state: { ...state, model, thinkingLevel: effort } };
+  }
   const next: CoreState = {
     ...state,
     model,
     thinkingLevel: effort,
-    nextMessageOrdinal: 1,
+    turnStarted: true,
     openMessageOrdinal: undefined,
     messages: [],
     openItems: {},
@@ -994,7 +1020,7 @@ function tokenUsageFrom(state: CoreState): TurnTokenUsage {
 function resetTurn(state: CoreState): CoreState {
   return {
     ...state,
-    nextMessageOrdinal: 1,
+    turnStarted: false,
     openMessageOrdinal: undefined,
     messages: [],
     openItems: {},
@@ -1158,7 +1184,7 @@ function emit<T extends ProviderRuntimeEvent["type"]>(
     threadId: ctx.threadId,
     createdAt: ctx.now(),
     ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    ...(itemId ? { itemId: RuntimeItemId.make(itemId) } : {}),
+    ...(itemId ? { itemId: RuntimeItemId.make(scopedItemId(ctx, itemId)) } : {}),
     payload: agent,
     raw: { source: "neopi.rpc", payload: frame },
   } as Extract<ProviderRuntimeEvent, { type: T }>;

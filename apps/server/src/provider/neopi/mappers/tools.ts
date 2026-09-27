@@ -16,6 +16,8 @@ import {
   type ToolActivitySource,
 } from "@t3tools/contracts";
 
+import { scopedItemId } from "./MapCtx.ts";
+
 import { snapshotDelta } from "./snapshotDelta.ts";
 
 /** Alias to the shared mapper context, exported for callers of this mapper. */
@@ -368,7 +370,7 @@ function itemEvent(
     threadId: ctx.threadId,
     createdAt: ctx.now(),
     ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    itemId: RuntimeItemId.make(call.toolCallId),
+    itemId: RuntimeItemId.make(scopedItemId(ctx, call.toolCallId)),
     payload: {
       itemType: payload.itemType,
       ...(payload.status ? { status: payload.status } : {}),
@@ -398,7 +400,7 @@ function contentDelta(
     threadId: ctx.threadId,
     createdAt: ctx.now(),
     ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    itemId: RuntimeItemId.make(toolCallId),
+    itemId: RuntimeItemId.make(scopedItemId(ctx, toolCallId)),
     payload: {
       streamKind: "command_output",
       delta,

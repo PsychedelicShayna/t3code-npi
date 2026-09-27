@@ -212,7 +212,6 @@ describe("applyUsageLimits", () => {
       const spawner = scriptedSpawner(commands, () =>
         handle({
           code: commands.length === 1 ? 0 : 1,
-          // @effect-diagnostics-next-line preferSchemaOverJson:off - fake CLI stdout, not a decoded document.
           stdout: JSON.stringify(payload([codexReport, openCodeReport])),
         }),
       );

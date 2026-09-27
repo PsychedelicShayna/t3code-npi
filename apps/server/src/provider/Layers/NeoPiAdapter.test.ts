@@ -102,6 +102,24 @@ it.live("streams a turn, steers the same turn, routes UI responses, and stops it
           observed.push(event);
         }),
       ).pipe(Effect.forkScoped);
+      const invalid = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("neopi"),
+          providerInstanceId: instanceId,
+          cwd: home,
+          runtimeMode: "auto",
+          resumeCursor: {
+            v: 1,
+            sessionId: "s",
+            sessionFile: "/tmp/x",
+            sessionDir: "/tmp",
+            turnBoundaries: [{ turnId: 1 }],
+          },
+        })
+        .pipe(Effect.flip);
+      assert.match(invalid.message, /Invalid NeoPi\/OMP resume cursor/);
+      assert.equal(yield* adapter.hasSession(threadId), false);
       yield* adapter.startSession({
         threadId,
         provider: ProviderDriverKind.make("neopi"),
@@ -188,6 +206,39 @@ it.live("streams a turn, steers the same turn, routes UI responses, and stops it
       yield* adapter.stopAll();
       assert.equal(stopCount, 1);
       assert.equal(yield* adapter.hasSession(threadId), false);
+      const secondFrames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+      const recreated = yield* makeNeoPiAdapter({
+        settings,
+        instanceId,
+        binary: "npi",
+        cwd: home,
+        t3Home: home,
+        attachmentsDir: home,
+        environment: {},
+        spawn: spawner.spawn,
+        discovery: hub,
+        makeRuntime: () => Effect.succeed({ ...runtime, frames: Stream.fromQueue(secondFrames) }),
+      });
+      const afterRestart: ProviderRuntimeEvent[] = [];
+      yield* Stream.runForEach(recreated.streamEvents, (event) =>
+        Effect.sync(() => {
+          afterRestart.push(event);
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* recreated.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("neopi"),
+        providerInstanceId: instanceId,
+        cwd: home,
+        runtimeMode: "auto",
+      });
+      yield* Queue.offer(secondFrames, { type: "notice", level: "warning", message: "recreated" });
+      for (let attempt = 0; attempt < 100 && afterRestart.length === 0; attempt++)
+        yield* Effect.sleep("10 millis");
+      assert.equal(afterRestart[0]?.type, "runtime.warning");
+      assert.ok(observed.length > 0);
+      assert.notEqual(afterRestart[0]?.eventId, observed[0]?.eventId);
+      yield* recreated.stopAll();
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

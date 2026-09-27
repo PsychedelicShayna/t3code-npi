@@ -95,10 +95,7 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
         }
       }
     }
-  }).pipe(
-    Effect.catch(() => Effect.void),
-    Effect.forkScoped,
-  );
+  }).pipe(Effect.ignore, Effect.forkScoped);
 
   const handle = ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(41),
@@ -211,6 +208,30 @@ it.live("negotiates v2 and records the capability", () =>
       assert.equal(client.capabilities.has("v2"), true);
       assert.equal(client.capabilities.has("rpc-ui"), true);
       assert.equal(client.ready.protocolVersion, 1);
+    }),
+  ),
+);
+
+it.live("rejects unsupported ready versions and incorrect v2 acknowledgements", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const ready of [{ ...v2Ready, protocolVersion: 42 }, v2Ready]) {
+        const peer = yield* scriptedPeer({
+          ready,
+          onLine: (message, emit) =>
+            message.type === "negotiate_protocol"
+              ? emit({
+                  id: message.id,
+                  type: "response",
+                  command: message.type,
+                  success: true,
+                  data: { protocolVersion: 1 },
+                })
+              : Effect.void,
+        });
+        const error = yield* makeClient(peer).pipe(Effect.flip);
+        assert.equal(error.code, "bad_frame");
+      }
     }),
   ),
 );
@@ -364,6 +385,96 @@ it.live("resolves out-of-order responses and a late prompt rejection", () =>
         error: "scheduling failed",
         code: "prompt_failed",
       });
+    }),
+  ),
+);
+
+it.live("delivers a late failure for an already admitted prompt in event order", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commands = yield* Queue.unbounded<CapturedCommand>();
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          negotiate(message, emit).pipe(
+            Effect.flatMap((handled) => (handled ? Effect.void : Queue.offer(commands, message))),
+          ),
+      });
+      const client = yield* makeClient(peer);
+      const received = yield* Queue.unbounded<Client.SessionEventFrame>();
+      yield* Stream.runForEach(client.events, (frame) => Queue.offer(received, frame)).pipe(
+        Effect.forkScoped,
+      );
+      const handle = yield* client.prompt({ type: "prompt", message: "say hi" });
+      const prompt = yield* Queue.take(commands);
+      yield* peer.emit({
+        id: prompt.id,
+        type: "response",
+        command: "prompt",
+        success: true,
+        data: { agentInvoked: true },
+      });
+      yield* peer.emit({ type: "agent_start" });
+      assert.deepEqual(yield* Deferred.await(handle.outcome), { kind: "agent" });
+      yield* peer.emit({
+        id: prompt.id,
+        type: "response",
+        command: "prompt",
+        success: false,
+        error: "late upstream rejection",
+      });
+      assert.equal((yield* Queue.take(received)).type, "agent_start");
+      assert.deepEqual(yield* Queue.take(received), {
+        type: "t3.prompt.failed",
+        id: prompt.id,
+        error: "late upstream rejection",
+        code: undefined,
+      });
+    }),
+  ),
+);
+
+it.live("fails admitted work and kills a peer that sends a malformed chunk", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const commands = yield* Queue.unbounded<CapturedCommand>();
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          negotiate(message, emit).pipe(
+            Effect.flatMap((handled) => (handled ? Effect.void : Queue.offer(commands, message))),
+          ),
+      });
+      const client = yield* makeClient(peer);
+      const frames = yield* Queue.unbounded<Client.SessionEventFrame>();
+      yield* Stream.runForEach(client.events, (frame) => Queue.offer(frames, frame)).pipe(
+        Effect.forkScoped,
+      );
+      const prompt = yield* client.prompt({ type: "prompt", message: "work" });
+      const command = yield* Queue.take(commands);
+      yield* peer.emit({
+        id: command.id,
+        type: "response",
+        command: "prompt",
+        success: true,
+        data: { agentInvoked: true },
+      });
+      yield* peer.emit({ type: "agent_start" });
+      assert.deepEqual(yield* Deferred.await(prompt.outcome), { kind: "agent" });
+      yield* peer.emit({
+        type: "rpc_chunk",
+        chunkId: "bad",
+        index: 3,
+        count: 1,
+        byteLength: 1,
+        data: "YQ==",
+      });
+      assert.equal((yield* Queue.take(frames)).type, "agent_start");
+      const fault = yield* Queue.take(frames);
+      assert.equal(fault.type, "t3.prompt.failed");
+      assert.equal(fault.code, "bad_chunk");
+      yield* Deferred.await(client.exit);
+      assert.ok(peer.signals.includes("SIGTERM"));
     }),
   ),
 );

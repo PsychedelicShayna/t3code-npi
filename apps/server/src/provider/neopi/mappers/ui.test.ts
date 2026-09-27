@@ -8,6 +8,8 @@ import {
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
+import { scopedItemId } from "./MapCtx.ts";
+
 import { emptyUiState, flushUiSettlements, mapUiRequest, NEOPI_CAP_TOOL_APPROVAL } from "./ui.ts";
 
 const ctx = {
@@ -99,7 +101,10 @@ describe("NeoPi UI mapper", () => {
     expect(ambiguous?.payload).not.toHaveProperty("args");
     send(state, { type: "tool_execution_end", toolCallId: "tool-2" });
     const unique = send(state, approval("b")).events[0];
-    expect(unique).toMatchObject({ itemId: "tool-1", payload: { args: { command: "first" } } });
+    expect(unique).toMatchObject({
+      itemId: scopedItemId(ctx, "tool-1"),
+      payload: { args: { command: "first" } },
+    });
   });
 
   it("gates structured approval on ready capabilities and sends its dedicated response", () => {
@@ -118,7 +123,7 @@ describe("NeoPi UI mapper", () => {
     const result = send(state, frame);
     expect(result.events[0]).toMatchObject({
       type: "request.opened",
-      itemId: "tool-3",
+      itemId: scopedItemId(ctx, "tool-3"),
       payload: {
         requestType: "exec_command_approval",
         args: { command: "rm build" },

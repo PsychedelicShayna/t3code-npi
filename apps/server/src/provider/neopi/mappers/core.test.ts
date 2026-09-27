@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { coreTurnTokenUsage, emptyCoreState, mapCoreFrame } from "./core.ts";
 import type { MapCtx } from "./MapCtx.ts";
+import { scopedItemId } from "./MapCtx.ts";
 
 function harness(child = false) {
   let nextId = 0;
@@ -42,6 +43,19 @@ function payloads(events: ReturnType<typeof harness>["events"], type: string) {
   return events.filter((event) => event.type === type).map((event) => event.payload);
 }
 
+const itemId = (nativeId: string) =>
+  scopedItemId(
+    {
+      provider: ProviderDriverKind.make("neopi"),
+      providerInstanceId: ProviderInstanceId.make("neopi-test"),
+      threadId: ThreadId.make("thread-test"),
+      turnId: TurnId.make("turn-test"),
+      now: () => "",
+      newEventId: () => "",
+    },
+    nativeId,
+  );
+
 describe("NeoPi core mapper", () => {
   it("keeps interleaved reasoning and assistant text items distinct with ordered deltas and completions", () => {
     const h = harness();
@@ -66,17 +80,32 @@ describe("NeoPi core mapper", () => {
     h.feed({ type: "message_end", message: assistant("hello world") });
     const deltas = h.events.filter((event) => event.type === "content.delta");
     expect(deltas.map((event) => [event.itemId, event.payload])).toEqual([
-      ["neopi:m1:thinking:0", { streamKind: "reasoning_text", delta: "first ", contentIndex: 0 }],
-      ["neopi:m1:text:1", { streamKind: "assistant_text", delta: "hello ", contentIndex: 1 }],
-      ["neopi:m1:thinking:0", { streamKind: "reasoning_text", delta: "thought", contentIndex: 0 }],
-      ["neopi:m1:text:1", { streamKind: "assistant_text", delta: "world", contentIndex: 1 }],
+      [
+        itemId("neopi:m1:thinking:0"),
+        { streamKind: "reasoning_text", delta: "first ", contentIndex: 0 },
+      ],
+      [
+        itemId("neopi:m1:text:1"),
+        { streamKind: "assistant_text", delta: "hello ", contentIndex: 1 },
+      ],
+      [
+        itemId("neopi:m1:thinking:0"),
+        { streamKind: "reasoning_text", delta: "thought", contentIndex: 0 },
+      ],
+      [
+        itemId("neopi:m1:text:1"),
+        { streamKind: "assistant_text", delta: "world", contentIndex: 1 },
+      ],
     ]);
     const starts = h.events.filter((event) => event.type === "item.started");
     const completed = h.events.filter((event) => event.type === "item.completed");
-    expect(starts.map((event) => event.itemId)).toEqual(["neopi:m1:thinking:0", "neopi:m1:text:1"]);
+    expect(starts.map((event) => event.itemId)).toEqual([
+      itemId("neopi:m1:thinking:0"),
+      itemId("neopi:m1:text:1"),
+    ]);
     expect(completed.map((event) => [event.itemId, event.payload.detail])).toEqual([
-      ["neopi:m1:thinking:0", "first thought"],
-      ["neopi:m1:text:1", "hello world"],
+      [itemId("neopi:m1:thinking:0"), "first thought"],
+      [itemId("neopi:m1:text:1"), "hello world"],
     ]);
     expect(h.events.every((event) => event.raw?.source === "neopi.rpc")).toBe(true);
   });
@@ -259,6 +288,39 @@ describe("NeoPi core mapper", () => {
       { itemType: "context_compaction", status: "failed" },
       { itemType: "context_compaction", status: "declined" },
     ]);
+  });
+
+  it("keeps one turn and sums both phases when a nonterminal agent run continues", () => {
+    const h = harness();
+    expect(
+      h.feed({ type: "agent_start" }).filter((event) => event.type === "turn.started"),
+    ).toHaveLength(1);
+    h.feed({ type: "message_start", message: assistant("") });
+    h.feed({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "first" },
+    });
+    h.feed({ type: "message_end", message: assistant("first", { input: 8, output: 3 }) });
+    h.feed({ type: "agent_end", isTerminal: false });
+    expect(
+      h.feed({ type: "agent_start" }).filter((event) => event.type === "turn.started"),
+    ).toHaveLength(0);
+    h.feed({ type: "message_start", message: assistant("") });
+    h.feed({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "second" },
+    });
+    h.feed({ type: "message_end", message: assistant("second", { input: 12, output: 4 }) });
+    h.feed({ type: "agent_end", isTerminal: true });
+    h.feed({ type: "t3.turn.outcome", state: "completed" });
+    expect(payloads(h.events, "turn.completed")).toMatchObject([
+      {
+        state: "completed",
+        tokenUsage: { usageStatus: "complete", inputTokens: 20, outputTokens: 7 },
+      },
+    ]);
+    const started = h.events.filter((event) => event.type === "item.started");
+    expect(new Set(started.map((event) => event.itemId)).size).toBe(2);
   });
 
   it("attributes nested content to the child without producing parent turn events", () => {

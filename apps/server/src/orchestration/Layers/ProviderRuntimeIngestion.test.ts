@@ -70,6 +70,8 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { makeSqlStatementCounter } from "../../../integration/SqlStatementCounter.integration.ts";
+import { emptyCoreState, mapCoreFrame } from "../../provider/neopi/mappers/core.ts";
+import type { MapCtx } from "../../provider/neopi/mappers/MapCtx.ts";
 
 function makeTestServerSettingsLayer(overrides: Partial<ServerSettings> = {}) {
   return ServerSettingsService.layerTest(overrides);
@@ -439,6 +441,76 @@ describe("ProviderRuntimeIngestion", () => {
       drain,
     };
   }
+
+  it("persists distinct NeoPi assistant messages across turns and threads", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const secondThread = asThreadId("thread-2");
+    await harness.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("cmd-neopi-thread-2"),
+      threadId: secondThread,
+      projectId: asProjectId("project-1"),
+      title: "Second Thread",
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+      interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+      runtimeMode: "approval-required",
+      branch: null,
+      worktreePath: null,
+      createdAt: now,
+    });
+    let sequence = 0;
+    const feedTurn = async (threadId: ThreadId, turnId: TurnId, answer: string) => {
+      const ctx: MapCtx = {
+        provider: ProviderDriverKind.make("neopi"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        threadId,
+        turnId,
+        now: () => now,
+        newEventId: () => `neopi-ingestion-${++sequence}`,
+      };
+      let state = emptyCoreState();
+      const events: ProviderRuntimeEvent[] = [];
+      for (const frame of [
+        { type: "agent_start" },
+        { type: "message_start", message: { role: "assistant", content: [] } },
+        { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: answer } },
+        {
+          type: "message_end",
+          message: { role: "assistant", content: [{ type: "text", text: answer }] },
+        },
+        { type: "t3.turn.outcome", state: "completed" },
+      ]) {
+        const mapped = mapCoreFrame(ctx, frame, state);
+        state = mapped.state;
+        events.push(...mapped.events);
+      }
+      await harness.emitAndDrain(events);
+      await waitForThread(
+        harness.readModel,
+        (thread) =>
+          thread.messages.some(
+            (message) =>
+              message.role === "assistant" && message.text === answer && !message.streaming,
+          ),
+        2000,
+        threadId,
+      );
+    };
+    await feedTurn(asThreadId("thread-1"), asTurnId("turn-1"), "first answer");
+    await feedTurn(asThreadId("thread-1"), asTurnId("turn-2"), "second answer");
+    await feedTurn(secondThread, asTurnId("turn-1"), "other thread answer");
+    const threads = (await harness.readModel()).threads;
+    const messages = threads.flatMap((thread) =>
+      thread.messages.filter((message) => message.role === "assistant"),
+    );
+    expect(messages.map((message) => message.text).sort()).toEqual([
+      "first answer",
+      "other thread answer",
+      "second answer",
+    ]);
+    expect(new Set(messages.map((message) => message.id)).size).toBe(3);
+  });
 
   it("maps turn started/completed events into thread session updates", async () => {
     const harness = await createHarness();

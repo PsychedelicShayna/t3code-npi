@@ -3,6 +3,7 @@ import { resolve, sep } from "node:path";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 import type { RuntimeMode } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import { neopiProjectSessionDir } from "./NeoPiPaths.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 import type { NeoPiLaunchPlan, NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
 
@@ -16,15 +17,7 @@ export interface NeoPiLaunchInput {
   readonly launchArgs?: string;
   readonly runtimeMode: RuntimeMode;
   readonly cursor?: NeoPiResumeCursor;
-  readonly knownCapabilities?: ReadonlySet<string>;
 }
-
-const segment = (value: string): string => {
-  const encoded = encodeURIComponent(value.trim());
-  return encoded === "" || encoded === "." || encoded === ".."
-    ? "default"
-    : encoded.replaceAll(".", "%2E");
-};
 
 const approvalModes: Record<RuntimeMode, string> = {
   "approval-required": "always-ask",
@@ -41,6 +34,8 @@ const protectedFlags = new Set([
   "--fork",
   "--mode",
   "--cwd",
+  "--profile",
+  "-p",
   "--approval-mode",
   "--yolo",
   "--auto-approve",
@@ -63,23 +58,23 @@ export const buildNeoPiLaunchPlan = (
         });
       }
     }
-    const shared =
-      !input.cursor &&
-      input.knownCapabilities?.has("session_lease") &&
-      input.knownCapabilities.has("new_session_flag");
+    // Flag advertisement alone is not a cooperating lifetime lease.
     const sessionDir =
       input.cursor?.sessionDir ??
-      (shared
-        ? ""
-        : resolve(
-            input.t3Home,
-            "neopi",
-            "sessions",
-            segment(input.profile || "default"),
-            segment(input.projectId),
-          ));
-    const args = ["--mode", "rpc-ui", "--cwd", input.cwd, "--no-title"];
-    if (!shared || input.cursor) args.push("--session-dir", sessionDir);
+      neopiProjectSessionDir({
+        baseDir: input.t3Home,
+        ...(input.profile !== undefined ? { profile: input.profile } : {}),
+        projectId: input.projectId,
+      });
+    const args = [
+      "--mode",
+      "rpc-ui",
+      "--cwd",
+      input.cwd,
+      "--no-title",
+      "--session-dir",
+      sessionDir,
+    ];
     if (input.cursor) {
       if (
         !input.cursor.sessionFile ||
@@ -92,8 +87,6 @@ export const buildNeoPiLaunchPlan = (
         });
       }
       args.push("--session", input.cursor.sessionFile);
-    } else if (shared) {
-      args.push("--new-session");
     }
     args.push("--approval-mode", approvalModes[input.runtimeMode], ...extra);
     return {

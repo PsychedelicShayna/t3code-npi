@@ -64,6 +64,8 @@ describe("NeoPi launch plan", () => {
           "--fork",
           "--mode=rpc",
           "--cwd",
+          "--profile=foreign",
+          "-p",
           "--approval-mode",
           "--yolo",
           "--auto-approve",
@@ -78,27 +80,17 @@ describe("NeoPi launch plan", () => {
         }
       }),
   );
-  it.effect("enables shared fresh files only with both native safety capabilities", () =>
+  it.effect("keeps live files isolated until a cooperating lease exists", () =>
     Effect.gen(function* () {
-      const caps = new Set(["session_lease", "new_session_flag"]);
-      const shared = yield* buildNeoPiLaunchPlan({
+      const isolated = yield* buildNeoPiLaunchPlan({
         ...input,
-        knownCapabilities: caps,
         profile: "",
       });
-      assert.equal(shared.identity.kind, "fresh");
-      assert.equal(shared.sessionDir, "");
-      assert.equal(shared.env.OMP_PROFILE, process.env.OMP_PROFILE);
-      assert.ok(shared.args.includes("--new-session"));
-      assert.ok(!shared.args.includes("--session-dir"));
-      for (const single of ["session_lease", "new_session_flag"]) {
-        const isolated = yield* buildNeoPiLaunchPlan({
-          ...input,
-          knownCapabilities: new Set([single]),
-        });
-        assert.ok(isolated.args.includes("--session-dir"));
-        assert.ok(!isolated.args.includes("--new-session"));
-      }
+      assert.equal(isolated.identity.kind, "fresh");
+      assert.equal(isolated.sessionDir, "/tmp/t3home/neopi/sessions/default/project-1");
+      assert.equal(isolated.env.OMP_PROFILE, process.env.OMP_PROFILE);
+      assert.ok(isolated.args.includes("--session-dir"));
+      assert.ok(!isolated.args.includes("--new-session"));
     }),
   );
   it.effect(
