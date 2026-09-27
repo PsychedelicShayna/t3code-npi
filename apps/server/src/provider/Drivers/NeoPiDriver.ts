@@ -14,10 +14,13 @@ import {
   buildInitialNeoPiProviderSnapshot,
   checkNeoPiProviderStatus,
   resolveNeoPiBinary,
+  neoPiSnapshotForCwd,
 } from "../Layers/NeoPiProvider.ts";
 import { applyUsageLimits } from "../Layers/neopiUsageLimits.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
+import { makeNeoPiDiscoveryProbe } from "../neopi/NeoPiDiscoveryProbe.ts";
+import { makeNeoPiHostToolBridge } from "../neopi/NeoPiHostToolBridge.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -50,6 +53,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fs = yield* FileSystem.FileSystem;
       const serverSettings = yield* ServerSettingsService;
       const serverConfig = yield* ServerConfig;
       const processEnv = mergeProviderInstanceEnvironment(environment);
@@ -80,6 +84,13 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           )
         : null;
       const binary = resolved?.binary ?? (config.binaryPath || "npi");
+      const commandProbe = makeNeoPiDiscoveryProbe({
+        binary,
+        profile: config.profile,
+        env,
+        spawn: spawner.spawn,
+        hub: discovery,
+      });
       const adapter = yield* makeNeoPiAdapter({
         settings: effectiveConfig,
         instanceId,
@@ -90,6 +101,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         environment: env,
         spawn: spawner.spawn,
         discovery,
+        makeHostBridge: makeNeoPiHostToolBridge,
       });
       const textGeneration = makeNeoPiTextGeneration({
         binary,
@@ -160,19 +172,10 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         adapter,
         textGeneration,
         snapshotForCwd: (cwd) =>
-          Effect.all([snapshot.getSnapshot, discovery.latest(cwd)]).pipe(
-            Effect.map(([base, found]) => ({
-              ...base,
-              slashCommands: [
-                {
-                  name: "compact",
-                  description: "Summarize the conversation and reduce context usage",
-                },
-                ...found.commands.filter((command) => command.name !== "compact"),
-              ],
-              skills: [...found.skills],
-            })),
-          ),
+          Effect.flatMap(snapshot.getSnapshot, (base) =>
+            neoPiSnapshotForCwd(base, cwd, discovery, commandProbe),
+          ).pipe(Effect.provideService(FileSystem.FileSystem, fs)),
+        invalidateCaches: commandProbe.invalidate,
       } satisfies ProviderInstance;
     }),
 };

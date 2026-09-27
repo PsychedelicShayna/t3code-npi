@@ -2,7 +2,13 @@
 import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, ProviderInstanceId, ThreadId, type TurnId } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  ThreadId,
+  type TurnId,
+} from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -22,9 +28,11 @@ const sessionDir = `${root}/neopi/sessions/default/test`;
 const sessionFile = `${sessionDir}/session.jsonl`;
 type Command = { id?: string; type: string; [key: string]: unknown };
 const decodeCommand = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const encodeCommand = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 type Emitter = (frame: unknown) => Effect.Effect<void>;
 const testPeer = Effect.fn("testPeer")(function* (
   handler: (cmd: Command, emit: Emitter) => Effect.Effect<void>,
+  ready: unknown = { type: "ready", protocolVersion: 1, capabilities: ["rpc-ui"] },
 ) {
   const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
   const stdin = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
@@ -38,7 +46,7 @@ const testPeer = Effect.fn("testPeer")(function* (
       yield* Queue.end(stdout).pipe(Effect.ignore);
       yield* Deferred.succeed(exited, signal).pipe(Effect.ignore);
     });
-  yield* emit({ type: "ready", protocolVersion: 1, capabilities: ["rpc-ui"] });
+  yield* emit(ready);
   yield* Effect.gen(function* () {
     let pending = "";
     while (true) {
@@ -597,4 +605,261 @@ it.live("treats recovered nonterminal errors as a successful original turn", () 
       yield* runtime.stop;
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("answers startup UI before v2 negotiation completes through the adapter", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let negotiateId: string | undefined;
+      const peer = yield* testPeer(
+        (cmd, emit) => {
+          if (cmd.type === "negotiate_protocol") {
+            negotiateId = cmd.id;
+            return emit({
+              type: "extension_ui_request",
+              id: "startup-input",
+              method: "confirm",
+              title: "Enable extension?",
+              message: "Continue?",
+            });
+          }
+          if (cmd.type === "extension_ui_response" && negotiateId)
+            return answer({ type: "negotiate_protocol", id: negotiateId }, emit, {
+              protocolVersion: 2,
+            });
+          if (cmd.type === "get_state")
+            return answer(cmd, emit, {
+              sessionId: "s1",
+              sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
+              messageCount: 0,
+            });
+          return answer(cmd, emit);
+        },
+        {
+          type: "ready",
+          protocolVersion: 1,
+          supportedProtocolVersions: [2],
+          capabilities: ["rpc-ui"],
+        },
+      );
+      const threadId = ThreadId.make("thread-test");
+      const adapter = yield* makeNeoPiAdapter({
+        settings: {
+          enabled: true,
+          binaryPath: "npi",
+          profile: "",
+          launchArgs: "",
+          customModels: [],
+        },
+        instanceId: ProviderInstanceId.make("neopi-startup-test"),
+        binary: "npi",
+        cwd: "/tmp",
+        t3Home: root,
+        attachmentsDir: root,
+        environment: {},
+        spawn: () => Effect.succeed(peer.handle),
+        discovery: yield* makeNeoPiDiscoveryHub(),
+      });
+      yield* Stream.runForEach(adapter.streamEvents, (event) => {
+        return event.type === "user-input.requested"
+          ? adapter.respondToUserInput(threadId, ApprovalRequestId.make(event.requestId!), {
+              "startup-input": "true",
+            })
+          : Effect.void;
+      }).pipe(Effect.forkScoped);
+      const session = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("neopi"),
+          providerInstanceId: ProviderInstanceId.make("neopi-startup-test"),
+          cwd: "/tmp",
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.timeout("5 seconds"));
+      NodeAssert.equal(session.status, "ready");
+      NodeAssert.ok(
+        peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.confirmed === true),
+      );
+      yield* adapter.stopAll();
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("installs host tools without credential frames and suppresses cancelled results", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(basicHandler);
+      const signals: AbortSignal[] = [];
+      const runtime = yield* make(() => Effect.succeed(peer.handle), undefined, {
+        definitions: [
+          {
+            name: "list_thread_pull_requests",
+            description: "List PRs",
+            parameters: { type: "object" },
+            loadMode: "discoverable",
+          },
+        ],
+        handle: (_call, signal) =>
+          Effect.sync(() => {
+            signals.push(signal);
+          }).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* runtime.start;
+      NodeAssert.deepEqual(
+        peer.commands.find((command) => command.type === "set_host_tools")?.tools,
+        [
+          {
+            name: "list_thread_pull_requests",
+            description: "List PRs",
+            parameters: { type: "object" },
+            loadMode: "discoverable",
+          },
+        ],
+      );
+      NodeAssert.equal(encodeCommand(peer.commands).includes("Bearer "), false);
+      yield* peer.emit({
+        type: "host_tool_call",
+        id: "host-cancelled",
+        toolCallId: "tool-cancelled",
+        toolName: "list_thread_pull_requests",
+        arguments: {},
+      });
+      for (let count = 0; count < 100 && signals.length === 0; count++)
+        yield* Effect.sleep("5 millis");
+      NodeAssert.equal(signals.length, 1);
+      yield* peer.emit({
+        type: "host_tool_cancel",
+        id: "cancel-frame",
+        targetId: "host-cancelled",
+      });
+      for (let count = 0; count < 100 && signals[0]?.aborted !== true; count++)
+        yield* Effect.sleep("5 millis");
+      NodeAssert.equal(signals[0]?.aborted, true);
+      NodeAssert.equal(
+        peer.commands.some((cmd) => cmd.type === "host_tool_result" && cmd.id === "host-cancelled"),
+        false,
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("answers unexpected host calls with an explicit error when no bridge is installed", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(basicHandler);
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      yield* runtime.start;
+      yield* peer.emit({
+        type: "host_tool_call",
+        id: "unsupported-call",
+        toolCallId: "tool-1",
+        toolName: "unknown_host_tool",
+        arguments: {},
+      });
+      for (
+        let count = 0;
+        count < 100 && !peer.commands.some((cmd) => cmd.type === "host_tool_result");
+        count++
+      )
+        yield* Effect.sleep("5 millis");
+      const result = peer.commands.find((cmd) => cmd.type === "host_tool_result");
+      NodeAssert.equal(result?.id, "unsupported-call");
+      NodeAssert.equal(result?.isError, true);
+      NodeAssert.match(encodeCommand(result), /Unsupported host tool/);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "routes capability-gated chat changes to RPC and exposes mode through adapter activities",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let mode: "off" | "chat" | "erp" | "raw" = "off";
+        const peer = yield* testPeer(
+          (cmd, emit) => {
+            if (cmd.type === "negotiate_protocol") return answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_state")
+              return answer(cmd, emit, {
+                sessionId: "s1",
+                sessionFile: `${root}/neopi/sessions/default/thread-test/session.jsonl`,
+                messageCount: 0,
+                chatMode: mode,
+              });
+            if (cmd.type === "set_chat_mode") {
+              if (
+                cmd.mode === "off" ||
+                cmd.mode === "chat" ||
+                cmd.mode === "erp" ||
+                cmd.mode === "raw"
+              )
+                mode = cmd.mode;
+              return answer(cmd, emit, { mode }).pipe(
+                Effect.andThen(emit({ type: "chat_mode_changed", mode })),
+              );
+            }
+            return answer(cmd, emit);
+          },
+          {
+            type: "ready",
+            protocolVersion: 1,
+            supportedProtocolVersions: [2],
+            capabilities: ["rpc-ui", "set_chat_mode"],
+          },
+        );
+        const threadId = ThreadId.make("thread-test");
+        const adapter = yield* makeNeoPiAdapter({
+          settings: {
+            enabled: true,
+            binaryPath: "npi",
+            profile: "",
+            launchArgs: "",
+            customModels: [],
+          },
+          instanceId: ProviderInstanceId.make("neopi-chat-test"),
+          binary: "npi",
+          cwd: "/tmp",
+          t3Home: root,
+          attachmentsDir: root,
+          environment: {},
+          spawn: () => Effect.succeed(peer.handle),
+          discovery: yield* makeNeoPiDiscoveryHub(),
+        });
+        const warnings: unknown[] = [];
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            if (event.type === "runtime.warning") warnings.push(event.payload.detail);
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("neopi"),
+          providerInstanceId: ProviderInstanceId.make("neopi-chat-test"),
+          cwd: "/tmp",
+          runtimeMode: "approval-required",
+        });
+        yield* adapter.sendTurn({ threadId, input: "/chat erp" });
+        NodeAssert.equal(mode, "erp");
+        yield* adapter.sendTurn({ threadId, input: "/chat" });
+        NodeAssert.equal(mode, "off");
+        yield* adapter.sendTurn({ threadId, input: "/chat" });
+        NodeAssert.equal(mode, "erp");
+        NodeAssert.deepEqual(
+          peer.commands.filter((cmd) => cmd.type === "set_chat_mode").map((cmd) => cmd.mode),
+          ["erp", "off", "erp"],
+        );
+        NodeAssert.equal(
+          peer.commands.some((cmd) => cmd.type === "prompt"),
+          false,
+        );
+        for (let count = 0; count < 100 && warnings.length < 2; count++)
+          yield* Effect.sleep("5 millis");
+        NodeAssert.ok(
+          warnings.some((detail) => JSON.stringify(detail).includes('\"mode\":\"erp\"')),
+        );
+        yield* adapter.stopAll();
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );

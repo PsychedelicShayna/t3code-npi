@@ -21,6 +21,7 @@ import { makeOrchestrationIntegrationHarness } from "../../../../integration/Orc
 import { makeNeoPiAdapter } from "../../Layers/NeoPiAdapter.ts";
 import { makeNeoPiDiscoveryHub } from "../NeoPiDiscovery.ts";
 import type { NeoPiRuntimeInput } from "../NeoPiSessionRuntime.ts";
+import type { NeoPiResumeCursor } from "../NeoPiRuntimeTypes.ts";
 import type {
   NeoPiRuntimeFrame,
   NeoPiRuntimeState,
@@ -261,10 +262,11 @@ describe("NeoPi subagent mapper", () => {
       { type: "subagent_lifecycle", payload: { id: "child-1", status: "completed", index: 0 } },
       started("child-1"),
     ]);
-    expect(ofType(events, "task.started").map((event) => event.payload.taskId)).toEqual([
-      "child-1",
-      "child-1#2",
-    ]);
+    expect(
+      ofType(events, "task.started").map((event) =>
+        "taskId" in event.payload ? event.payload.taskId : undefined,
+      ),
+    ).toEqual(["child-1", "child-1#2"]);
   });
 });
 
@@ -280,7 +282,7 @@ effectIt.live("child subagent text does not enter the parent message through ing
         Effect.gen(function* () {
           const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
           const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
-          const cursor = yield* SubscriptionRef.make({
+          const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
             v: 1 as const,
             sessionDir: "/tmp",
             sessionId: "native",

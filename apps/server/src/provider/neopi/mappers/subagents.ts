@@ -117,10 +117,11 @@ function mapProgress(
     (opened.run.text.trim().length > 0 ? tail(opened.run.text) : undefined);
   const status = progressStatus(text(progress.status));
   const lastToolName = text(progress.currentTool);
+  const lastSummary = summary ?? opened.run.lastSummary;
   const run = {
     ...opened.run,
     description,
-    lastSummary: summary ?? opened.run.lastSummary,
+    ...(lastSummary === undefined ? {} : { lastSummary }),
   };
   return {
     events: [
@@ -216,6 +217,7 @@ function startRun(
   }
   const generation = (state.generations[id] ?? 0) + 1;
   const parentToolUseId = text(payload.parentToolCallId);
+  const role = text(payload.agent);
   const run: ChildRun = {
     nativeId: id,
     taskId: generation === 1 ? id : `${id}#${generation}`,
@@ -224,7 +226,7 @@ function startRun(
       ? { parentAgentId: state.toolOwners[parentToolUseId] }
       : {}),
     description: text(payload.description) ?? text(payload.agent) ?? id,
-    ...(text(payload.agent) ? { role: text(payload.agent) } : {}),
+    ...(role ? { role } : {}),
     terminal: false,
     core: emptyCoreState(),
     tools: withHostToolNames(emptyToolState(), hostToolNames ?? []),

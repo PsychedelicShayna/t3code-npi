@@ -67,25 +67,31 @@ const hostToolClient = McpSchema.McpServerClient.of({
   },
   getClient: Effect.die("Host tools do not support MCP reverse requests"),
 });
+export class McpInProcessToolError extends Schema.TaggedError<McpInProcessToolError>()(
+  "McpInProcessToolError",
+  { message: Schema.String },
+) {}
 
 /** Invoke the registered MCP tool directly, preserving its validation and image handling. */
 export const invokeRegisteredMcpTool = (
   authorizationHeader: string,
   name: string,
   args: Record<string, unknown>,
-): Effect.Effect<McpSchema.CallToolResult, Error> =>
+): Effect.Effect<McpSchema.CallToolResult, McpInProcessToolError> =>
   Effect.gen(function* () {
     const capability = capabilityForTool(name);
-    if (!capability) return yield* Effect.fail(new Error(`Unsupported host tool: ${name}`));
+    if (!capability)
+      return yield* new McpInProcessToolError({ message: `Unsupported host tool: ${name}` });
     const scope = yield* resolveActiveMcpCredential(authorizationHeader);
     if (!scope || !scope.capabilities.has(capability))
-      return yield* Effect.fail(new Error("access revoked"));
+      return yield* new McpInProcessToolError({ message: "access revoked" });
     const server = activeToolServer;
-    if (!server) return yield* Effect.fail(new Error("T3 Code host tools are unavailable"));
+    if (!server)
+      return yield* new McpInProcessToolError({ message: "T3 Code host tools are unavailable" });
     return yield* server.callTool({ name, arguments: args }).pipe(
       Effect.provideService(McpSchema.McpServerClient, hostToolClient),
       Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
-      Effect.mapError((error) => new Error(error.message)),
+      Effect.mapError((error) => new McpInProcessToolError({ message: error.message })),
     );
   });
 

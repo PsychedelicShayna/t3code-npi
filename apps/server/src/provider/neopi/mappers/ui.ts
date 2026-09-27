@@ -26,12 +26,13 @@ export type UiReply =
       };
     };
 
-/** The adapter sends ExtensionUi through respondUi and ToolApproval through writeFrame. */
+/** Replies are prepared without mutating UI state; commit only after wire delivery. */
 export interface PendingUi {
   readonly requestId: ReturnType<typeof ApprovalRequestId.make>;
   readonly nativeId: string;
   readonly kind: "approval" | "user-input";
   readonly reply: (answer: ProviderApprovalDecision | Record<string, unknown>) => UiReply;
+  readonly settle: (answer: ProviderApprovalDecision | Record<string, unknown>) => void;
 }
 
 interface OpenUi {
@@ -147,6 +148,17 @@ export function mapUiRequest(
     }
     return { events, state };
   }
+  if (type === "t3.state" || type === "chat_mode_changed") {
+    const mode = type === "t3.state" ? record(data.state)?.chatMode : data.mode;
+    if (mode === "off" || mode === "chat" || mode === "erp" || mode === "raw")
+      events.push(
+        makeEvent(ctx, frame, "runtime.warning", {
+          message: `NeoPi/OMP chat mode: ${mode}`,
+          detail: { neopiUi: { kind: "chat-mode", mode } },
+        }),
+      );
+    return { events, state };
+  }
   if (type === "tool_execution_start") {
     const id = nonempty(data.toolCallId);
     const toolName = nonempty(data.toolName);
@@ -248,8 +260,10 @@ export function mapUiRequest(
               : answer === "acceptForSession" || answer === "acceptAlways"
                 ? "allow_session"
                 : "deny";
-          state.settlements.push({ id, decision: String(answer) });
           return { _tag: "ToolApproval", frame: { type: "tool_approval_response", id, decision } };
+        },
+        settle: (answer) => {
+          state.settlements.push({ id, decision: String(answer) });
         },
       },
     };
@@ -300,21 +314,33 @@ export function mapUiRequest(
               answer === "accept" || answer === "acceptForSession" || answer === "acceptAlways"
                 ? "Approve"
                 : "Deny";
-            state.settlements.push({ id, decision: String(answer) });
             return { _tag: "ExtensionUi", frame: { id, value } };
+          },
+          settle: (answer) => {
+            state.settlements.push({ id, decision: String(answer) });
           },
         },
       };
     }
 
     const descriptions = Array.isArray(data.optionDetails) ? data.optionDetails : [];
-    const questionOptions = options.flatMap((option, index) => {
-      const label = nonempty(option);
-      if (!label) return [];
-      return [
-        { label, description: text(record(descriptions[index])?.description) ?? "", value: option },
-      ];
-    });
+    const questionOptions =
+      method === "confirm"
+        ? [
+            { label: "Yes", description: "", value: "true" },
+            { label: "No", description: "", value: "false" },
+          ]
+        : options.flatMap((option, index) => {
+            const label = nonempty(option);
+            if (!label) return [];
+            return [
+              {
+                label,
+                description: text(record(descriptions[index])?.description) ?? "",
+                value: option,
+              },
+            ];
+          });
     const prefill = method === "editor" ? text(data.prefill) : undefined;
     if (prefill && nonempty(prefill))
       questionOptions.push({ label: prefill.trim(), description: "", value: prefill });
@@ -334,7 +360,7 @@ export function mapUiRequest(
               header: title,
               question,
               options: questionOptions,
-              allowCustomAnswer: method !== "select",
+              allowCustomAnswer: method !== "select" && method !== "confirm",
               multiSelect: false,
             },
           ],
@@ -351,15 +377,17 @@ export function mapUiRequest(
         kind: "user-input",
         reply: (answer) => {
           const answers = record(answer) ?? {};
-          const first = Object.values(answers)[0];
+          const first = answers[id];
           const response: UiResponseWire =
             first === undefined
               ? { id, cancelled: true }
               : method === "confirm"
                 ? { id, confirmed: first === true || first === "true" }
                 : { id, value: String(first) };
-          state.settlements.push({ id, answers });
           return { _tag: "ExtensionUi", frame: response };
+        },
+        settle: (answer) => {
+          state.settlements.push({ id, answers: record(answer) ?? {} });
         },
       },
     };
@@ -369,28 +397,33 @@ export function mapUiRequest(
   if (method === "notify") {
     const message = nonempty(data.message);
     if (message)
-      event =
-        data.notifyType === "info"
-          ? makeEvent(ctx, frame, "thread.metadata.updated", { metadata: { notice: message } })
-          : makeEvent(ctx, frame, "runtime.warning", { message, detail: data.notifyType });
+      event = makeEvent(ctx, frame, "runtime.warning", {
+        message,
+        detail: { neopiUi: { kind: "notice", level: data.notifyType } },
+      });
   } else if (method === "setStatus") {
-    event = makeEvent(ctx, frame, "thread.metadata.updated", {
-      metadata: { status: { key: data.statusKey, text: data.statusText ?? "" } },
-    });
+    const key = nonempty(data.statusKey);
+    if (key)
+      event = makeEvent(ctx, frame, "runtime.warning", {
+        message: nonempty(data.statusText) ?? `NeoPi status ${key} cleared`,
+        detail: { neopiUi: { kind: "status", key, text: text(data.statusText) ?? "" } },
+      });
   } else if (method === "setWidget") {
-    event = makeEvent(ctx, frame, "thread.metadata.updated", {
-      metadata: {
-        widget: {
-          key: data.widgetKey,
-          lines: data.widgetLines ?? [],
-          ...(data.widgetPlacement ? { placement: data.widgetPlacement } : {}),
-        },
-      },
-    });
+    const key = nonempty(data.widgetKey);
+    const lines = Array.isArray(data.widgetLines)
+      ? data.widgetLines.filter((line): line is string => typeof line === "string")
+      : [];
+    if (key)
+      event = makeEvent(ctx, frame, "runtime.warning", {
+        message: lines.join("\n") || `NeoPi widget ${key} cleared`,
+        detail: { neopiUi: { kind: "widget", key, lines } },
+      });
   } else if (method === "set_editor_text") {
-    event = makeEvent(ctx, frame, "thread.metadata.updated", {
-      metadata: { composerText: data.text },
-    });
+    if (typeof data.text === "string")
+      event = makeEvent(ctx, frame, "runtime.warning", {
+        message: "NeoPi/OMP suggested composer text",
+        detail: { neopiUi: { kind: "editor", text: data.text } },
+      });
   } else if (method === "open_url") {
     event = makeEvent(ctx, frame, "runtime.warning", {
       message: nonempty(data.instructions) ?? "Open URL",

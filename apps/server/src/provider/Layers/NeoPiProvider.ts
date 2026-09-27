@@ -1,4 +1,4 @@
-import type { NeoPiSettings, ServerProviderModel } from "@t3tools/contracts";
+import type { NeoPiSettings, ServerProvider, ServerProviderModel } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import type { SpawnFn } from "effect-neopi-rpc/client";
 import { make as makeClient } from "effect-neopi-rpc/client";
@@ -18,6 +18,7 @@ import {
 } from "../providerSnapshot.ts";
 import { providerModelsFromSettings } from "../providerSnapshot.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
+import type { NeoPiDiscoveryProbe } from "../neopi/NeoPiDiscoveryProbe.ts";
 import { neopiCompatibility } from "../neopi/NeoPiCompatibility.ts";
 import { toServerProviderModels } from "../neopi/NeoPiModelCatalog.ts";
 
@@ -281,3 +282,26 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
     skills: [...discovery.skills],
   };
 });
+
+/** Live session discovery takes precedence over the disposable full-loadout probe. */
+export const neoPiSnapshotForCwd = (
+  base: ServerProvider,
+  cwd: string,
+  hub: NeoPiDiscoveryHub,
+  probe: NeoPiDiscoveryProbe,
+) =>
+  Effect.gen(function* () {
+    const latest = yield* hub.latest(cwd);
+    if (base.enabled && base.installed && base.status !== "error" && latest.source !== "live")
+      yield* probe.probe(cwd);
+    const found = yield* hub.latest(cwd);
+    return {
+      ...base,
+      ...(found.source === "not-loaded" ? { message: "Commands not loaded yet" } : {}),
+      slashCommands: [
+        COMPACT_SLASH_COMMAND,
+        ...found.commands.filter((command) => command.name !== "compact"),
+      ],
+      skills: [...found.skills],
+    } satisfies ServerProvider;
+  });

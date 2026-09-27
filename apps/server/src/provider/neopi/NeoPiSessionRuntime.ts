@@ -4,6 +4,7 @@ import type { ModelSelection, RuntimeMode, ThreadId, TurnId } from "@t3tools/con
 import {
   make as makeClient,
   type NeoPiRpcClient,
+  type NeoPiRpcTransport,
   type PromptHandle,
   type SpawnFn,
   type HostToolCallFrame,
@@ -113,6 +114,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const uiPending = new Set<string>();
   const hostPending = new Map<string, Scope.Closeable>();
   let client: NeoPiRpcClient | undefined;
+  let earlyUi: Pick<NeoPiRpcTransport, "respondUi"> | undefined;
   let lifetime: Scope.Closeable | undefined;
   let generation = 0;
   let active: ActiveTurn | undefined;
@@ -315,14 +317,25 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         message,
       );
     });
-  const pumpHost = (peer: NeoPiRpcClient) =>
+  const pumpHost = (peer: Pick<NeoPiRpcTransport, "hostToolCalls" | "hostToolResult">) =>
     Stream.runForEach(peer.hostToolCalls, (call) =>
       Effect.gen(function* () {
         if (call.type === "host_tool_cancel") {
           const requestScope = hostPending.get(call.targetId);
           if (requestScope) yield* Scope.close(requestScope, Exit.void);
           hostPending.delete(call.targetId);
-        } else if (input.hostBridge) {
+        } else if (!input.hostBridge) {
+          yield* peer
+            .hostToolResult(
+              call.id,
+              {
+                content: [{ type: "text", text: `Unsupported host tool: ${call.toolName}` }],
+                isError: true,
+              },
+              true,
+            )
+            .pipe(Effect.ignore);
+        } else {
           const requestScope = yield* Scope.make();
           const signal = yield* Effect.abortSignal.pipe(
             Effect.provideService(Scope.Scope, requestScope),
@@ -335,7 +348,11 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
                 isError: true,
               }),
             ),
-            Effect.flatMap((result) => peer.hostToolResult(call.id, result, result.isError)),
+            Effect.flatMap((result) =>
+              signal.aborted || hostPending.get(call.id) !== requestScope
+                ? Effect.void
+                : peer.hostToolResult(call.id, result, result.isError),
+            ),
             Effect.ensuring(
               Scope.close(requestScope, Exit.void).pipe(
                 Effect.tap(() =>
@@ -360,6 +377,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     const exit = closing ? yield* Deferred.await(closing.exit) : undefined;
     if (lifetime) yield* Scope.close(lifetime, Exit.void).pipe(Effect.ignore);
     client = undefined;
+    earlyUi = undefined;
     lifetime = undefined;
     return exit;
   });
@@ -392,36 +410,50 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         ...(input.requestTimeoutMs === undefined
           ? {}
           : { requestTimeoutMs: input.requestTimeoutMs }),
+        onTransportReady: (transport) =>
+          Effect.gen(function* () {
+            earlyUi = transport;
+            yield* transport.transportReady.pipe(
+              Effect.matchEffect({
+                onFailure: () => Effect.void,
+                onSuccess: (ready) => emit({ ...ready, type: "ready" }),
+              }),
+            );
+            yield* Stream.runForEach(transport.events, handleEvent).pipe(
+              Effect.forkScoped,
+              Effect.provideService(Scope.Scope, scope),
+            );
+            yield* Stream.runForEach(transport.uiRequests, (frame) =>
+              Effect.gen(function* () {
+                if (activeUiMethods.has(frame.method)) {
+                  if (
+                    (yield* SubscriptionRef.get(state)) === "failed" ||
+                    (yield* SubscriptionRef.get(state)) === "stopping"
+                  ) {
+                    yield* emit({
+                      type: "extension_ui_request",
+                      id: frame.id,
+                      method: "cancel",
+                      targetId: frame.id,
+                      ...(active ? { turnId: active.id } : {}),
+                    });
+                  } else uiPending.add(frame.id);
+                }
+                if (frame.method === "cancel" && typeof frame.targetId === "string")
+                  uiPending.delete(frame.targetId);
+                yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
+              }),
+            ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
+            yield* pumpHost(transport).pipe(
+              Effect.forkScoped,
+              Effect.provideService(Scope.Scope, scope),
+            );
+          }),
       }).pipe(Effect.provideService(Scope.Scope, scope));
       client = peer;
+      earlyUi = undefined;
       capabilities.clear();
       for (const item of peer.capabilities) capabilities.add(item);
-      yield* Stream.runForEach(peer.events, handleEvent).pipe(
-        Effect.forkScoped,
-        Effect.provideService(Scope.Scope, scope),
-      );
-      yield* Stream.runForEach(peer.uiRequests, (frame) =>
-        Effect.gen(function* () {
-          if (activeUiMethods.has(frame.method)) {
-            if (
-              (yield* SubscriptionRef.get(state)) === "failed" ||
-              (yield* SubscriptionRef.get(state)) === "stopping"
-            ) {
-              yield* emit({
-                type: "extension_ui_request",
-                id: frame.id,
-                method: "cancel",
-                targetId: frame.id,
-                ...(active ? { turnId: active.id } : {}),
-              });
-            } else uiPending.add(frame.id);
-          }
-          if (frame.method === "cancel" && typeof frame.targetId === "string")
-            uiPending.delete(frame.targetId);
-          yield* emit({ ...frame, ...(active ? { turnId: active.id } : {}) });
-        }),
-      ).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
-      yield* pumpHost(peer).pipe(Effect.forkScoped, Effect.provideService(Scope.Scope, scope));
       yield* Deferred.await(peer.exit).pipe(
         Effect.flatMap((exit) =>
           Effect.gen(function* () {
@@ -694,13 +726,14 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     applyModelSelection,
     respondUi: (response) =>
       Effect.gen(function* () {
-        uiPending.delete(response.id);
-        if (!client)
+        const channel = client ?? earlyUi;
+        if (!channel)
           return yield* new NeoPiRpcError({
             code: "closed",
             message: "NeoPi/OMP session is not connected",
           });
-        yield* client.respondUi(response);
+        yield* channel.respondUi(response);
+        uiPending.delete(response.id);
       }),
   } satisfies NeoPiSessionRuntimeShape;
 });

@@ -401,7 +401,7 @@ describe("NeoPi tool output at the T3 consumer boundary", () => {
         label: "Image view",
         tone: "tool",
         itemType: "image_view",
-        viewedImagePath: viewed,
+        viewedImagePath: viewed!,
       }),
     ).toBe(imagePath);
     expect(

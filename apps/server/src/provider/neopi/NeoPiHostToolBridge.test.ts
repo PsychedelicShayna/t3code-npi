@@ -4,9 +4,9 @@ import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
+import * as Schema from "effect/Schema";
 import { McpServer } from "effect/unstable/ai";
 import { HttpServer } from "effect/unstable/http";
 import * as NetAddress from "effect/unstable/net/NetAddress";
@@ -19,6 +19,7 @@ import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
 import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { makeNeoPiHostToolBridge } from "./NeoPiHostToolBridge.ts";
+const decodeResult = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const environmentId = EnvironmentId.make("environment-bridge-test");
 const threadId = ThreadId.make("thread-bridge-test");
@@ -109,7 +110,7 @@ const ToolkitLayer = Layer.mergeAll(
   Layer.provideMerge(Layer.mock(OrchestrationEngineService)({})),
   Layer.provideMerge(
     Layer.mock(ProjectionSnapshotQuery)({
-      getThreadShellById: () => Effect.succeed(Option.some(thread)),
+      getThreadShellById: () => Effect.succeedSome(thread),
     }),
   ),
   Layer.provideMerge(Layer.succeed(ServerEnvironment.ServerEnvironment, fakeEnvironment)),
@@ -165,7 +166,7 @@ it.effect(
         );
         expect(pullRequests.isError).not.toBe(true);
         expect(
-          JSON.parse(
+          decodeResult(
             pullRequests.content[0]!.type === "text" ? pullRequests.content[0]!.text : "null",
           ),
         ).toMatchObject({ pullRequests: [], chains: [] });
@@ -218,7 +219,11 @@ it.effect(
         yield* Deferred.await(connected);
         const preview = yield* bridge.handle(call("preview_status"), new AbortController().signal);
         expect(preview.isError).not.toBe(true);
-        expect(JSON.stringify(preview.content)).toContain("example.test");
+        expect(
+          preview.content.some(
+            (block) => block.type === "text" && block.text.includes("example.test"),
+          ),
+        ).toBe(true);
         const snapshot = yield* bridge.handle(
           call("preview_snapshot"),
           new AbortController().signal,

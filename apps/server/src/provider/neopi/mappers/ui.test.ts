@@ -60,6 +60,8 @@ describe("NeoPi UI mapper", () => {
       _tag: "ExtensionUi",
       frame: { id: "a", value: "Approve" },
     });
+    expect(flushUiSettlements(ctx, state)).toEqual([]);
+    result.pending?.settle("acceptForSession");
     expect(flushUiSettlements(ctx, state).map((event) => decode(event))).toMatchObject([
       { type: "request.resolved", requestId: "a", payload: { decision: "acceptForSession" } },
     ]);
@@ -139,6 +141,7 @@ describe("NeoPi UI mapper", () => {
       _tag: "ToolApproval",
       frame: { type: "tool_approval_response", id: "structured", decision: "allow_session" },
     });
+    result.pending?.settle("acceptForSession");
     expect(flushUiSettlements(ctx, state).map((event) => decode(event))).toMatchObject([
       { type: "request.resolved", requestId: "structured" },
     ]);
@@ -174,6 +177,7 @@ describe("NeoPi UI mapper", () => {
       _tag: "ExtensionUi",
       frame: { id: "q1", value: "Other (type your own)" },
     });
+    first.pending?.settle({ q1: "Other (type your own)" });
     const editor = send(state, {
       type: "extension_ui_request",
       id: "q2",
@@ -194,6 +198,7 @@ describe("NeoPi UI mapper", () => {
       _tag: "ExtensionUi",
       frame: { id: "q2", value: "src/foo/bar baz" },
     });
+    editor.pending?.settle({ q2: "src/foo/bar baz" });
     const next = send(state, {
       type: "extension_ui_request",
       id: "q3",
@@ -273,17 +278,33 @@ describe("NeoPi UI mapper", () => {
       timeout: 500,
     });
     expect(confirm.events[0]).toMatchObject({
-      payload: { questions: [{ question: "Launch task?\nTimeout: 500ms" }] },
+      payload: {
+        questions: [
+          {
+            question: "Launch task?\nTimeout: 500ms",
+            options: [
+              { label: "Yes", value: "true" },
+              { label: "No", value: "false" },
+            ],
+            allowCustomAnswer: false,
+          },
+        ],
+      },
     });
     expect(confirm.pending?.reply({ c: true })).toEqual({
       _tag: "ExtensionUi",
       frame: { id: "c", confirmed: true },
     });
+    expect(confirm.pending?.reply({ unrelated: "true", c: "false" })).toEqual({
+      _tag: "ExtensionUi",
+      frame: { id: "c", confirmed: false },
+    });
+    confirm.pending?.settle({ c: "false" });
     const notices = [
       [
         { method: "notify", message: "hello", notifyType: "info" },
-        "thread.metadata.updated",
-        { metadata: { notice: "hello" } },
+        "runtime.warning",
+        { message: "hello", detail: { neopiUi: { kind: "notice", level: "info" } } },
       ],
       [
         { method: "notify", message: "careful", notifyType: "warning" },
@@ -292,8 +313,8 @@ describe("NeoPi UI mapper", () => {
       ],
       [
         { method: "setStatus", statusKey: "job", statusText: "running" },
-        "thread.metadata.updated",
-        { metadata: { status: { key: "job", text: "running" } } },
+        "runtime.warning",
+        { detail: { neopiUi: { kind: "status", key: "job", text: "running" } } },
       ],
       [
         {
@@ -302,13 +323,13 @@ describe("NeoPi UI mapper", () => {
           widgetLines: ["line"],
           widgetPlacement: "belowEditor",
         },
-        "thread.metadata.updated",
-        { metadata: { widget: { key: "review", lines: ["line"], placement: "belowEditor" } } },
+        "runtime.warning",
+        { detail: { neopiUi: { kind: "widget", key: "review", lines: ["line"] } } },
       ],
       [
         { method: "set_editor_text", text: "draft" },
-        "thread.metadata.updated",
-        { metadata: { composerText: "draft" } },
+        "runtime.warning",
+        { detail: { neopiUi: { kind: "editor", text: "draft" } } },
       ],
       [
         {

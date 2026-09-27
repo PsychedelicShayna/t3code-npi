@@ -3,7 +3,7 @@ import type { AgentToolResultWire, HostToolCallFrame } from "effect-neopi-rpc/cl
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import { Tool } from "effect/unstable/ai";
-import { invokeRegisteredMcpTool } from "../../mcp/McpHttpServer.ts";
+import { invokeRegisteredMcpTool, McpInProcessToolError } from "../../mcp/McpHttpServer.ts";
 import type { McpCapability, McpInvocationScope } from "../../mcp/McpInvocationContext.ts";
 import { resolveActiveMcpCredential } from "../../mcp/McpSessionRegistry.ts";
 import { DeviceToolkit } from "../../mcp/toolkits/device/tools.ts";
@@ -26,7 +26,7 @@ export interface NeoPiHostToolBridge {
 const definitionsFor = (tools: Record<string, Tool.Any>) =>
   Object.values(tools).map((tool) => ({
     name: tool.name,
-    description: Tool.getDescription(tool),
+    description: Tool.getDescription(tool) ?? tool.name,
     parameters: Tool.getJsonSchema(tool),
     loadMode: "discoverable" as const,
   }));
@@ -68,19 +68,18 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
         call.toolName,
         call.arguments,
       );
-      const content: AgentToolResultWire["content"][number][] = result.content.flatMap((block) =>
-        block.type === "text"
-          ? [{ type: "text" as const, text: block.text }]
-          : block.type === "image"
-            ? [
-                {
-                  type: "image" as const,
-                  data: Buffer.from(block.data).toString("base64"),
-                  mimeType: block.mimeType,
-                },
-              ]
-            : [],
-      );
+      const content: Array<AgentToolResultWire["content"][number]> = [];
+      for (const block of result.content) {
+        if (block.type === "text") {
+          content.push({ type: "text", text: block.text });
+        } else if (block.type === "image") {
+          content.push({
+            type: "image",
+            data: Buffer.from(block.data).toString("base64"),
+            mimeType: block.mimeType,
+          });
+        }
+      }
       return {
         content,
         ...(result.structuredContent === undefined ? {} : { details: result.structuredContent }),
@@ -88,12 +87,13 @@ export const makeNeoPiHostToolBridge = Effect.fn("NeoPiHostToolBridge.make")(fun
       } satisfies AgentToolResultWire;
     }).pipe(
       Effect.raceFirst(
-        Effect.callback<never, Error>((resume) => {
+        Effect.callback<never, McpInProcessToolError>((resume) => {
           if (signal.aborted) {
-            resume(Effect.fail(new Error("Host tool cancelled")));
+            resume(Effect.fail(new McpInProcessToolError({ message: "Host tool cancelled" })));
             return;
           }
-          const cancel = () => resume(Effect.fail(new Error("Host tool cancelled")));
+          const cancel = () =>
+            resume(Effect.fail(new McpInProcessToolError({ message: "Host tool cancelled" })));
           signal.addEventListener("abort", cancel, { once: true });
           return Effect.sync(() => signal.removeEventListener("abort", cancel));
         }),

@@ -72,7 +72,21 @@ export interface NeoPiRpcClientOptions {
   /** Applies to command/response only, not the prompt lifecycle. Default 30s. */
   readonly requestTimeoutMs?: number;
   readonly stderrTailBytes?: number;
+  readonly onTransportReady?: (transport: NeoPiRpcTransport) => Effect.Effect<void>;
 }
+
+/** Streams and replies available immediately after stdio is connected, before ready negotiation. */
+export type NeoPiRpcTransport = Pick<
+  NeoPiRpcClient,
+  | "events"
+  | "uiRequests"
+  | "respondUi"
+  | "hostToolCalls"
+  | "hostToolResult"
+  | "hostUriRequests"
+  | "hostUriResult"
+  | "exit"
+> & { readonly transportReady: Effect.Effect<ReadyFrame, NeoPiRpcError> };
 
 export interface NeoPiRpcClient {
   readonly ready: ReadyFrame;
@@ -618,38 +632,6 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
 
   yield* Effect.addFinalizer(() => close());
 
-  const ready = yield* Deferred.await(readyDeferred).pipe(
-    Effect.timeout(Duration.millis(requestTimeoutMs)),
-    Effect.catchTag("TimeoutError", () =>
-      Effect.fail(
-        new NeoPiRpcError({
-          code: "timeout",
-          message: "timed out waiting for the ready frame",
-        }),
-      ),
-    ),
-  );
-
-  const supported = ready.supportedProtocolVersions;
-  const capabilities = new Set<string>(
-    Array.isArray(ready.capabilities)
-      ? ready.capabilities.filter((entry): entry is string => typeof entry === "string")
-      : [],
-  );
-  if (Array.isArray(supported) && supported.includes(2)) {
-    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 });
-    if (!isRecord(result) || result.protocolVersion !== 2) {
-      const error = new NeoPiRpcError({
-        code: "bad_frame",
-        message: "NeoPi/OMP peer did not confirm protocol v2 negotiation",
-      });
-      yield* abortTransport(error);
-      return yield* error;
-    }
-    protocol = 2;
-    capabilities.add("v2");
-  }
-
   const hostUriRequestsStream = Stream.unwrap(
     Effect.gen(function* () {
       yield* Effect.acquireRelease(
@@ -688,6 +670,51 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
 
   const hostUriResult = (result: HostUriResultWire): Effect.Effect<void, NeoPiRpcError> =>
     writeFrame(result);
+
+  if (options.onTransportReady) {
+    yield* options.onTransportReady({
+      transportReady: Deferred.await(readyDeferred),
+      events: Stream.fromQueue(events),
+      uiRequests: Stream.fromQueue(uiRequests),
+      respondUi,
+      hostToolCalls: Stream.fromQueue(hostToolCalls),
+      hostToolResult,
+      hostUriRequests: hostUriRequestsStream,
+      hostUriResult,
+      exit,
+    });
+  }
+  const ready = yield* Deferred.await(readyDeferred).pipe(
+    Effect.timeout(Duration.millis(requestTimeoutMs)),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.fail(
+        new NeoPiRpcError({
+          code: "timeout",
+          message: "timed out waiting for the ready frame",
+        }),
+      ),
+    ),
+  );
+
+  const supported = ready.supportedProtocolVersions;
+  const capabilities = new Set<string>(
+    Array.isArray(ready.capabilities)
+      ? ready.capabilities.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  );
+  if (Array.isArray(supported) && supported.includes(2)) {
+    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 });
+    if (!isRecord(result) || result.protocolVersion !== 2) {
+      const error = new NeoPiRpcError({
+        code: "bad_frame",
+        message: "NeoPi/OMP peer did not confirm protocol v2 negotiation",
+      });
+      yield* abortTransport(error);
+      return yield* error;
+    }
+    protocol = 2;
+    capabilities.add("v2");
+  }
 
   return {
     ready,
