@@ -20,6 +20,7 @@ import * as ServerConfig from "../config.ts";
 import * as DeviceService from "../device/DeviceService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import { resolveActiveMcpCredential } from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import {
   PreviewSnapshotToolkitHandlersLive,
@@ -27,6 +28,7 @@ import {
 } from "./toolkits/preview/handlers.ts";
 import {
   PreviewSnapshotTool,
+  PreviewToolkit,
   PreviewSnapshotToolkit,
   PreviewStandardToolkit,
 } from "./toolkits/preview/tools.ts";
@@ -38,10 +40,69 @@ import {
 } from "./toolkits/device/handlers.ts";
 import {
   DeviceScreenshotTool,
+  DeviceToolkit,
   DeviceScreenshotToolkit,
   DeviceStandardToolkit,
 } from "./toolkits/device/tools.ts";
 
+const capabilityForTool = (name: string): McpInvocationContext.McpCapability | undefined => {
+  if (Object.hasOwn(PreviewToolkit.tools, name)) return "preview";
+  if (Object.hasOwn(DeviceToolkit.tools, name)) return "device";
+  if (Object.hasOwn(PullRequestsToolkit.tools, name)) return "pull-requests";
+  return undefined;
+};
+
+let activeToolServer: McpServer.McpServer["Service"] | undefined;
+const hostToolClientInfo = { name: "t3-code", version: packageJson.version };
+const hostToolClientCapabilities = {};
+const hostToolClient = McpSchema.McpServerClient.of({
+  clientId: 0,
+  protocolVersion: "2025-06-18",
+  clientCapabilities: hostToolClientCapabilities,
+  clientInfo: hostToolClientInfo,
+  initializePayload: {
+    protocolVersion: "2025-06-18",
+    capabilities: hostToolClientCapabilities,
+    clientInfo: hostToolClientInfo,
+  },
+  getClient: Effect.die("Host tools do not support MCP reverse requests"),
+});
+
+/** Invoke the registered MCP tool directly, preserving its validation and image handling. */
+export const invokeRegisteredMcpTool = (
+  authorizationHeader: string,
+  name: string,
+  args: Record<string, unknown>,
+): Effect.Effect<McpSchema.CallToolResult, Error> =>
+  Effect.gen(function* () {
+    const capability = capabilityForTool(name);
+    if (!capability) return yield* Effect.fail(new Error(`Unsupported host tool: ${name}`));
+    const scope = yield* resolveActiveMcpCredential(authorizationHeader);
+    if (!scope || !scope.capabilities.has(capability))
+      return yield* Effect.fail(new Error("access revoked"));
+    const server = activeToolServer;
+    if (!server) return yield* Effect.fail(new Error("T3 Code host tools are unavailable"));
+    return yield* server.callTool({ name, arguments: args }).pipe(
+      Effect.provideService(McpSchema.McpServerClient, hostToolClient),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+      Effect.mapError((error) => new Error(error.message)),
+    );
+  });
+
+export const InProcessToolkitLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    yield* Effect.acquireRelease(
+      Effect.sync(() => {
+        activeToolServer = server;
+      }),
+      () =>
+        Effect.sync(() => {
+          if (activeToolServer === server) activeToolServer = undefined;
+        }),
+    );
+  }),
+);
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
     error: "invalid_mcp_credential",
@@ -671,4 +732,5 @@ export const layer = Layer.mergeAll(
   PreviewToolkitRegistrationLive,
   PullRequestsToolkitRegistrationLive,
   DeviceToolkitRegistrationLive,
+  InProcessToolkitLive,
 ).pipe(Layer.provideMerge(McpTransportLive));

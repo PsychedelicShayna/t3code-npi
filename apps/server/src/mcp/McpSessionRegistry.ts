@@ -232,6 +232,14 @@ export const issueActiveMcpCredential = (
         .pipe(Effect.andThen(activeMcpSessionRegistry.issue(request)))
     : Effect.undefined;
 
+/** Resolve a credential using the same registry that authenticates /mcp. */
+export const resolveActiveMcpCredential = (
+  authorizationHeader: string,
+): Effect.Effect<McpInvocationContext.McpInvocationScope | undefined> =>
+  activeMcpSessionRegistry
+    ? activeMcpSessionRegistry.resolve(authorizationHeader.replace(/^Bearer\s+/, ""))
+    : Effect.undefined;
+
 /**
  * Refreshes the liveness of a thread's MCP credential. Called on every provider
  * turn so an active session is never mistaken for an abandoned one.
@@ -240,7 +248,9 @@ export const touchActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.touch(threadId) : Effect.void;
 
 export const revokeActiveMcpThread = (threadId: ThreadId): Effect.Effect<void> =>
-  activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void;
+  (activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeThread(threadId) : Effect.void).pipe(
+    Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
+  );
 
 export const revokeAllActiveMcpCredentials = (): Effect.Effect<void> =>
   activeMcpSessionRegistry ? activeMcpSessionRegistry.revokeAll : Effect.void;
