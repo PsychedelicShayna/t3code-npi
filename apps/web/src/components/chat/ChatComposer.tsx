@@ -269,6 +269,7 @@ import {
   searchSlashCommandItems,
   slashCommandItemsForPromptPosition,
 } from "./composerSlashCommandSearch";
+import { projectNeoPiComposerUi } from "./neopiComposerUi";
 import {
   getComposerPromptInjectionState,
   getComposerProviderState,
@@ -1745,6 +1746,26 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           })
       : null);
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
+  const neopiUi = useMemo(
+    () =>
+      projectNeoPiComposerUi(activeThread?.id === activeThreadId ? activeThread.activities : []),
+    [activeThread, activeThreadId],
+  );
+  const seenNeoPiEditorRef = useRef<{ target: string; eventId: string | null }>({
+    target: composerDraftTargetKey,
+    eventId: null,
+  });
+  useEffect(() => {
+    const seen = seenNeoPiEditorRef.current;
+    if (seen.target !== composerDraftTargetKey) {
+      seen.target = composerDraftTargetKey;
+      seen.eventId = null;
+    }
+    if (!neopiUi.editor || seen.eventId === neopiUi.editor.eventId) return;
+    seen.eventId = neopiUi.editor.eventId;
+    // Never overwrite text the user has already typed, including whitespace.
+    if (prompt.length === 0) setComposerDraftPrompt(composerDraftTarget, neopiUi.editor.text);
+  }, [composerDraftTarget, composerDraftTargetKey, neopiUi.editor, prompt, setComposerDraftPrompt]);
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const removeComposerDraftImage = useComposerDraftStore((store) => store.removeImage);
   const addComposerDraftFiles = useComposerDraftStore((store) => store.addFiles);
@@ -2395,7 +2416,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         provider: selectedProvider,
         command,
         label: `/${command.name}`,
-        description: command.description ?? command.input?.hint ?? "Run provider command",
+        description:
+          (command.description ?? command.input?.hint ?? "Run provider command") +
+          (selectedProvider === "neopi" && command.source
+            ? ` · ${command.source === "mcp_prompt" ? "MCP prompt" : command.source}`
+            : ""),
       }));
       const query = composerTrigger.query.trim().toLowerCase();
       const skillItems = slashMenuSkills.map((skill) => ({
@@ -3657,7 +3682,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return;
       }
       if (item.type === "skill") {
-        const replacement = `$${item.skill.name} `;
+        // NeoPi invokes skills as /skill:name tokens, including in mid-prompt prose.
+        const replacement =
+          item.provider === "neopi" ? `/skill:${item.skill.name} ` : `$${item.skill.name} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,
           trigger.rangeEnd,
@@ -6964,6 +6991,23 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   )}
                 >
                   {composerControlsInStrip ? null : composerControls}
+                  {selectedProvider === "neopi" &&
+                  (neopiUi.chatMode || neopiUi.labels.length > 0) ? (
+                    <span
+                      data-neopi-composer-state="true"
+                      className="shrink-0 truncate text-xs text-muted-foreground"
+                      title={[
+                        neopiUi.chatMode ? `Chat: ${neopiUi.chatMode}` : "",
+                        ...neopiUi.labels,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    >
+                      {[neopiUi.chatMode ? `Chat: ${neopiUi.chatMode}` : "", ...neopiUi.labels]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  ) : null}
                 </div>
 
                 {/* Right side: send / stop button */}

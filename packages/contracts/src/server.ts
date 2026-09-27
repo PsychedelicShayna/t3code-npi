@@ -89,6 +89,10 @@ export const ServerProviderSlashCommand = Schema.Struct({
   name: TrimmedNonEmptyString,
   description: Schema.optional(TrimmedNonEmptyString),
   input: Schema.optional(ServerProviderSlashCommandInput),
+  /** Native NeoPi/OMP command origin, when the provider reports one. */
+  source: Schema.optional(
+    Schema.Literals(["builtin", "extension", "custom", "mcp_prompt", "file"]),
+  ),
 });
 export type ServerProviderSlashCommand = typeof ServerProviderSlashCommand.Type;
 

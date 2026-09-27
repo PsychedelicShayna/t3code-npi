@@ -72,6 +72,30 @@ export interface SessionEventFrame {
   readonly [k: string]: unknown;
 }
 
+export type NeoPiChatMode = "chat" | "erp" | "raw" | "off";
+
+export interface SetChatModeCommand {
+  readonly type: "set_chat_mode";
+  readonly mode: NeoPiChatMode;
+  readonly include?: string;
+}
+
+export interface SetChatModeResult {
+  readonly mode: NeoPiChatMode;
+  readonly include?: string;
+}
+
+export interface ChatModeChangedFrame {
+  readonly type: "chat_mode_changed";
+  readonly mode: NeoPiChatMode;
+  readonly include?: string;
+}
+
+/** `get_state` on peers before #109 simply omits this field. */
+export interface NeoPiChatModeState {
+  readonly chatMode?: NeoPiChatMode;
+}
+
 export type Frame =
   | ReadyFrame
   | ResponseFrame

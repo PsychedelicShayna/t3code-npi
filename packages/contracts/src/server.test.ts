@@ -52,6 +52,25 @@ describe("ServerProvider", () => {
     expect(parsed.updateState).toBeUndefined();
   });
 
+  it("preserves optional slash-command origin and input without changing older providers", () => {
+    const parsed = decodeServerProvider({
+      ...baseProviderSnapshot,
+      slashCommands: [
+        {
+          name: "review",
+          description: "Review files",
+          input: { hint: "path" },
+          source: "extension",
+        },
+        { name: "compact", description: "Compact context" },
+      ],
+    });
+    expect(parsed.slashCommands).toEqual([
+      { name: "review", description: "Review files", input: { hint: "path" }, source: "extension" },
+      { name: "compact", description: "Compact context" },
+    ]);
+  });
+
   it("defaults one-click update support when decoding older advisory snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",
