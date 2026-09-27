@@ -3,8 +3,11 @@
  *
  * `tool_execution_*` frames become one runtime item per `toolCallId`.
  * `host_tool_call` is recorded and otherwise ignored — the host bridge
- * executes it. Bash `partialResult` text is a rolling tail snapshot, not an
- * append-only chunk.
+ * executes it. Bash `partialResult` text is a rolling tail snapshot. Prefix
+ * growth and rollover both publish the current window on `item.updated`
+ * as `item.aggregatedOutput` / `rawOutput`, the shapes ingestion and the
+ * work log keep. `content.delta` is not used: T3 drops non-assistant deltas.
+ * The completing result replaces that window.
  */
 import {
   EventId,
@@ -17,6 +20,8 @@ import {
 } from "@t3tools/contracts";
 
 import { scopedItemId } from "./MapCtx.ts";
+
+import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 
 import { snapshotDelta } from "./snapshotDelta.ts";
 
@@ -166,28 +171,22 @@ function mapUpdate(
   }
 
   const compared = snapshotDelta(call.bashSnapshot ?? "", snapshot);
+  const visible = visibleCommandSnapshot(compared, snapshot);
   call = { ...call, bashSnapshot: snapshot };
   next = putInFlight(next, call);
-
-  if ("delta" in compared) {
-    if (compared.delta.length > 0) {
-      events.push(contentDelta(ctx, frame, call.toolCallId, compared.delta));
-    }
+  if (visible === undefined) {
     return { events, state: next };
   }
 
-  if (compared.replace.length > 0) {
-    events.push(
-      itemEvent(ctx, frame, call, "item.updated", {
-        itemType: call.itemType,
-        status: "inProgress",
-        title: call.title,
-        detail: compared.replace,
-        data: startData(call),
-        ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
-      }),
-    );
-  }
+  events.push(
+    itemEvent(ctx, frame, call, "item.updated", {
+      itemType: call.itemType,
+      status: "inProgress",
+      title: call.title,
+      data: commandData(call, visible),
+      ...(call.host ? { toolSource: T3_CODE_TOOL_SOURCE } : {}),
+    }),
+  );
   return { events, state: next };
 }
 
@@ -212,8 +211,12 @@ function mapEnd(
     call = { ...call, args: record.args };
   }
   if (!call.host && state.hostToolCallIds.has(identity.toolCallId)) {
-    const classified = classify(call.toolName, true);
+    const classified = classify(call.toolName, true, call.args);
     call = { ...call, host: true, itemType: classified.itemType, title: classified.title };
+  }
+  const previewPath = workspaceImagePath(call.args, asRecord(asRecord(record.result)?.details));
+  if (previewPath && !call.host && call.itemType === "dynamic_tool_call") {
+    call = { ...call, itemType: "image_view", title: "Image view" };
   }
 
   const failed = record.isError === true || asRecord(record.result)?.isError === true;
@@ -246,7 +249,7 @@ function beginCall(
   args: unknown,
 ): InFlightTool {
   const host = state.hostToolNames.has(toolName) || state.hostToolCallIds.has(toolCallId);
-  const classified = classify(toolName, host);
+  const classified = classify(toolName, host, args);
   return {
     toolCallId,
     toolName,
@@ -257,10 +260,15 @@ function beginCall(
   };
 }
 
-function classify(toolName: string, host: boolean): { itemType: CanonicalItemType; title: string } {
+function classify(
+  toolName: string,
+  host: boolean,
+  args: unknown,
+): { itemType: CanonicalItemType; title: string } {
   if (host) return { itemType: "mcp_tool_call", title: toolName };
   if (toolName === "bash") return { itemType: "command_execution", title: "Ran command" };
   if (FILE_CHANGE_TOOLS.has(toolName)) return { itemType: "file_change", title: "File change" };
+  if (workspaceImagePath(args, undefined)) return { itemType: "image_view", title: "Image view" };
   if (toolName === "web_search") return { itemType: "web_search", title: "Web search" };
   if (toolName.startsWith("mcp__")) return { itemType: "mcp_tool_call", title: toolName };
   return { itemType: "dynamic_tool_call", title: toolName };
@@ -286,12 +294,14 @@ function startData(call: InFlightTool): unknown {
     };
   }
   if (call.itemType === "command_execution") {
-    const command = commandFromArgs(call.args);
-    return command === undefined ? undefined : { command };
+    return commandData(call, undefined);
   }
   if (call.itemType === "file_change") {
     const paths = pathsFromArgs(call.args);
     return paths.length > 0 ? { paths, files: paths.map((path) => ({ path })) } : undefined;
+  }
+  if (call.itemType === "image_view") {
+    return imageData(call, undefined, []);
   }
   if (call.itemType === "web_search") {
     const query = stringField(asRecord(call.args)?.query);
@@ -307,6 +317,7 @@ function completedData(call: InFlightTool, result: unknown): unknown {
   const text = joinText(blocks);
   const images = imageBlocks(blocks);
   const details = asRecord(asRecord(result)?.details);
+  const diff = call.toolName === "edit" && !call.host ? editDiff(details) : undefined;
 
   if (call.toolName === "write" && !call.host) {
     const written = asRecord(call.args)?.content;
@@ -315,15 +326,24 @@ function completedData(call: InFlightTool, result: unknown): unknown {
     data.content = text;
   }
 
-  if (call.toolName === "edit" && !call.host) {
-    const diff = editDiff(details);
-    if (diff !== undefined) data.diff = diff;
+  if (call.itemType === "command_execution") {
+    // The completing result is authoritative, including when it replaces a tail window.
+    const output = text !== undefined ? text : call.bashSnapshot;
+    Object.assign(data, commandData(call, output, integerField(details?.exitCode)));
+  } else if (diff !== undefined) {
+    data.diff = diff;
+    data.rawOutput = { content: diff };
+    data.item = { aggregatedOutput: diff };
+  } else {
+    assignPresentedText(data, call, text);
   }
 
-  if (images.length > 0) data.images = images;
+  if (images.length > 0 || call.itemType === "image_view") {
+    Object.assign(data, imageData(call, details, images));
+  }
 
-  const exitCode = details?.exitCode;
-  if (typeof exitCode === "number" && Number.isInteger(exitCode)) {
+  const exitCode = integerField(details?.exitCode);
+  if (exitCode !== undefined && call.itemType !== "command_execution") {
     data.exitCode = exitCode;
   }
 
@@ -342,6 +362,65 @@ function completedData(call: InFlightTool, result: unknown): unknown {
   return Object.keys(data).length > 0 ? data : undefined;
 }
 
+function commandData(
+  call: InFlightTool,
+  output: string | undefined,
+  exitCode?: number,
+): Record<string, unknown> {
+  const command = commandFromArgs(call.args);
+  const data: Record<string, unknown> = {};
+  if (command !== undefined) data.command = command;
+  const item: Record<string, unknown> = {};
+  if (command !== undefined) item.command = command;
+  if (output !== undefined && output.length > 0) {
+    item.aggregatedOutput = output;
+    data.rawOutput = { content: output, stdout: output };
+    data.result = { content: output };
+  }
+  if (exitCode !== undefined) {
+    item.exitCode = exitCode;
+    data.exitCode = exitCode;
+  }
+  if (Object.keys(item).length > 0) data.item = item;
+  return data;
+}
+
+function assignPresentedText(
+  data: Record<string, unknown>,
+  call: InFlightTool,
+  text: string | undefined,
+): void {
+  if (text === undefined || text.length === 0) return;
+  data.rawOutput = { content: text };
+  data.result = { content: [{ type: "text", text }] };
+  if (call.itemType !== "mcp_tool_call") return;
+  data.item = {
+    type: "mcpToolCall",
+    id: call.toolCallId,
+    tool: call.toolName,
+    status: "completed",
+    arguments: call.args,
+    result: { content: [{ type: "text", text }] },
+    ...(call.host ? { server: "t3-code" } : {}),
+  };
+}
+
+function imageData(
+  call: InFlightTool,
+  details: Record<string, unknown> | undefined,
+  images: ReadonlyArray<{ mimeType: string; data: string }>,
+): Record<string, unknown> {
+  const imagePath = workspaceImagePath(call.args, details);
+  const data: Record<string, unknown> = { args: call.args };
+  if (imagePath) {
+    data.imagePath = imagePath;
+    data.toolName = call.toolName;
+    data.input = { file_path: imagePath, path: imagePath };
+  }
+  if (images.length > 0) data.images = images;
+  return data;
+}
+
 function editDiff(details: Record<string, unknown> | undefined): string | undefined {
   if (!details) return undefined;
   if (typeof details.diff === "string" && details.diff.length > 0) return details.diff;
@@ -352,6 +431,52 @@ function editDiff(details: Record<string, unknown> | undefined): string | undefi
     if (typeof diff === "string" && diff.length > 0) diffs.push(diff);
   }
   return diffs.length > 0 ? diffs.join("\n") : undefined;
+}
+
+function integerField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function workspaceImagePath(
+  args: unknown,
+  details: Record<string, unknown> | undefined,
+): string | undefined {
+  const record = asRecord(args);
+  const source = asRecord(asRecord(details?.meta)?.source);
+  const candidates = [
+    record?.imagePath,
+    record?.file_path,
+    record?.path,
+    details?.imagePath,
+    details?.resolvedPath,
+    details?.displayTarget,
+    details?.path,
+    source?.type === "path" ? source.value : undefined,
+  ];
+  for (const candidate of candidates) {
+    const path = localImagePath(candidate);
+    if (path) return path;
+  }
+  return undefined;
+}
+
+function localImagePath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || !isWorkspaceImagePreviewPath(trimmed)) return undefined;
+  if (/^file:\/\//i.test(trimmed)) {
+    try {
+      const url = new URL(trimmed);
+      if (url.hostname.length > 0 && url.hostname !== "localhost") return undefined;
+      const pathname = decodeURIComponent(url.pathname);
+      const path = /^\/[a-z]:\//i.test(pathname) ? pathname.slice(1) : pathname;
+      return isWorkspaceImagePreviewPath(path) ? path : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  if (/^[a-z][a-z\d+.-]*:/i.test(trimmed) && !/^[a-z]:[\\/]/i.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 function itemEvent(
@@ -386,28 +511,19 @@ function itemEvent(
   };
 }
 
-function contentDelta(
-  ctx: ToolMapCtx,
-  frame: unknown,
-  toolCallId: string,
-  delta: string,
-): ProviderRuntimeEvent {
-  return {
-    type: "content.delta",
-    eventId: EventId.make(ctx.newEventId()),
-    provider: ctx.provider,
-    providerInstanceId: ctx.providerInstanceId,
-    threadId: ctx.threadId,
-    createdAt: ctx.now(),
-    ...(ctx.turnId ? { turnId: ctx.turnId } : {}),
-    itemId: RuntimeItemId.make(scopedItemId(ctx, toolCallId)),
-    payload: {
-      streamKind: "command_output",
-      delta,
-    },
-    providerRefs: { providerItemId: ProviderItemId.make(toolCallId) },
-    raw: { source: "neopi.rpc", payload: frame },
-  };
+function visibleCommandSnapshot(
+  compared: ReturnType<typeof snapshotDelta>,
+  snapshot: string,
+): string | undefined {
+  if ("delta" in compared && compared.delta.length === 0) return undefined;
+  const visible = withoutTrailingIncompleteCodePoint(snapshot);
+  return visible.length > 0 ? visible : undefined;
+}
+
+function withoutTrailingIncompleteCodePoint(value: string): string {
+  if (value.length === 0) return value;
+  const last = value.charCodeAt(value.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? value.slice(0, -1) : value;
 }
 
 function putInFlight(state: ToolState, call: InFlightTool): ToolState {
