@@ -168,3 +168,17 @@ Full glossary with file links: `docs/internals/glossary.md`
 
 - Don't verify with browsers or computer use unless the user explicitly agrees or requests it.
 - Security is important, but should not be over-indexed on, especially for dev mode/maintainer-only features.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in `PsychedelicShayna/t3code-npi` GitHub Issues (the fork, never upstream). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical Matt triage labels, layered orthogonally over house type/effort/priority labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `CONTEXT.md` + `docs/adr/`, extending `docs/internals/glossary.md`. See `docs/agents/domain.md`.
