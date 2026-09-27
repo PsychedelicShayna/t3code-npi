@@ -48,7 +48,7 @@ const asCommand = (value: unknown): CapturedCommand | undefined =>
   isRecord(value) ? value : undefined;
 
 const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
-  readonly ready: Record<string, unknown>;
+  readonly ready?: Record<string, unknown>;
   readonly onLine: (
     message: CapturedCommand,
     emit: (frame: unknown) => Effect.Effect<void>,
@@ -75,7 +75,7 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
       yield* Deferred.succeed(exitGate, status).pipe(Effect.ignore);
     });
 
-  yield* emit(input.ready);
+  if (input.ready) yield* emit(input.ready);
   yield* Effect.gen(function* () {
     let pending = "";
     while (true) {
@@ -138,7 +138,7 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
     unref: Effect.succeed(Effect.void),
   });
 
-  return { handle, emit, signals, stdin: captured };
+  return { handle, emit, finish, endStdout: Queue.end(stdout), signals, stdin: captured };
 });
 
 const makeClient = (
@@ -621,6 +621,119 @@ it.live("routes side channels and writes single-line host replies", () =>
       assert.equal(uiReply?.confirmed, true);
       const toolReply = parsed.find((frame) => frame.type === "host_tool_result");
       assert.equal(toolReply?.id, "tool-1");
+    }),
+  ),
+);
+
+it.live("bounds the whole transport handshake even when the hook waits for ready", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({ onLine: () => Effect.void });
+      const error = yield* Effect.flip(
+        Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 40,
+          onTransportReady: (transport) => transport.transportReady.pipe(Effect.ignore),
+        }),
+      );
+      assert.equal(error.code, "timeout");
+      yield* Effect.gen(function* () {
+        while (!peer.signals.includes("SIGTERM")) yield* Effect.sleep("10 millis");
+      }).pipe(Effect.timeout("1 second"));
+    }),
+  ),
+);
+
+it.live("fails ready immediately when the peer exits without sending a ready frame", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({ onLine: () => Effect.void });
+      yield* peer.finish({ code: 1, signal: null });
+      const error = yield* Effect.flip(
+        Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 2_000,
+          onTransportReady: (transport) => transport.transportReady.pipe(Effect.ignore),
+        }),
+      );
+      assert.equal(error.code, "exited");
+    }),
+  ),
+);
+
+it.live("fails ready when stdout ends but the process remains alive", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({ onLine: () => Effect.void });
+      yield* peer.endStdout;
+      const error = yield* Effect.flip(
+        Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 2_000,
+          onTransportReady: (transport) => transport.transportReady.pipe(Effect.ignore),
+        }),
+      );
+      assert.equal(error.code, "exited");
+    }),
+  ),
+);
+
+it.live("rejects malformed ready while accepting a startup UI response during negotiation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const malformed = yield* scriptedPeer({
+        ready: { type: "ready", protocolVersion: 9 },
+        onLine: () => Effect.void,
+      });
+      const bad = yield* Effect.flip(
+        Client.make({
+          spawn: () => Effect.succeed(malformed.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 2_000,
+        }),
+      );
+      assert.equal(bad.code, "bad_frame");
+
+      const uiAnswered = yield* Deferred.make<void>();
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (cmd, emit) =>
+          cmd.type === "extension_ui_response"
+            ? Deferred.succeed(uiAnswered, undefined).pipe(Effect.asVoid)
+            : negotiate(cmd, emit).pipe(Effect.asVoid),
+      });
+      yield* peer.emit({ type: "extension_ui_request", id: "startup-ui", method: "confirm" });
+      const scope = yield* Effect.scope;
+      const client = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 2_000,
+        onTransportReady: (transport) =>
+          Stream.runForEach(transport.uiRequests, (frame) =>
+            transport.respondUi({ id: frame.id, confirmed: true }),
+          ).pipe(Effect.forkIn(scope), Effect.asVoid),
+      });
+      yield* Effect.addFinalizer(() => client.close(20));
+      assert.equal(client.capabilities.has("v2"), true);
+      yield* Deferred.await(uiAnswered).pipe(Effect.timeout("2 seconds"));
     }),
   ),
 );

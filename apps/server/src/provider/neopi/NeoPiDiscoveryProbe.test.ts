@@ -35,7 +35,9 @@ it.live(
               const done = yield* Deferred.make<void>();
               yield* Queue.offer(
                 outbound,
-                new TextEncoder().encode('{"type":"ready","protocolVersion":1}\n'),
+                new TextEncoder().encode(
+                  '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1,2]}\n',
+                ),
               );
               const writer = Sink.forEach((bytes: Uint8Array) =>
                 Effect.gen(function* () {
@@ -46,12 +48,15 @@ it.live(
                     id: "id" in frame ? frame.id : undefined,
                     command: frame.type,
                     success: true,
-                    data: {
-                      commands: [
-                        { name: "build", source: "extension", input: { hint: "target" } },
-                        { name: "skill:unslop", source: "skill", description: "Remove slop" },
-                      ],
-                    },
+                    data:
+                      frame.type === "negotiate_protocol"
+                        ? { protocolVersion: 2 }
+                        : {
+                            commands: [
+                              { name: "build", source: "extension", input: { hint: "target" } },
+                              { name: "skill:unslop", source: "skill", description: "Remove slop" },
+                            ],
+                          },
                   };
                   yield* Queue.offer(outbound, new TextEncoder().encode(`${encode(response)}\n`));
                 }),
@@ -84,6 +89,7 @@ it.live(
           ["unslop"],
         );
         assert.equal(launches.length, 1);
+        assert.deepEqual(launches[0]?.slice(0, 2), ["--mode", "rpc-ui"]);
         assert.equal(launches[0]?.includes("--no-skills"), false);
         assert.equal(launches[0]?.includes("--no-extensions"), false);
         yield* probe.probe("/workspace/a");

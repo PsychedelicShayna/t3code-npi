@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ServerProviderUsageLimits, ServerProviderUsageWindow } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import type * as Duration from "effect/Duration";
@@ -77,6 +78,26 @@ export function toUsageLimits(input: NeoPiUsageLimitsInput): ServerProviderUsage
       message: "NeoPi/OMP has no usage windows for this provider.",
     });
   }
+  // `--provider` filters reports, not accounts. Without an active-account RPC,
+  // multiple credentials cannot be attributed to the current model safely.
+  const accountsWithoutUsage =
+    isRecord(input.payload) && Array.isArray(input.payload.accountsWithoutUsage)
+      ? input.payload.accountsWithoutUsage
+      : [];
+  if (
+    reports.length !== 1 ||
+    accountsWithoutUsage.some(
+      (account) =>
+        isRecord(account) &&
+        text(account.provider).toLowerCase() === input.activeProvider.toLowerCase(),
+    )
+  ) {
+    return makeUnavailableUsageLimits({
+      checkedAt: input.checkedAt,
+      reason: "unsupported",
+      message: "NeoPi/OMP cannot attribute usage windows to the active account.",
+    });
+  }
 
   const windows = new Map<string, ServerProviderUsageWindow>();
   for (const report of reports) {
@@ -129,11 +150,19 @@ export const applyUsageLimits = Effect.fn("applyNeoPiUsageLimits")(function* (
     });
   }
 
+  const environmentHash = createHash("sha256");
+  for (const [key, value] of Object.entries(input.environment ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b),
+  )) {
+    environmentHash.update(key).update("\0").update(value).update("\0");
+  }
+  const environmentIdentity = environmentHash.digest("hex");
   const cacheKey = [
     input.binary,
     input.profile?.trim() ?? "",
     activeProvider.toLowerCase(),
     input.cwd,
+    environmentIdentity,
   ].join("\0");
   const nowMs = yield* DateTime.now.pipe(Effect.map((now) => DateTime.toEpochMillis(now)));
   const cached = probeCache.get(cacheKey);

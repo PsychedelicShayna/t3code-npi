@@ -202,6 +202,26 @@ describe("toUsageLimits", () => {
       toUsageLimits({ payload: { generatedAt: 1 }, activeProvider: "openai-codex", checkedAt }),
     ).toBe(undefined);
   });
+  it("does not publish another credential's exhausted window as the active account", () => {
+    const exhausted = {
+      ...codexReport,
+      metadata: { accountId: "inactive" },
+      limits: [
+        limit({
+          id: "openai-codex:primary",
+          label: "Primary",
+          amount: { usedFraction: 1 },
+        }),
+      ],
+    };
+    const result = toUsageLimits({
+      payload: payload([codexReport, exhausted]),
+      activeProvider: "openai-codex",
+      checkedAt,
+    });
+    expect(result?.windows).toEqual([]);
+    expect(result?.unavailable?.message).toContain("active account");
+  });
 });
 
 describe("applyUsageLimits", () => {
@@ -245,10 +265,22 @@ describe("applyUsageLimits", () => {
         activeProvider: "OpenAI-Codex",
         profile: "work",
         cwd: "/work",
+        environment: { PATH: "/usr/bin" },
         previous,
       }).pipe(Effect.provide(spawner));
       expect(commands).toHaveLength(1);
       expect(cached.windows[0]?.usedPercent).toBe(5);
+
+      const anotherCredential = yield* applyUsageLimits({
+        binary: "/bin/npi",
+        activeProvider: "openai-codex",
+        profile: "work",
+        cwd: "/work",
+        environment: { PATH: "/usr/bin", OMP_AUTH_BROKER: "other" },
+        previous,
+      }).pipe(Effect.provide(spawner));
+      expect(commands).toHaveLength(2);
+      expect(anotherCredential).toBe(previous);
 
       clearNeoPiUsageProbeCache();
       const failed = yield* applyUsageLimits({

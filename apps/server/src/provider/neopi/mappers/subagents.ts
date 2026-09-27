@@ -7,7 +7,7 @@ import {
 } from "@t3tools/contracts";
 
 import { coreTurnTokenUsage, emptyCoreState, mapCoreFrame, type CoreState } from "./core.ts";
-import type { MapCtx } from "./MapCtx.ts";
+import { scopedItemId, type MapCtx } from "./MapCtx.ts";
 import { emptyToolState, mapToolFrame, withHostToolNames, type ToolState } from "./tools.ts";
 
 /**
@@ -16,11 +16,10 @@ import { emptyToolState, mapToolFrame, withHostToolNames, type ToolState } from 
  * re-entered through the core and tool mappers with an agent-scoped MapCtx,
  * so item ids and tool state cannot collide with the parent turn.
  *
- * Child assistant/reasoning deltas are not republished as content.delta.
- * Ingestion appends those stream kinds to the parent answer, and the payload
- * schema has no agentId to re-home them. Claude drops the same narration.
- * The child's text is attributed on task.progress instead, and its token
- * totals stay on task.completed.typedUsage.
+ * Child assistant/reasoning deltas cannot be republished as content.delta:
+ * ingestion appends them to the parent answer. The Agents surface currently
+ * retains a bounded child progress preview, not a child transcript.
+ * Child token totals stay on task.completed.typedUsage.
  */
 export interface SubagentState {
   readonly runs: Readonly<Record<string, ChildRun>>;
@@ -190,8 +189,22 @@ function mapEvent(
           }),
         ]
       : [];
+  const childEvents = core.events.flatMap((event): ProviderRuntimeEvent[] => {
+    if (event.type === "runtime.error") {
+      return [
+        emit(ctx, frame, "task.progress", {
+          taskId: RuntimeTaskId.make(run.taskId),
+          description: run.description,
+          error: event.payload.message,
+          status: "running",
+          ...linkage(run),
+        }),
+      ];
+    }
+    return keepChildEvent(event) ? [event] : [];
+  });
   return {
-    events: [...opened.events, ...core.events.filter(keepChildEvent), ...tools.events, ...progress],
+    events: [...opened.events, ...childEvents, ...tools.events, ...progress],
     state: {
       ...putRun(opened.state, { ...run, ...(summary ? { lastSummary: summary } : {}) }),
       ...(toolCallId
@@ -216,15 +229,17 @@ function startRun(
     return { events: [], state: run === existing ? state : putRun(state, run) };
   }
   const generation = (state.generations[id] ?? 0) + 1;
-  const parentToolUseId = text(payload.parentToolCallId);
+  const nativeParentToolUseId = text(payload.parentToolCallId);
+  const parentAgentId = nativeParentToolUseId ? state.toolOwners[nativeParentToolUseId] : undefined;
+  const parentToolUseId = nativeParentToolUseId
+    ? scopedItemId(parentAgentId ? { ...ctx, agentId: parentAgentId } : ctx, nativeParentToolUseId)
+    : undefined;
   const role = text(payload.agent);
   const run: ChildRun = {
     nativeId: id,
-    taskId: generation === 1 ? id : `${id}#${generation}`,
+    taskId: scopedItemId(ctx, `task:${id}#${generation}`),
     ...(parentToolUseId ? { parentToolUseId } : {}),
-    ...(parentToolUseId && state.toolOwners[parentToolUseId]
-      ? { parentAgentId: state.toolOwners[parentToolUseId] }
-      : {}),
+    ...(parentAgentId ? { parentAgentId } : {}),
     description: text(payload.description) ?? text(payload.agent) ?? id,
     ...(role ? { role } : {}),
     terminal: false,

@@ -1,4 +1,5 @@
 import { make as makeClient, type SpawnFn } from "effect-neopi-rpc/client";
+import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -6,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import type { NeoPiDiscoveryHub, NeoPiDiscoverySnapshot } from "./NeoPiDiscovery.ts";
 import { toNeoPiCommandCatalog, type NeoPiAvailableCommand } from "./NeoPiCommandCatalog.ts";
+import { neopiCompatibility } from "./NeoPiCompatibility.ts";
 
 const CACHE_MS = 10 * 60_000;
 
@@ -46,7 +48,7 @@ export function makeNeoPiDiscoveryProbe(input: {
             command: input.binary,
             args: [
               "--mode",
-              "rpc",
+              "rpc-ui",
               "--cwd",
               cwd,
               "--no-session",
@@ -58,6 +60,13 @@ export function makeNeoPiDiscoveryProbe(input: {
             env: input.env,
             requestTimeoutMs: input.deadlineMs ?? 30_000,
           });
+          if (
+            neopiCompatibility(client.ready, client.capabilities.has("v2")).status !== "supported"
+          )
+            return yield* new NeoPiRpcError({
+              code: "bad_frame",
+              message: "NeoPi/OMP discovery requires protocol v2",
+            });
           yield* Effect.addFinalizer(() => client.close(150));
           const response = yield* client.request({ type: "get_available_commands" });
           const commands =

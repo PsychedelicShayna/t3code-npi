@@ -28,7 +28,7 @@ import type {
   NeoPiSessionRuntimeShape,
 } from "../NeoPiRuntimeTypes.ts";
 import { emptyCoreState, mapCoreFrame } from "./core.ts";
-import type { MapCtx } from "./MapCtx.ts";
+import { scopedItemId, type MapCtx } from "./MapCtx.ts";
 import { emptySubagentState, mapSubagentFrame } from "./subagents.ts";
 
 function ctx(): MapCtx {
@@ -43,6 +43,7 @@ function ctx(): MapCtx {
     newEventId: () => `event-${++nextId}`,
   };
 }
+const childTaskId = (id: string, generation = 1) => scopedItemId(ctx(), `task:${id}#${generation}`);
 
 function assistant(text: string, usage?: object) {
   return {
@@ -140,20 +141,28 @@ describe("NeoPi subagent mapper", () => {
 
     expect(ofType(events, "task.started").map((event) => event.payload)).toEqual([
       expect.objectContaining({
-        taskId: "child-1",
-        agentId: "child-1",
+        taskId: childTaskId("child-1"),
+        agentId: childTaskId("child-1"),
         description: "Inspect the mapper",
-        parentToolUseId: "tool-parent",
+        parentToolUseId: scopedItemId(ctx(), "tool-parent"),
         taskType: "subagent",
       }),
     ]);
     expect(ofType(events, "task.progress").map((event) => event.payload)).toEqual([
-      expect.objectContaining({ taskId: "child-1", summary: "reading core", status: "running" }),
-      expect.objectContaining({ taskId: "child-1", summary: "summing usage", status: "running" }),
+      expect.objectContaining({
+        taskId: childTaskId("child-1"),
+        summary: "reading core",
+        status: "running",
+      }),
+      expect.objectContaining({
+        taskId: childTaskId("child-1"),
+        summary: "summing usage",
+        status: "running",
+      }),
     ]);
     expect(ofType(events, "task.completed").map((event) => event.payload)).toEqual([
       expect.objectContaining({
-        taskId: "child-1",
+        taskId: childTaskId("child-1"),
         status: "completed",
         typedUsage: {
           totalTokens: 23,
@@ -238,8 +247,8 @@ describe("NeoPi subagent mapper", () => {
     ).toBe(false);
     expect(ofType(events, "task.progress").map((event) => event.payload)).toEqual([
       expect.objectContaining({
-        taskId: "child-1",
-        agentId: "child-1",
+        taskId: childTaskId("child-1"),
+        agentId: childTaskId("child-1"),
         summary: "CHILD-SECRET",
       }),
     ]);
@@ -247,7 +256,10 @@ describe("NeoPi subagent mapper", () => {
       (event) => event.type === "item.completed" && event.payload.itemType === "command_execution",
     );
     expect(tool?.payload).toEqual(
-      expect.objectContaining({ agentId: "child-1", parentToolUseId: "tool-parent" }),
+      expect.objectContaining({
+        agentId: childTaskId("child-1"),
+        parentToolUseId: scopedItemId(ctx(), "tool-parent"),
+      }),
     );
     expect(tool && "itemId" in tool ? tool.itemId : undefined).toContain("child-1");
   });
@@ -266,7 +278,38 @@ describe("NeoPi subagent mapper", () => {
       ofType(events, "task.started").map((event) =>
         "taskId" in event.payload ? event.payload.taskId : undefined,
       ),
-    ).toEqual(["child-1", "child-1#2"]);
+    ).toEqual([childTaskId("child-1"), childTaskId("child-1", 2)]);
+  });
+
+  it("separates a reused child name across runtime restarts and keeps its error off the parent", () => {
+    const frame = { type: "subagent_lifecycle", payload: { id: "named-child", status: "started" } };
+    const a = mapSubagentFrame(ctx(), frame, emptySubagentState());
+    const restarted = { ...ctx(), sessionKey: "restarted-session" };
+    const b = mapSubagentFrame(restarted, frame, emptySubagentState());
+    expect(a.events[0]?.payload).toEqual(
+      expect.objectContaining({ taskId: childTaskId("named-child") }),
+    );
+    expect(b.events[0]?.payload).toEqual(
+      expect.objectContaining({
+        taskId: scopedItemId(restarted, "task:named-child#1"),
+      }),
+    );
+    expect(a.events[0]?.payload).not.toEqual(b.events[0]?.payload);
+    const error = mapSubagentFrame(
+      ctx(),
+      {
+        type: "subagent_event",
+        payload: {
+          id: "named-child",
+          event: { type: "notice", level: "error", message: "Child failed" },
+        },
+      },
+      a.state,
+    );
+    expect(error.events.some((event) => event.type === "runtime.error")).toBe(false);
+    expect(ofType(error.events, "task.progress")[0]?.payload).toEqual(
+      expect.objectContaining({ taskId: childTaskId("named-child"), error: "Child failed" }),
+    );
   });
 });
 
@@ -353,6 +396,14 @@ effectIt.live("child subagent text does not enter the parent message through ing
                           usage: childUsage,
                         },
                       },
+                    },
+                    turnId: turn.turnId,
+                  },
+                  {
+                    type: "subagent_event",
+                    payload: {
+                      id: "child-1",
+                      event: { type: "notice", level: "error", message: "child-only error" },
                     },
                     turnId: turn.turnId,
                   },
@@ -461,8 +512,9 @@ effectIt.live("child subagent text does not enter the parent message through ing
         completed?.payload && typeof completed.payload === "object"
           ? (completed.payload as { typedUsage?: { inputTokens?: number }; agentId?: string })
           : undefined;
-      assert.equal(payload?.agentId, "child-1");
+      assert.equal(payload?.agentId?.includes("child-1"), true);
       assert.equal(payload?.typedUsage?.inputTokens, 8);
+      assert.equal(thread.session?.status, "ready");
     }).pipe(Effect.provide(NodeServices.layer)),
   ),
 );

@@ -524,10 +524,31 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   const stderrDone = yield* Deferred.make<void>();
 
   yield* Stream.runForEach(stdoutLines(handle.stdout), ingestLine).pipe(
-    Effect.ignore,
+    Effect.catch((error) =>
+      abortTransport(
+        new NeoPiRpcError({
+          code: "closed",
+          message: `NeoPi/OMP stdout failed: ${String(error)}`,
+        }),
+      ),
+    ),
     Effect.andThen(
       Effect.sync(() => finishChunks(decoder.current)).pipe(
         Effect.flatMap((message) => (message === undefined ? Effect.void : noteBadChunk(message))),
+      ),
+    ),
+    Effect.andThen(
+      Deferred.isDone(readyDeferred).pipe(
+        Effect.flatMap((done) =>
+          done
+            ? Effect.void
+            : abortTransport(
+                new NeoPiRpcError({
+                  code: "exited",
+                  message: "NeoPi/OMP stdout ended before the ready frame",
+                }),
+              ),
+        ),
       ),
     ),
     Effect.ensuring(Deferred.succeed(stdoutDone, undefined).pipe(Effect.ignore)),
@@ -570,11 +591,18 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     }),
   );
 
-  yield* Effect.all([readExit, Deferred.await(stdoutDone), Deferred.await(stderrDone)], {
-    concurrency: "unbounded",
-  }).pipe(
-    Effect.flatMap(([status]) =>
+  yield* readExit.pipe(
+    Effect.flatMap((status) =>
       Effect.gen(function* () {
+        if (!(yield* Deferred.isDone(readyDeferred))) {
+          yield* Deferred.fail(
+            readyDeferred,
+            new NeoPiRpcError({ code: "exited", message: "NeoPi/OMP process exited before ready" }),
+          ).pipe(Effect.ignore);
+        }
+        yield* Effect.all([Deferred.await(stdoutDone), Deferred.await(stderrDone)], {
+          concurrency: "unbounded",
+        });
         if (fatal) {
           yield* failPending(fatal);
         } else if (!closed) {
@@ -671,20 +699,22 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   const hostUriResult = (result: HostUriResultWire): Effect.Effect<void, NeoPiRpcError> =>
     writeFrame(result);
 
-  if (options.onTransportReady) {
-    yield* options.onTransportReady({
-      transportReady: Deferred.await(readyDeferred),
-      events: Stream.fromQueue(events),
-      uiRequests: Stream.fromQueue(uiRequests),
-      respondUi,
-      hostToolCalls: Stream.fromQueue(hostToolCalls),
-      hostToolResult,
-      hostUriRequests: hostUriRequestsStream,
-      hostUriResult,
-      exit,
-    });
-  }
-  const ready = yield* Deferred.await(readyDeferred).pipe(
+  const ready = yield* Effect.gen(function* () {
+    if (options.onTransportReady) {
+      yield* options.onTransportReady({
+        transportReady: Deferred.await(readyDeferred),
+        events: Stream.fromQueue(events),
+        uiRequests: Stream.fromQueue(uiRequests),
+        respondUi,
+        hostToolCalls: Stream.fromQueue(hostToolCalls),
+        hostToolResult,
+        hostUriRequests: hostUriRequestsStream,
+        hostUriResult,
+        exit,
+      });
+    }
+    return yield* Deferred.await(readyDeferred);
+  }).pipe(
     Effect.timeout(Duration.millis(requestTimeoutMs)),
     Effect.catchTag("TimeoutError", () =>
       Effect.fail(
@@ -694,6 +724,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
         }),
       ),
     ),
+    Effect.tapError(abortTransport),
   );
 
   const supported = ready.supportedProtocolVersions;
