@@ -1,19 +1,22 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
+import { NEOPI_CURRENT_MODEL, ProviderInstanceId } from "@t3tools/contracts";
+import { createModelSelection } from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import { createModelSelection } from "@t3tools/shared/model";
-import { expect } from "vite-plus/test";
-import { NEOPI_CURRENT_MODEL, ProviderInstanceId } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as NeoPiRpcClient from "effect-neopi-rpc/client";
 import type { SpawnFn } from "effect-neopi-rpc/client";
+import { expect } from "vite-plus/test";
 
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeNeoPiTextGeneration } from "./NeoPiTextGeneration.ts";
@@ -29,14 +32,16 @@ const TEST_MODEL = createModelSelection(
 );
 const CURRENT_MODEL = createModelSelection(ProviderInstanceId.make("neopi"), NEOPI_CURRENT_MODEL);
 const PROFILE = "neopi-text-generation-test";
-const GENERATED_JSON = JSON.stringify({
+const GENERATED_REPLY = {
   subject:
     "  Add the NeoPi RPC text-generation provider integration with a deliberately overlong subject line.\nsecond line",
   body: "\n## Summary\n\n- Add the provider\n\n## Testing\n\n- Run focused tests\n",
   title: "  Improve NeoPi pull request output\nsecondary title line",
   branch: "../Add!!! NeoPi Provider...",
   needsRefinement: false,
-});
+};
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const GENERATED_JSON = encodeJson(GENERATED_REPLY);
 
 interface SpawnCapture {
   readonly args: ReadonlyArray<string>;
@@ -162,7 +167,7 @@ lines.on("line", (line) => {
 
 const makeHarness = (
   options: HarnessOptions = {},
-): Effect.Effect<Harness, never, ChildProcessSpawner.ChildProcessSpawner> =>
+): Effect.Effect<Harness, never, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope> =>
   Effect.gen(function* () {
     const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-neopi-text-test-"));
     yield* Effect.addFinalizer(() =>
@@ -177,7 +182,7 @@ const makeHarness = (
       const scenarioPath = NodePath.join(root, "scenario.json");
       NodeFS.writeFileSync(
         scenarioPath,
-        JSON.stringify(
+        encodeJson(
           scenarioFor(
             options.responseText ??
               `\n\u0060\u0060\u0060json\n${GENERATED_JSON}\n\u0060\u0060\u0060\n`,
@@ -282,7 +287,7 @@ it.live("generates all four text operations through a trimmed disposable RPC loa
           modelSelection: CURRENT_MODEL,
         });
 
-        expect(commit.subject).toBe(sanitizeCommitSubject(JSON.parse(GENERATED_JSON).subject));
+        expect(commit.subject).toBe(sanitizeCommitSubject(GENERATED_REPLY.subject));
         expect(commit.subject.length).toBeLessThanOrEqual(72);
         expect(commit.subject.endsWith(".")).toBe(false);
         expect(commit.body).toBe(
@@ -388,7 +393,7 @@ it.live("closes the RPC process when the generation deadline expires", () =>
   withNode(
     Effect.scoped(
       Effect.gen(function* () {
-        const marker = NodePath.join(NodeOS.tmpdir(), `t3-neopi-hang-${process.pid}-${Date.now()}`);
+        const marker = NodePath.join(NodeOS.tmpdir(), `t3-neopi-hang-${NodeCrypto.randomUUID()}`);
         const { textGeneration, captures } = yield* makeHarness({
           peerSource: hangingPeer,
           peerArgs: [marker],
@@ -427,7 +432,7 @@ it.live("closes the RPC process when a generation fiber is interrupted", () =>
       Effect.gen(function* () {
         const marker = NodePath.join(
           NodeOS.tmpdir(),
-          `t3-neopi-interrupt-${process.pid}-${Date.now()}`,
+          `t3-neopi-interrupt-${NodeCrypto.randomUUID()}`,
         );
         const { textGeneration, captures } = yield* makeHarness({
           peerSource: hangingPeer,

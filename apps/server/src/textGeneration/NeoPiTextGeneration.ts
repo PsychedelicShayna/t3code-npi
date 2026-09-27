@@ -341,7 +341,7 @@ const collectAssistantText = (
   client: NeoPiRpcClient,
   settled: Deferred.Deferred<string, TextGenerationError>,
   operation: string,
-): Effect.Effect<void> =>
+): Effect.Effect<void, never, Scope.Scope> =>
   Effect.gen(function* () {
     let deltas = "";
     let snapshot = "";
