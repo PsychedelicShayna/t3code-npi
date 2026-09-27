@@ -4,6 +4,7 @@ import {
   CodexSettings,
   CursorSettings,
   GrokSettings,
+  NeoPiSettings,
   OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
@@ -13,6 +14,7 @@ import {
   ClaudeAI,
   CursorIcon,
   GrokIcon,
+  NeoPiIcon,
   type Icon,
   OpenAI,
   OpenCodeIcon,
@@ -33,6 +35,11 @@ export interface ProviderClientDefinition {
   readonly label: string;
   readonly icon: Icon;
   readonly settingsSchema: ProviderSettingsSchema;
+  /**
+   * Optional subtitle for the driver kind. NeoPi/OMP uses this to state
+   * oh-my-pi compatibility without claiming upstream Pi Agent.
+   */
+  readonly description?: string;
   /**
    * Optional short label rendered as a `variant="warning"` badge next to
    * the instance title. Used to flag drivers that still ship under an
@@ -69,6 +76,13 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     icon: GrokIcon,
     badgeLabel: "Early Access",
     settingsSchema: GrokSettings,
+  },
+  {
+    value: ProviderDriverKind.make("neopi"),
+    label: "NeoPi/OMP",
+    description: "NeoPi/OMP (oh-my-pi compatible)",
+    icon: NeoPiIcon,
+    settingsSchema: NeoPiSettings,
   },
   {
     value: ProviderDriverKind.make("opencode"),

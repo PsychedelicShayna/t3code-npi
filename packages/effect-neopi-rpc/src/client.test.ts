@@ -215,6 +215,45 @@ it.live("negotiates v2 and records the capability", () =>
   ),
 );
 
+it.live("sends a one-way approval response without waiting for a reply", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const received = yield* Deferred.make<CapturedCommand>();
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          negotiate(message, emit).pipe(
+            Effect.flatMap((handled) =>
+              handled
+                ? Effect.void
+                : message.type === "tool_approval_response"
+                  ? Deferred.succeed(received, message).pipe(Effect.asVoid)
+                  : emit({
+                      id: message.id,
+                      type: "response",
+                      command: message.type,
+                      success: true,
+                      data: { ok: true },
+                    }),
+            ),
+          ),
+      });
+      const client = yield* makeClient(peer);
+      yield* client.writeFrame({
+        type: "tool_approval_response",
+        id: "approval-1",
+        decision: "allow_once",
+      });
+      assert.deepEqual(yield* Deferred.await(received), {
+        type: "tool_approval_response",
+        id: "approval-1",
+        decision: "allow_once",
+      });
+      assert.deepEqual(yield* client.request({ type: "get_state" }), { ok: true });
+    }),
+  ),
+);
+
 it.live("escalates close from SIGTERM to SIGKILL", () =>
   Effect.scoped(
     Effect.gen(function* () {

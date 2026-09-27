@@ -2572,6 +2572,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                     grok: {
                       enabled: false,
                     },
+                    neopi: {
+                      enabled: false,
+                    },
                   },
                 }),
               ),
@@ -2645,6 +2648,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
                 "codex",
                 "cursor",
                 "grok",
+                "neopi",
                 "opencode",
               ]);
               assert.strictEqual(cursorProvider?.enabled, false);

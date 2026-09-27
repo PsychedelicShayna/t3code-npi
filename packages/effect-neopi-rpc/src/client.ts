@@ -78,6 +78,8 @@ export interface NeoPiRpcClient {
   readonly ready: ReadyFrame;
   readonly capabilities: ReadonlySet<string>;
   readonly request: <C extends { type: string }>(cmd: C) => Effect.Effect<unknown, NeoPiRpcError>;
+  /** One-way protocol frame; unlike request, it has no response correlation. */
+  readonly writeFrame: (frame: unknown) => Effect.Effect<void, NeoPiRpcError>;
   readonly prompt: (cmd: PromptCommand) => Effect.Effect<PromptHandle, NeoPiRpcError>;
   readonly events: Stream.Stream<SessionEventFrame>;
   readonly uiRequests: Stream.Stream<UiRequestFrame>;
@@ -657,6 +659,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     ready,
     capabilities,
     request,
+    writeFrame,
     prompt,
     events: Stream.fromQueue(events),
     uiRequests: Stream.fromQueue(uiRequests),

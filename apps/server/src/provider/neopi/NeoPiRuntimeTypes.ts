@@ -65,6 +65,7 @@ export interface NeoPiSessionRuntimeShape {
   readonly compact: (customInstructions?: string) => Effect.Effect<void, NeoPiRuntimeError>;
   readonly respondUi: NeoPiRpcClient["respondUi"];
   readonly request: NeoPiRpcClient["request"];
+  readonly writeFrame: NeoPiRpcClient["writeFrame"];
   readonly frames: Stream.Stream<NeoPiRuntimeFrame>;
   readonly restart: (reason: "runtime-mode-change") => Effect.Effect<void, NeoPiRuntimeError>;
   readonly stop: Effect.Effect<void>;

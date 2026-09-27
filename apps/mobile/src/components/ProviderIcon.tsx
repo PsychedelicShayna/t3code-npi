@@ -1,5 +1,5 @@
 import { Image } from "expo-image";
-import { Path, Svg } from "react-native-svg";
+import { Circle, Path, Rect, Svg } from "react-native-svg";
 import { View } from "react-native";
 import { providerInstanceInitials } from "@t3tools/client-runtime/state/provider-instance-display";
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
@@ -49,6 +49,21 @@ export function ProviderIcon(props: ProviderIconProps) {
           fill={fill}
           d="M7.62249 16.7237C4.83113 14.0422 5.3124 9.89222 7.69417 7.49905C9.45541 5.72786 12.341 5.00497 14.86 6.06768L17.5653 4.81138C17.0779 4.45714 16.4533 4.07613 15.7365 3.80839C12.4966 2.46764 8.6178 3.13492 5.98413 5.78141C3.45081 8.32904 2.65415 12.2463 4.02219 15.5889C5.04412 18.0871 3.36889 19.8541 1.68137 21.6377C1.08337 22.2699 0.483318 22.9022 0 23.5716L7.62045 16.7257"
         />
+      </Svg>
+    );
+  }
+
+  if (props.provider === "neopi") {
+    return (
+      <Svg width={size} height={size} viewBox="0 0 120 90" fill="none">
+        <Rect x={10} y={8} width={100} height={12} rx={2} fill={mono} />
+        <Rect x={25} y={20} width={12} height={62} rx={2} fill={mono} />
+        <Rect x={75} y={20} width={12} height={45} rx={2} fill={mono} />
+        <Rect x={71} y={55} width={20} height={16} rx={3} fill="#f97316" />
+        <Rect x={76} y={59} width={3} height={8} rx={1} fill="#0d0d0d" />
+        <Rect x={82} y={59} width={3} height={8} rx={1} fill="#0d0d0d" />
+        <Circle cx={18} cy={14} r={2} fill="#f97316" opacity={0.8} />
+        <Circle cx={102} cy={14} r={2} fill="#f97316" opacity={0.8} />
       </Svg>
     );
   }

@@ -60,6 +60,7 @@ export interface NeoPiRuntimeInput {
   readonly binary: string;
   readonly cwd: string;
   readonly t3Home: string;
+  readonly env?: Record<string, string>;
   readonly projectId: string;
   readonly profile?: string;
   readonly launchArgs?: string;
@@ -108,7 +109,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
   const capabilities = new Set<string>();
   const uiPending = new Set<string>();
-  const hostPending = new Map<string, AbortController>();
+  const hostPending = new Map<string, Scope.Closeable>();
   let client: NeoPiRpcClient | undefined;
   let lifetime: Scope.Closeable | undefined;
   let generation = 0;
@@ -155,8 +156,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       });
     }
     uiPending.clear();
-    for (const [id, controller] of hostPending) {
-      controller.abort();
+    for (const [id, requestScope] of hostPending) {
+      yield* Scope.close(requestScope, Exit.void);
       yield* emit({
         type: "host_tool_cancel",
         id,
@@ -310,12 +311,16 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     Stream.runForEach(peer.hostToolCalls, (call) =>
       Effect.gen(function* () {
         if (call.type === "host_tool_cancel") {
-          hostPending.get(call.targetId)?.abort();
+          const requestScope = hostPending.get(call.targetId);
+          if (requestScope) yield* Scope.close(requestScope, Exit.void);
           hostPending.delete(call.targetId);
         } else if (input.hostBridge) {
-          const controller = new AbortController();
-          hostPending.set(call.id, controller);
-          yield* input.hostBridge.handle(call, controller.signal).pipe(
+          const requestScope = yield* Scope.make();
+          const signal = yield* Effect.abortSignal.pipe(
+            Effect.provideService(Scope.Scope, requestScope),
+          );
+          hostPending.set(call.id, requestScope);
+          yield* input.hostBridge.handle(call, signal).pipe(
             Effect.catchCause((cause) =>
               Effect.succeed({
                 content: [{ type: "text" as const, text: String(cause) }],
@@ -324,9 +329,13 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
             ),
             Effect.flatMap((result) => peer.hostToolResult(call.id, result, result.isError)),
             Effect.ensuring(
-              Effect.sync(() => {
-                hostPending.delete(call.id);
-              }),
+              Scope.close(requestScope, Exit.void).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    hostPending.delete(call.id);
+                  }),
+                ),
+              ),
             ),
             Effect.ignore,
             Effect.forkIn(lifetime!),
@@ -453,7 +462,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       ] as const) {
         yield* peer.request(command).pipe(
           Effect.mapError(rpcError),
-          Effect.catch((error) => (unknownCommand(error) ? Effect.void : Effect.fail(error))),
+          Effect.catchIf(unknownCommand, () => Effect.void),
         );
       }
       yield* setState("ready");
@@ -464,7 +473,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         Effect.gen(function* () {
           yield* setState("failed");
           yield* closePeer;
-          return yield* Effect.fail(error);
+          return yield* error;
         }),
       ),
     );
@@ -657,6 +666,12 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     interrupt,
     compact,
     request,
+    writeFrame: (frame) =>
+      client
+        ? client.writeFrame(frame)
+        : Effect.fail(
+            new NeoPiRpcError({ code: "closed", message: "NeoPi/OMP session is not connected" }),
+          ),
     frames: Stream.fromQueue(frames),
     restart,
     stop,

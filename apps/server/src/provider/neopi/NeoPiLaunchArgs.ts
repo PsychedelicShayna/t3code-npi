@@ -10,6 +10,7 @@ export interface NeoPiLaunchInput {
   readonly binary: string;
   readonly cwd: string;
   readonly t3Home: string;
+  readonly env?: Record<string, string>;
   readonly projectId: string;
   readonly profile?: string;
   readonly launchArgs?: string;
@@ -100,7 +101,15 @@ export const buildNeoPiLaunchPlan = (
       args,
       cwd: input.cwd,
       sessionDir,
-      env: { OMP_PROFILE: input.profile?.trim() ?? "" },
+      env: {
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        ),
+        ...input.env,
+        ...(input.profile?.trim() ? { OMP_PROFILE: input.profile.trim() } : {}),
+      },
       identity: input.cursor
         ? { kind: "resume" as const, cursor: input.cursor }
         : { kind: "fresh" as const },

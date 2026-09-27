@@ -88,7 +88,7 @@ describe("NeoPi launch plan", () => {
       });
       assert.equal(shared.identity.kind, "fresh");
       assert.equal(shared.sessionDir, "");
-      assert.equal(shared.env.OMP_PROFILE, "");
+      assert.equal(shared.env.OMP_PROFILE, process.env.OMP_PROFILE);
       assert.ok(shared.args.includes("--new-session"));
       assert.ok(!shared.args.includes("--session-dir"));
       for (const single of ["session_lease", "new_session_flag"]) {
@@ -100,5 +100,29 @@ describe("NeoPi launch plan", () => {
         assert.ok(!isolated.args.includes("--new-session"));
       }
     }),
+  );
+  it.effect(
+    "preserves the process environment, applies instance overrides, then the selected profile",
+    () =>
+      Effect.gen(function* () {
+        const planned = yield* buildNeoPiLaunchPlan({
+          ...input,
+          env: {
+            HOME: "/tmp/isolated-home",
+            OMP_PROFILE: "environment-profile",
+            CUSTOM_TOKEN: "instance",
+          },
+        });
+        assert.equal(planned.env.HOME, "/tmp/isolated-home");
+        assert.equal(planned.env.CUSTOM_TOKEN, "instance");
+        assert.equal(planned.env.OMP_PROFILE, "work");
+        assert.equal(planned.env.PATH, process.env.PATH);
+        const noProfile = yield* buildNeoPiLaunchPlan({
+          ...input,
+          profile: "",
+          env: { OMP_PROFILE: "environment-profile" },
+        });
+        assert.equal(noProfile.env.OMP_PROFILE, "environment-profile");
+      }),
   );
 });
