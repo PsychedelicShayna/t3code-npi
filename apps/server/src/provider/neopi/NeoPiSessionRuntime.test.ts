@@ -1,5 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import { strict as assert } from "node:assert";
+import * as NodeAssert from "node:assert/strict";
 import { it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type { ThreadId, TurnId } from "@t3tools/contracts";
@@ -8,6 +8,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -18,6 +19,7 @@ const root = "/tmp/neopi-runtime-tests";
 const sessionDir = `${root}/neopi/sessions/default/test`;
 const sessionFile = `${sessionDir}/session.jsonl`;
 type Command = { id?: string; type: string; [key: string]: unknown };
+const decodeCommand = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 type Emitter = (frame: unknown) => Effect.Effect<void>;
 const testPeer = Effect.fn("testPeer")(function* (
   handler: (cmd: Command, emit: Emitter) => Effect.Effect<void>,
@@ -43,15 +45,12 @@ const testPeer = Effect.fn("testPeer")(function* (
       while ((newline = pending.indexOf("\n")) >= 0) {
         const line = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
-        const command = JSON.parse(line) as Command;
+        const command = decodeCommand(line) as Command;
         commands.push(command);
         yield* handler(command, emit);
       }
     }
-  }).pipe(
-    Effect.catch(() => Effect.void),
-    Effect.forkScoped,
-  );
+  }).pipe(Effect.ignore, Effect.forkScoped);
   const handle = ChildProcessSpawner.makeHandle({
     pid: ChildProcessSpawner.ProcessId(123),
     exitCode: Deferred.await(exited).pipe(
@@ -150,9 +149,9 @@ it.live("rejects auto-resumed fresh sessions and mismatched resume ids, closing 
         );
         const runtime = yield* make(() => Effect.succeed(peer.handle), cursor);
         const failure = yield* runtime.start.pipe(Effect.flip);
-        assert.equal(failure.code, "identity_mismatch");
-        assert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
-        assert.ok(peer.signals.includes("SIGKILL"));
+        NodeAssert.equal(failure.code, "identity_mismatch");
+        NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
+        NodeAssert.ok(peer.signals.includes("SIGKILL"));
       }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
@@ -194,11 +193,11 @@ it.live(
         for (const [i, text] of ["reject", "data-local", "event-local", "agent"].entries()) {
           yield* runtime.startTurn({ ...turn(`turn-${i}`), text });
           const outcomes = yield* awaitOutcomes(frames, i + 1);
-          assert.equal(outcomes[i]?.state, i === 0 ? "failed" : "completed");
-          assert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
+          NodeAssert.equal(outcomes[i]?.state, i === 0 ? "failed" : "completed");
+          NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
         }
-        assert.equal(frames.filter((frame) => frame.type === "t3.turn.outcome").length, 4);
-        assert.ok(
+        NodeAssert.equal(frames.filter((frame) => frame.type === "t3.turn.outcome").length, 4);
+        NodeAssert.ok(
           frames.findIndex((frame) => frame.type === "command_output") <
             frames.findIndex(
               (frame) => frame.turnId === "turn-2" && frame.type === "t3.turn.outcome",
@@ -233,10 +232,13 @@ it.live(
         const runtime = yield* make(() => Effect.succeed(peer.handle));
         const frames = yield* capture(runtime);
         yield* runtime.start;
-        assert.equal((yield* runtime.steer(turn("unused")).pipe(Effect.flip)).code, "not_running");
+        NodeAssert.equal(
+          (yield* runtime.steer(turn("unused")).pipe(Effect.flip)).code,
+          "not_running",
+        );
         yield* runtime.startTurn(turn("t1"));
         yield* runtime.steer(turn("steer-not-a-turn"));
-        assert.equal(
+        NodeAssert.equal(
           (yield* runtime.restart("runtime-mode-change").pipe(Effect.flip)).code,
           "not_ready",
         );
@@ -246,7 +248,7 @@ it.live(
         yield* runtime.interrupt;
         yield* peer.emit({ type: "agent_end", isTerminal: true });
         const outcomes = yield* awaitOutcomes(frames, 2);
-        assert.deepEqual(
+        NodeAssert.deepEqual(
           outcomes.map((event) => [event.turnId, event.state]),
           [
             ["t1", "completed"],
@@ -254,12 +256,12 @@ it.live(
           ],
         );
         const cursor = yield* SubscriptionRef.get(runtime.cursor);
-        assert.deepEqual(
+        NodeAssert.deepEqual(
           cursor.turnBoundaries.map((boundary) => boundary.userEntryId),
           ["user-1", "user-2"],
         );
-        assert.equal(peer.commands.filter((cmd) => cmd.type === "steer").length, 1);
-        assert.equal(peer.commands.filter((cmd) => cmd.type === "abort").length, 1);
+        NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "steer").length, 1);
+        NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "abort").length, 1);
         yield* runtime.stop;
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
@@ -272,7 +274,7 @@ it.live("restarts with the verified cursor and updated approval mode", () =>
       let index = 0;
       const runtime = yield* make((cmd) =>
         Effect.sync(() => {
-          assert.equal(cmd._tag, "StandardCommand");
+          NodeAssert.equal(cmd._tag, "StandardCommand");
           if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
           args.push([...cmd.args]);
           return peers[index++]!.handle;
@@ -280,9 +282,9 @@ it.live("restarts with the verified cursor and updated approval mode", () =>
       );
       yield* runtime.start;
       yield* runtime.setRuntimeMode("auto");
-      assert.equal(args.length, 2);
-      assert.equal(args[1]?.[args[1]!.indexOf("--session") + 1], sessionFile);
-      assert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
+      NodeAssert.equal(args.length, 2);
+      NodeAssert.equal(args[1]?.[args[1]!.indexOf("--session") + 1], sessionFile);
+      NodeAssert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
       yield* runtime.stop;
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
@@ -309,12 +311,14 @@ it.live(
         });
         yield* peer.finish("SIGKILL");
         const outcomes = yield* awaitOutcomes(frames, 1);
-        assert.equal(outcomes[0]?.state, "failed");
-        assert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
-        assert.ok(
+        NodeAssert.equal(outcomes[0]?.state, "failed");
+        NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "failed");
+        NodeAssert.ok(
           frames.some((frame) => frame.type === "t3.session.exited" && frame.recoverable === true),
         );
-        assert.ok(frames.some((frame) => frame.method === "cancel" && frame.targetId === "ui1"));
+        NodeAssert.ok(
+          frames.some((frame) => frame.method === "cancel" && frame.targetId === "ui1"),
+        );
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -351,20 +355,20 @@ it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGT
         i++
       )
         yield* Effect.sleep("5 millis");
-      assert.equal(signals.length, 1);
+      NodeAssert.equal(signals.length, 1);
       yield* runtime.stop;
-      assert.equal(yield* SubscriptionRef.get(runtime.state), "stopped");
-      assert.ok(peer.signals.includes("SIGKILL"));
-      assert.equal(signals[0]?.aborted, true);
-      assert.ok(
+      NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "stopped");
+      NodeAssert.ok(peer.signals.includes("SIGKILL"));
+      NodeAssert.equal(signals[0]?.aborted, true);
+      NodeAssert.ok(
         frames.some((frame) => frame.method === "cancel" && frame.targetId === "select-pending"),
       );
-      assert.ok(
+      NodeAssert.ok(
         frames.some(
           (frame) => frame.type === "host_tool_cancel" && frame.targetId === "host-pending",
         ),
       );
-      assert.ok(
+      NodeAssert.ok(
         peer.commands.some(
           (cmd) =>
             cmd.type === "extension_ui_response" &&
@@ -374,7 +378,7 @@ it.live("cancels pending UI and host work and kills a peer ignoring EOF and SIGT
       );
       for (let i = 0; i < 100 && !frames.some((frame) => frame.type === "t3.session.exited"); i++)
         yield* Effect.sleep("5 millis");
-      assert.ok(
+      NodeAssert.ok(
         frames.some(
           (frame) =>
             frame.type === "t3.session.exited" &&
@@ -411,7 +415,7 @@ it.live(
         let index = 0;
         const runtime = yield* make((cmd) =>
           Effect.sync(() => {
-            assert.equal(cmd._tag, "StandardCommand");
+            NodeAssert.equal(cmd._tag, "StandardCommand");
             if (cmd._tag !== "StandardCommand") throw new Error("unexpected piped command");
             args.push([...cmd.args]);
             return peers[index++]!.handle;
@@ -421,8 +425,8 @@ it.live(
         yield* runtime.start;
         yield* runtime.startTurn(turn("first"));
         const deferred = yield* runtime.setRuntimeMode("full-access").pipe(Effect.flip);
-        assert.equal(deferred.code, "runtime_mode_deferred");
-        assert.ok(deferred.message.includes("takes effect after the current turn"));
+        NodeAssert.equal(deferred.code, "runtime_mode_deferred");
+        NodeAssert.ok(deferred.message.includes("takes effect after the current turn"));
         yield* peers[0]!.emit({
           type: "message_update",
           assistantMessageEvent: {
@@ -432,16 +436,16 @@ it.live(
           },
         });
         yield* peers[0]!.emit({ type: "agent_end", isTerminal: true });
-        assert.equal((yield* awaitOutcomes(frames, 1))[0]?.state, "failed");
+        NodeAssert.equal((yield* awaitOutcomes(frames, 1))[0]?.state, "failed");
         yield* runtime.startTurn(turn("second"));
-        assert.equal(args.length, 2);
-        assert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
+        NodeAssert.equal(args.length, 2);
+        NodeAssert.equal(args[1]?.[args[1]!.indexOf("--approval-mode") + 1], "yolo");
         yield* peers[1]!.emit({
           type: "message_update",
           assistantMessageEvent: { type: "error", reason: "aborted", error: {} },
         });
         yield* peers[1]!.emit({ type: "agent_end", isTerminal: true });
-        assert.equal((yield* awaitOutcomes(frames, 2))[1]?.state, "interrupted");
+        NodeAssert.equal((yield* awaitOutcomes(frames, 2))[1]?.state, "interrupted");
         yield* runtime.stop;
       }),
     ).pipe(Effect.provide(NodeServices.layer)),

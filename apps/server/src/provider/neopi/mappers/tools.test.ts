@@ -34,7 +34,14 @@ function run(frames: readonly unknown[], initialState: ToolState = emptyToolStat
 }
 
 function data(event: ReturnType<typeof run>["events"][number]): Record<string, unknown> {
-  return event.type.startsWith("item.") ? (event.payload.data as Record<string, unknown>) : {};
+  if (
+    event.type !== "item.started" &&
+    event.type !== "item.updated" &&
+    event.type !== "item.completed"
+  ) {
+    return {};
+  }
+  return event.payload.data as Record<string, unknown>;
 }
 
 const bashStart = (toolCallId: string) => ({
@@ -126,7 +133,11 @@ describe("NeoPi tool mapper", () => {
     };
     const { events } = run([start, end]);
     expect(events.map((event) => event.type)).toEqual(["item.started", "item.completed"]);
-    expect(events[0]?.payload.itemType).toBe("file_change");
+    const started = events[0];
+    expect(started?.type).toBe("item.started");
+    if (started?.type === "item.started") {
+      expect(started.payload.itemType).toBe("file_change");
+    }
     expect(data(events[1]!)).toMatchObject({
       paths: ["src/a.ts", "src/b.ts"],
       diff: "--- a/src/a.ts\n+++ b/src/a.ts\n--- a/src/b.ts\n+++ b/src/b.ts",

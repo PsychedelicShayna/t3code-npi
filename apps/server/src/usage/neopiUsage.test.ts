@@ -1,13 +1,16 @@
+// @effect-diagnostics nodeBuiltinImport:off - the suite seeds session trees on
+// disk, mirroring the reader's deliberate node:fs usage.
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
-import { fileURLToPath } from "node:url";
+import * as NodeURL from "node:url";
+import * as DateTime from "effect/DateTime";
 
 import { discoverNeoPiSessionRoots, readNeoPiUsage } from "./neopiUsage.ts";
 
 const fixturePath = NodePath.join(
-  NodePath.dirname(fileURLToPath(import.meta.url)),
+  NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)),
   "testFixtures",
   "neopi-session.jsonl",
 );
@@ -28,7 +31,7 @@ function assistant(input: {
     type: "message",
     id: input.id,
     parentId: null,
-    timestamp: new Date(input.timestampMs).toISOString(),
+    timestamp: DateTime.formatIso(DateTime.makeUnsafe(input.timestampMs)),
     message: {
       role: "assistant",
       provider: input.provider,
