@@ -56,6 +56,8 @@ export const T3_CODE_TOOL_SOURCE = {
 } as const satisfies ToolActivitySource;
 
 const FILE_CHANGE_TOOLS = new Set(["edit", "write", "delete", "move"]);
+const MAX_COMMAND_DISPLAY_CHARS = 2048;
+const OMITTED_COMMAND_OUTPUT = "[earlier output omitted]\n";
 
 export function emptyToolState(): ToolState {
   return {
@@ -330,6 +332,15 @@ function completedData(call: InFlightTool, result: unknown): unknown {
     // The completing result is authoritative, including when it replaces a tail window.
     const output = text !== undefined ? text : call.bashSnapshot;
     Object.assign(data, commandData(call, output, integerField(details?.exitCode)));
+    if (output) {
+      data.displayOutput =
+        output.length <= MAX_COMMAND_DISPLAY_CHARS
+          ? output
+          : OMITTED_COMMAND_OUTPUT +
+            Array.from(
+              output.slice(OMITTED_COMMAND_OUTPUT.length - MAX_COMMAND_DISPLAY_CHARS),
+            ).join("");
+    }
   } else if (diff !== undefined) {
     data.diff = diff;
     data.rawOutput = { content: diff };

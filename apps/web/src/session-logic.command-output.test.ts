@@ -66,6 +66,22 @@ describe("deriveWorkLogEntries command output", () => {
     });
   });
 
+  it("shows the completed command's opt-in multiline display output instead of its compact summary", () => {
+    const [entry] = deriveWorkLogEntries([
+      makeCommandActivity("multiline-output", {
+        itemType: "command_execution",
+        title: "Ran command",
+        data: {
+          command: "printf 'one\\ntwo\\nthree\\n'",
+          rawOutput: { content: "one" },
+          displayOutput: "one\ntwo\nthree",
+        },
+      }),
+    ]);
+
+    expect(entry?.detail).toBe("one\ntwo\nthree");
+  });
+
   it("keeps command output that equals the command text", () => {
     const [entry] = deriveWorkLogEntries([
       makeCommandActivity("matching-output", {

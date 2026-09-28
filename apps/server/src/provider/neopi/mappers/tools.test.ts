@@ -329,6 +329,42 @@ describe("NeoPi tool output at the T3 consumer boundary", () => {
     expect(surfacedOutput(finalOnly.events)).toEqual(["only at the end"]);
   });
 
+  it("keeps completed multiline bash output in the bounded activity display payload", () => {
+    const { events } = run([
+      bashStart("bash-lines"),
+      bashUpdate("bash-lines", "line one"),
+      bashEnd("bash-lines", "line one\nline two\nline three"),
+    ]);
+    const completed = events.find((event) => event.type === "item.completed");
+    expect(completed?.type).toBe("item.completed");
+    if (completed?.type !== "item.completed") return;
+
+    const [activity] = runtimeEventToActivities(completed);
+    const projected = projectActivityPayload(activity!);
+    expect((projected.payload as { data?: { displayOutput?: string } }).data?.displayOutput).toBe(
+      "line one\nline two\nline three",
+    );
+  });
+
+  it("bounds long terminal output on the wire while retaining its final lines", () => {
+    const { events } = run([
+      bashStart("bash-long"),
+      bashEnd("bash-long", `first\n${"x".repeat(3000)}\nlast`),
+    ]);
+    const completed = events.find((event) => event.type === "item.completed");
+    expect(completed?.type).toBe("item.completed");
+    if (completed?.type !== "item.completed") return;
+
+    const [activity] = runtimeEventToActivities(completed);
+    const projected = projectActivityPayload(activity!);
+    const wire = (
+      projected.payload as { data?: { displayOutput?: string; rawOutput?: { content?: string } } }
+    ).data;
+    expect(wire?.displayOutput).toMatch(/^\[earlier output omitted\]\n.*\nlast$/s);
+    expect(wire?.displayOutput?.length).toBeLessThanOrEqual(2048);
+    expect(wire?.rawOutput?.content).toBe("first");
+  });
+
   it("surfaces an edit diff and a viewed image through projection and the work log", () => {
     const imagePath = "/workspace/diagram.png";
     const { events } = run([
