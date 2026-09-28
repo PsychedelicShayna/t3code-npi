@@ -48,6 +48,7 @@
     "@types/yauzl": "^3.4.0",
     "effect-acp": "workspace:*",
     "effect-codex-app-server": "workspace:*",
+    "effect-neopi-rpc": "workspace:*",
     "vite-plus": "catalog:"
   },
   "engines": {

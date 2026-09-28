@@ -1,0 +1,95 @@
+{
+  "scenario": [
+    {
+      "emit": [
+        {
+          "type": "ready",
+          "protocolVersion": 1,
+          "supportedProtocolVersions": [1, 2],
+          "maxFrameBytes": 1048576,
+          "maxReassembledFrameBytes": 67108864
+        },
+        {
+          "type": "available_commands_update",
+          "commands": [
+            {
+              "name": "security",
+              "description": "Plan, run, inspect, import, and compare NeoPi-native security scans",
+              "source": "builtin",
+              "input": {
+                "hint": "<plan|scan|status|cancel|scans|show|import|export|validate|compare|disposition>"
+              }
+            },
+            {
+              "name": "model",
+              "description": "Show current model selection",
+              "source": "builtin"
+            },
+            {
+              "name": "switch",
+              "description": "Switch model for this session only",
+              "source": "builtin",
+              "input": { "hint": "[model]" }
+            },
+            {
+              "name": "fast",
+              "description": "Toggle fast mode",
+              "source": "builtin",
+              "input": { "hint": "[on|off|status]" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "on": { "type": "negotiate_protocol", "protocolVersion": 2 },
+      "emit": [
+        {
+          "id": "$id",
+          "type": "response",
+          "command": "negotiate_protocol",
+          "success": true,
+          "data": { "protocolVersion": 2 }
+        }
+      ]
+    },
+    {
+      "on": { "type": "get_state" },
+      "emit": [
+        {
+          "id": "$id",
+          "type": "response",
+          "command": "get_state",
+          "success": true,
+          "data": {
+            "model": {
+              "id": "grok-4.5",
+              "name": "Grok 4.5",
+              "provider": "xai-oauth",
+              "baseUrl": "https://api.x.ai/v1",
+              "contextWindow": 500000,
+              "maxTokens": 500000
+            },
+            "thinkingLevel": "high",
+            "isStreaming": false,
+            "isCompacting": false,
+            "steeringMode": "all",
+            "followUpMode": "one-at-a-time",
+            "interruptMode": "wait",
+            "sessionId": "redacted-session",
+            "autoCompactionEnabled": true,
+            "queuedMessageCount": 0,
+            "messageCount": 0,
+            "fastModeEnabled": false,
+            "fastModeActive": false,
+            "contextUsage": {
+              "tokens": 13867,
+              "contextWindow": 500000,
+              "percent": 2.7734
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,981 @@
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
+import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import type * as PlatformError from "effect/PlatformError";
+import { ChildProcess, type ChildProcessSpawner } from "effect/unstable/process";
+
+import {
+  emptyStderrTail,
+  encodeFrameLine,
+  endQueue,
+  pushStderrTail,
+  signalFromExitFailure,
+  stderrTailText,
+  stdoutLines,
+} from "./_internal/stdio.ts";
+import { NeoPiRpcError } from "./errors.ts";
+import { MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, isRpcChunkFrame } from "./frame.ts";
+import type {
+  AgentToolResultWire,
+  Frame,
+  HostToolCallFrame,
+  HostToolCancelFrame,
+  HostUriRequestFrame,
+  HostUriResultWire,
+  PromptCommand,
+  ReadyFrame,
+  ResponseFrame,
+  SessionEventFrame,
+  UiRequestFrame,
+  UiResponseWire,
+} from "./schema.ts";
+import { decodeFrameLine, isRecord } from "./schema.ts";
+
+export type {
+  AgentToolResultWire,
+  Frame,
+  HostToolCallFrame,
+  HostToolCancelFrame,
+  HostUriRequestFrame,
+  HostUriResultWire,
+  PromptCommand,
+  ReadyFrame,
+  ResponseFrame,
+  SessionEventFrame,
+  UiRequestFrame,
+  UiResponseWire,
+};
+
+/** `ChildProcessSpawner` `spawn`, so T3 can pass `spawner.spawn` directly. */
+export type SpawnFn = (
+  command: ChildProcess.Command,
+) => Effect.Effect<
+  ChildProcessSpawner.ChildProcessHandle,
+  PlatformError.PlatformError,
+  Scope.Scope
+>;
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+export const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
+/** Caps live stderr retention when a subscriber is attached. Unused sessions offer nothing. */
+export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
+/** How long to drain stdout/stderr after process death before releasing readers. */
+export const DEFAULT_STDIO_DRAIN_MS = 250;
+export const DEFAULT_CLOSE_GRACE_MS = 5_000;
+
+export interface NeoPiRpcClientOptions {
+  readonly spawn: SpawnFn;
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+  /** Applies to command/response only, not the prompt lifecycle. Default 30s. */
+  readonly requestTimeoutMs?: number;
+  readonly stderrTailBytes?: number;
+  readonly onTransportReady?: (transport: NeoPiRpcTransport) => Effect.Effect<void>;
+}
+
+/** Streams and replies available immediately after stdio is connected, before ready negotiation. */
+export type NeoPiRpcTransport = Pick<
+  NeoPiRpcClient,
+  | "events"
+  | "uiRequests"
+  | "respondUi"
+  | "hostToolCalls"
+  | "hostToolResult"
+  | "hostUriRequests"
+  | "hostUriResult"
+  | "exit"
+> & { readonly transportReady: Effect.Effect<ReadyFrame, NeoPiRpcError> };
+
+export interface NeoPiRpcClient {
+  readonly ready: ReadyFrame;
+  readonly capabilities: ReadonlySet<string>;
+  readonly request: <C extends { type: string }>(cmd: C) => Effect.Effect<unknown, NeoPiRpcError>;
+  /** One-way protocol frame; unlike request, it has no response correlation. */
+  readonly writeFrame: (frame: unknown) => Effect.Effect<void, NeoPiRpcError>;
+  readonly prompt: (cmd: PromptCommand) => Effect.Effect<PromptHandle, NeoPiRpcError>;
+  readonly events: Stream.Stream<SessionEventFrame>;
+  readonly uiRequests: Stream.Stream<UiRequestFrame>;
+  readonly respondUi: (response: UiResponseWire) => Effect.Effect<void, NeoPiRpcError>;
+  readonly hostToolCalls: Stream.Stream<HostToolCallFrame | HostToolCancelFrame>;
+  readonly hostToolUpdate: (
+    id: string,
+    partialResult: AgentToolResultWire,
+  ) => Effect.Effect<void, NeoPiRpcError>;
+  readonly hostToolResult: (
+    id: string,
+    result: AgentToolResultWire,
+    isError?: boolean,
+  ) => Effect.Effect<void, NeoPiRpcError>;
+  readonly hostUriRequests: Stream.Stream<HostUriRequestFrame>;
+  readonly hostUriResult: (result: HostUriResultWire) => Effect.Effect<void, NeoPiRpcError>;
+  readonly stderr: Stream.Stream<string>;
+  readonly exit: Deferred.Deferred<ProcessExit>;
+  readonly close: (graceMs?: number) => Effect.Effect<void>;
+}
+
+export interface PromptHandle {
+  readonly id: string;
+  readonly outcome: Deferred.Deferred<PromptOutcome>;
+}
+
+export type PromptOutcome =
+  | { readonly kind: "local"; readonly agentInvoked: false; readonly userEntryId?: string }
+  | { readonly kind: "rejected"; readonly error: string; readonly code?: string }
+  | { readonly kind: "agent"; readonly userEntryId?: string };
+
+export interface ProcessExit {
+  readonly code: number | null;
+  readonly signal: string | null;
+  readonly stderrTail: string;
+}
+
+interface PendingRequest {
+  readonly command: string;
+  readonly deferred: Deferred.Deferred<unknown, NeoPiRpcError>;
+}
+
+interface PromptRecord {
+  readonly id: string;
+  readonly outcome: Deferred.Deferred<PromptOutcome>;
+  acked: boolean;
+  userEntryId?: string;
+  sawAgentStart: boolean;
+}
+
+const unsupportedUriResult = (id: string): HostUriResultWire => ({
+  type: "host_uri_result",
+  id,
+  isError: true,
+  error: "unsupported",
+});
+
+const decodeStartupError = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("startup_error"),
+      code: Schema.Literal("session_in_use"),
+      pid: Schema.optional(Schema.Number),
+      sessionFile: Schema.optional(Schema.String),
+    }),
+  ),
+);
+const startupError = (tail: string): NeoPiRpcError | undefined => {
+  for (const line of tail.split("\n")) {
+    try {
+      const value = decodeStartupError(line);
+      return new NeoPiRpcError({
+        code: value.code,
+        message: `NeoPi/OMP session is already in use${value.sessionFile ? `: ${value.sessionFile}` : ""}${value.pid !== undefined ? ` (PID ${value.pid})` : ""}`,
+      });
+    } catch {
+      // Stderr can also contain diagnostics unrelated to startup.
+    }
+  }
+  return undefined;
+};
+export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* (
+  options: NeoPiRpcClientOptions,
+) {
+  const lifetime = yield* Effect.scope;
+  const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const stderrTailBytes = options.stderrTailBytes ?? DEFAULT_STDERR_TAIL_BYTES;
+  const command = ChildProcess.make(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env,
+    extendEnv: true,
+  });
+  const handle = yield* options.spawn(command).pipe(
+    Effect.mapError(
+      (cause) =>
+        new NeoPiRpcError({
+          code: "spawn",
+          message: `failed to spawn NeoPi/OMP (${options.command}): ${cause.message}`,
+        }),
+    ),
+  );
+
+  const outbound = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+  const events = yield* Queue.unbounded<SessionEventFrame, Cause.Done<void>>();
+  const uiRequests = yield* Queue.unbounded<UiRequestFrame, Cause.Done<void>>();
+  const hostToolCalls = yield* Queue.unbounded<
+    HostToolCallFrame | HostToolCancelFrame,
+    Cause.Done<void>
+  >();
+  const hostUriRequests = yield* Queue.unbounded<HostUriRequestFrame, Cause.Done<void>>();
+  const stderr = yield* Queue.sliding<string, Cause.Done<void>>(DEFAULT_STDERR_QUEUE_CAPACITY);
+  const exit = yield* Deferred.make<ProcessExit>();
+  const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
+
+  const startupUiPending = new Set<string>();
+  const startupUiChanges = yield* Queue.unbounded<void>();
+  const pending = new Map<string, PendingRequest>();
+  const prompts = new Map<string, PromptRecord>();
+  let nextRequestId = 0;
+  let protocol: 1 | 2 = 1;
+  let ceiling = MAX_RPC_REASSEMBLED_BYTES;
+  let fatal: NeoPiRpcError | undefined;
+  let closed = false;
+  let promptEntryIds = false;
+  let uriListeners = 0;
+  let stderrListeners = 0;
+  let negotiating = false;
+  const stderrTail = emptyStderrTail();
+  const decoder = { current: new RpcFrameDecoder(ceiling) };
+
+  const failPending = (error: NeoPiRpcError): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      fatal ??= error;
+      for (const request of pending.values()) {
+        yield* Deferred.fail(request.deferred, error).pipe(Effect.ignore);
+      }
+      pending.clear();
+      for (const prompt of prompts.values()) {
+        yield* Queue.offer(events, {
+          type: "t3.prompt.failed",
+          id: prompt.id,
+          error: error.message,
+          code: error.code,
+        }).pipe(Effect.ignore);
+        yield* completePrompt(prompt, {
+          kind: "rejected",
+          error: error.message,
+          ...(error.code !== undefined ? { code: error.code } : {}),
+        });
+      }
+      prompts.clear();
+    });
+
+  const writeFrame = (frame: unknown): Effect.Effect<void, NeoPiRpcError> =>
+    Effect.gen(function* () {
+      if (closed || fatal) {
+        return yield* (
+          fatal ??
+            new NeoPiRpcError({
+              code: "closed",
+              message: "NeoPi/OMP RPC client is closed",
+            })
+        );
+      }
+      const offered = yield* Queue.offer(outbound, encodeFrameLine(frame)).pipe(
+        Effect.mapError(
+          () =>
+            new NeoPiRpcError({
+              code: "closed",
+              message: "NeoPi/OMP stdin is closed",
+            }),
+        ),
+      );
+      if (!offered) {
+        return yield* new NeoPiRpcError({
+          code: "closed",
+          message: "NeoPi/OMP stdin is closed",
+        });
+      }
+    });
+
+  const allocateId = (existing: unknown): string => {
+    if (typeof existing === "string" && existing.length > 0) {
+      return existing;
+    }
+    nextRequestId += 1;
+    return `npi-${nextRequestId}`;
+  };
+
+  const request = <C extends { type: string }>(
+    cmd: C,
+    pauseForStartupUi = false,
+  ): Effect.Effect<unknown, NeoPiRpcError> =>
+    Effect.gen(function* () {
+      if (fatal) {
+        return yield* fatal;
+      }
+      if (closed) {
+        return yield* new NeoPiRpcError({
+          code: "closed",
+          message: "NeoPi/OMP RPC client is closed",
+          command: cmd.type,
+        });
+      }
+      const id = allocateId(readCommandId(cmd));
+      const deferred = yield* Deferred.make<unknown, NeoPiRpcError>();
+      pending.set(id, { command: cmd.type, deferred });
+      yield* writeFrame({ ...cmd, id }).pipe(
+        Effect.tap(() => Effect.sync(() => {})),
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            pending.delete(id);
+          }),
+        ),
+      );
+      const awaitReply = Deferred.await(deferred);
+      const wait = pauseForStartupUi
+        ? Effect.gen(function* () {
+            let remaining = requestTimeoutMs;
+            while (true) {
+              const changed = Queue.take(startupUiChanges).pipe(
+                Effect.as({ kind: "changed" as const }),
+              );
+              const replied = awaitReply.pipe(
+                Effect.map((value) => ({ kind: "reply" as const, value })),
+              );
+              if (startupUiPending.size > 0) {
+                const result = yield* Effect.raceFirst(replied, changed);
+                if (result.kind === "reply") return result.value;
+                continue;
+              }
+              const started = performance.now();
+              const result = yield* Effect.raceFirst(replied, changed).pipe(
+                Effect.timeout(Duration.millis(Math.max(0, remaining))),
+              );
+              remaining -= performance.now() - started;
+              if (result.kind === "reply") return result.value;
+            }
+          })
+        : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
+      return yield* wait.pipe(
+        Effect.catchTag("TimeoutError", () =>
+          Effect.fail(
+            new NeoPiRpcError({
+              code: "timeout",
+              message: `timed out waiting for ${cmd.type}`,
+              command: cmd.type,
+            }),
+          ),
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.delete(id);
+          }),
+        ),
+      );
+    });
+
+  const prompt = (cmd: PromptCommand): Effect.Effect<PromptHandle, NeoPiRpcError> =>
+    Effect.gen(function* () {
+      if (fatal) {
+        return yield* fatal;
+      }
+      const id = allocateId(cmd.id);
+      const outcome = yield* Deferred.make<PromptOutcome>();
+      const record: PromptRecord = { id, outcome, acked: false, sawAgentStart: false };
+      prompts.set(id, record);
+      yield* writeFrame({ ...cmd, id, type: "prompt" }).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            prompts.delete(id);
+          }),
+        ),
+      );
+      return { id, outcome } satisfies PromptHandle;
+    });
+
+  const onResponse = (frame: ResponseFrame): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const id = frame.id;
+      if (id !== undefined) {
+        const promptRecord = prompts.get(id);
+        if (promptRecord) {
+          yield* onPromptResponse(promptRecord, frame);
+          return;
+        }
+        const requestRecord = pending.get(id);
+        if (requestRecord) {
+          pending.delete(id);
+          if (frame.success) {
+            yield* Deferred.succeed(requestRecord.deferred, frame.data).pipe(Effect.ignore);
+          } else {
+            yield* Deferred.fail(requestRecord.deferred, responseError(frame)).pipe(Effect.ignore);
+          }
+          return;
+        }
+      }
+      // Proposal responses have no success ack, but a cancelled proposal gets
+      // a response-only error. Surface it to the runtime instead of dropping it.
+      if (frame.command === "plan_proposal_response" && !frame.success && id)
+        yield* Queue.offer(events, {
+          type: "t3.plan.proposal.rejected",
+          id,
+          error: frame.error ?? "Plan proposal rejected",
+          code: frame.code,
+        }).pipe(Effect.ignore);
+    });
+
+  const onPromptResponse = (record: PromptRecord, frame: ResponseFrame): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (!frame.success) {
+        yield* completePrompt(record, {
+          kind: "rejected",
+          error: frame.error ?? "prompt rejected",
+          ...(frame.code !== undefined ? { code: frame.code } : {}),
+        });
+        yield* Queue.offer(events, {
+          type: "t3.prompt.failed",
+          id: record.id,
+          error: frame.error ?? "prompt rejected",
+          code: frame.code,
+        }).pipe(Effect.ignore);
+        prompts.delete(record.id);
+        return;
+      }
+      if (record.acked) {
+        return;
+      }
+      record.acked = true;
+      const data = isRecord(frame.data) ? frame.data : {};
+      if (typeof data.userEntryId === "string" && data.userEntryId)
+        record.userEntryId = data.userEntryId;
+      const agentInvoked = agentInvokedOf(frame.data);
+      if (agentInvoked === false) {
+        yield* completePrompt(record, {
+          kind: "local",
+          agentInvoked: false,
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
+        yield* Queue.offer(events, { type: "t3.prompt.local", id: record.id }).pipe(Effect.ignore);
+        prompts.delete(record.id);
+        return;
+      }
+      if (agentInvoked === true || record.sawAgentStart) {
+        yield* completePrompt(record, {
+          kind: "agent",
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
+      }
+    });
+
+  const onAgentStart = (): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const open = oldestOpenPrompt();
+      if (!open) {
+        return;
+      }
+      if (open.acked) {
+        yield* completePrompt(open, {
+          kind: "agent",
+          ...(open.userEntryId ? { userEntryId: open.userEntryId } : {}),
+        });
+        return;
+      }
+      open.sawAgentStart = true;
+    });
+
+  const onPromptResult = (frame: SessionEventFrame): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const id = frame.id;
+      if (typeof id !== "string") {
+        return;
+      }
+      const record = prompts.get(id);
+      if (!record) {
+        return;
+      }
+      if (promptEntryIds && !record.acked) return;
+      if (frame.agentInvoked === false) {
+        yield* completePrompt(record, {
+          kind: "local",
+          agentInvoked: false,
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
+        return;
+      }
+      if (frame.agentInvoked === true && record.acked) {
+        yield* completePrompt(record, {
+          kind: "agent",
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
+      }
+    });
+
+  const oldestOpenPrompt = (): PromptRecord | undefined => {
+    for (const record of prompts.values()) {
+      if (!Deferred.isDoneUnsafe(record.outcome)) {
+        return record;
+      }
+    }
+    return undefined;
+  };
+
+  const publishEvent = (frame: SessionEventFrame): Effect.Effect<void> =>
+    Queue.offer(events, frame).pipe(Effect.ignore);
+
+  const handleLogicalFrame = (frame: Frame): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (!(yield* Deferred.isDone(readyDeferred))) {
+        if (frame.type !== "ready") {
+          return yield* failReady(
+            new NeoPiRpcError({
+              code: "bad_frame",
+              message: "expected ready before any other frame",
+            }),
+          );
+        }
+        const ready = frame as ReadyFrame;
+        if (ready.protocolVersion !== 1) {
+          return yield* failReady(
+            new NeoPiRpcError({
+              code: "bad_frame",
+              message: `unsupported NeoPi/OMP ready protocolVersion: ${String(ready.protocolVersion)}`,
+            }),
+          );
+        }
+        if (
+          typeof ready.maxReassembledFrameBytes === "number" &&
+          ready.maxReassembledFrameBytes > 0
+        ) {
+          ceiling = ready.maxReassembledFrameBytes;
+          decoder.current = new RpcFrameDecoder(ceiling);
+        }
+        promptEntryIds = ready.capabilities?.includes("prompt_entry_ids") === true;
+        negotiating = ready.supportedProtocolVersions?.includes(2) === true;
+        yield* Deferred.succeed(readyDeferred, ready).pipe(Effect.ignore);
+        return;
+      }
+
+      switch (frame.type) {
+        case "response":
+          return yield* onResponse(frame as ResponseFrame);
+        case "extension_ui_request": {
+          const ui = frame as UiRequestFrame;
+          if (
+            negotiating &&
+            (ui.method === "cancel" ||
+              ui.method === "select" ||
+              ui.method === "confirm" ||
+              ui.method === "input" ||
+              ui.method === "editor")
+          ) {
+            if (ui.method === "cancel") {
+              if (typeof ui.targetId === "string" && startupUiPending.delete(ui.targetId))
+                yield* Queue.offer(startupUiChanges, undefined);
+            } else if (!startupUiPending.has(ui.id)) {
+              startupUiPending.add(ui.id);
+              yield* Queue.offer(startupUiChanges, undefined);
+            }
+          }
+          return yield* Queue.offer(uiRequests, ui).pipe(Effect.ignore);
+        }
+        case "host_tool_call":
+        case "host_tool_cancel":
+          return yield* Queue.offer(
+            hostToolCalls,
+            frame as HostToolCallFrame | HostToolCancelFrame,
+          ).pipe(Effect.ignore);
+        case "host_uri_request": {
+          const uri = frame as HostUriRequestFrame;
+          if (uriListeners === 0) {
+            yield* writeFrame(unsupportedUriResult(uri.id)).pipe(Effect.ignore);
+            return;
+          }
+          yield* Queue.offer(hostUriRequests, uri).pipe(Effect.ignore);
+          return;
+        }
+        case "agent_start":
+          yield* onAgentStart();
+          return yield* publishEvent(frame as SessionEventFrame);
+        case "prompt_result":
+          yield* onPromptResult(frame as SessionEventFrame);
+          yield* publishEvent(frame as SessionEventFrame);
+          if (frame.agentInvoked === false && typeof frame.id === "string")
+            prompts.delete(frame.id);
+          return;
+        case "agent_end":
+          yield* publishEvent(frame as SessionEventFrame);
+          if (frame.isTerminal !== false) prompts.clear();
+          return;
+        default:
+          return yield* publishEvent(frame as SessionEventFrame);
+      }
+    });
+
+  const abortTransport = (error: NeoPiRpcError): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      if (fatal) return;
+      yield* failPending(error);
+      yield* Deferred.fail(readyDeferred, error).pipe(Effect.ignore);
+      yield* handle
+        .kill({
+          killSignal: "SIGTERM",
+          forceKillAfter: Duration.millis(150),
+        })
+        .pipe(Effect.ignore, Effect.forkIn(lifetime));
+    });
+
+  const failReady = abortTransport;
+  const noteBadChunk = (message: string): Effect.Effect<void> =>
+    abortTransport(new NeoPiRpcError({ code: "bad_chunk", message }));
+
+  const ingestLine = (line: string): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const parsed = yield* decodeFrameLine(line).pipe(
+        Effect.catch((error) => failReady(error).pipe(Effect.as(undefined))),
+      );
+      if (parsed === undefined) {
+        return;
+      }
+      if (isRpcChunkFrame(parsed)) {
+        if (protocol !== 2) {
+          return yield* noteBadChunk("rpc_chunk is not valid on protocol v1");
+        }
+      }
+      const pushed = pushChunk(decoder.current, parsed);
+      if (!pushed.ok) {
+        return yield* noteBadChunk(pushed.message);
+      }
+      if (pushed.frame) {
+        yield* handleLogicalFrame(pushed.frame as Frame);
+      }
+    });
+
+  const stdoutDone = yield* Deferred.make<void>();
+  const stderrDone = yield* Deferred.make<void>();
+
+  const stdoutFiber = yield* Stream.runForEach(stdoutLines(handle.stdout), ingestLine).pipe(
+    Effect.catch((error) =>
+      abortTransport(
+        new NeoPiRpcError({
+          code: "closed",
+          message: `NeoPi/OMP stdout failed: ${String(error)}`,
+        }),
+      ),
+    ),
+    Effect.andThen(
+      Effect.sync(() => finishChunks(decoder.current)).pipe(
+        Effect.flatMap((message) => (message === undefined ? Effect.void : noteBadChunk(message))),
+      ),
+    ),
+    Effect.andThen(
+      Effect.gen(function* () {
+        if (!(yield* Deferred.isDone(readyDeferred))) {
+          // A startup_error on stderr can arrive just after stdout closes.
+          // A still-running peer with closed stdout must nevertheless fail promptly.
+          yield* Deferred.await(stderrDone).pipe(Effect.timeoutOption("100 millis"));
+          if (!(yield* Deferred.isDone(readyDeferred)))
+            yield* abortTransport(
+              startupError(stderrTailText(stderrTail)) ??
+                new NeoPiRpcError({
+                  code: "exited",
+                  message: "NeoPi/OMP stdout ended before the ready frame",
+                }),
+            );
+          return;
+        }
+        // Handshake already completed. A live peer with no response channel
+        // cannot deliver agent_end. Intentional close and observed process
+        // death keep their own paths.
+        if (closed || fatal) return;
+        yield* Effect.sleep("20 millis");
+        if (closed || fatal || !(yield* handle.isRunning)) return;
+        yield* abortTransport(
+          new NeoPiRpcError({
+            code: "closed",
+            message: "NeoPi/OMP stdout ended while the process was still running",
+          }),
+        );
+      }),
+    ),
+    Effect.ensuring(Deferred.succeed(stdoutDone, undefined).pipe(Effect.ignore)),
+    Effect.forkScoped,
+  );
+
+  const stderrDecoder = new TextDecoder("utf-8", { fatal: false });
+  const stderrFiber = yield* Stream.runForEach(handle.stderr, (chunk) =>
+    Effect.sync(() => {
+      pushStderrTail(stderrTail, chunk, stderrTailBytes);
+      return stderrDecoder.decode(chunk, { stream: true });
+    }).pipe(
+      Effect.flatMap((text) =>
+        text.length === 0 || stderrListeners === 0
+          ? Effect.void
+          : Queue.offer(stderr, text).pipe(Effect.ignore),
+      ),
+    ),
+  ).pipe(
+    Effect.ignore,
+    Effect.ensuring(Deferred.succeed(stderrDone, undefined).pipe(Effect.ignore)),
+    Effect.forkScoped,
+  );
+
+  yield* Stream.fromQueue(outbound).pipe(
+    Stream.run(handle.stdin),
+    Effect.catch(() =>
+      abortTransport(
+        new NeoPiRpcError({
+          code: "closed",
+          message: "NeoPi/OMP stdin write failed",
+        }),
+      ),
+    ),
+    Effect.forkScoped,
+  );
+
+  const readExit = handle.exitCode.pipe(
+    Effect.match({
+      onSuccess: (code) => ({ code: code as number, signal: null as string | null }),
+      onFailure: (error) => ({ code: null as number | null, signal: signalFromExitFailure(error) }),
+    }),
+  );
+
+  yield* readExit.pipe(
+    Effect.flatMap((status) =>
+      Effect.gen(function* () {
+        yield* Effect.all([Deferred.await(stdoutDone), Deferred.await(stderrDone)], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout(Duration.millis(DEFAULT_STDIO_DRAIN_MS)), Effect.ignore);
+        yield* Fiber.interrupt(stdoutFiber).pipe(Effect.ignore);
+        yield* Fiber.interrupt(stderrFiber).pipe(Effect.ignore);
+        if (!(yield* Deferred.isDone(readyDeferred))) {
+          yield* Deferred.fail(
+            readyDeferred,
+            startupError(stderrTailText(stderrTail)) ??
+              new NeoPiRpcError({
+                code: "exited",
+                message: "NeoPi/OMP process exited before ready",
+              }),
+          ).pipe(Effect.ignore);
+        }
+        if (fatal) {
+          yield* failPending(fatal);
+        } else if (!closed) {
+          yield* failPending(
+            new NeoPiRpcError({
+              code: "exited",
+              message: "NeoPi/OMP process exited",
+            }),
+          );
+        }
+        yield* endQueue(events);
+        yield* endQueue(uiRequests);
+        yield* endQueue(hostToolCalls);
+        yield* endQueue(hostUriRequests);
+        yield* endQueue(stderr);
+        yield* Deferred.succeed(exit, {
+          code: status.code,
+          signal: status.signal,
+          stderrTail: stderrTailText(stderrTail),
+        }).pipe(Effect.ignore);
+      }),
+    ),
+    Effect.forkScoped,
+  );
+
+  const close = (graceMs: number = DEFAULT_CLOSE_GRACE_MS): Effect.Effect<void> =>
+    Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (closed) {
+          return yield* Deferred.await(exit).pipe(
+            Effect.timeout(Duration.millis(DEFAULT_STDIO_DRAIN_MS)),
+            Effect.ignore,
+          );
+        }
+        closed = true;
+        yield* failPending(
+          new NeoPiRpcError({
+            code: "closed",
+            message: "NeoPi/OMP RPC client is closed",
+          }),
+        );
+        yield* Queue.end(outbound).pipe(Effect.ignore);
+        const slices = Math.max(1, Math.ceil(graceMs / 20));
+        for (let slice = 0; slice < slices; slice++) {
+          if (yield* Deferred.isDone(exit)) {
+            break;
+          }
+          yield* Effect.sleep("20 millis");
+        }
+        if (!(yield* Deferred.isDone(exit))) {
+          yield* handle
+            .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.millis(graceMs) })
+            .pipe(Effect.ignore);
+        }
+        yield* Deferred.await(exit).pipe(
+          Effect.timeout(Duration.millis(graceMs + DEFAULT_STDIO_DRAIN_MS + 500)),
+          Effect.ignore,
+        );
+      }),
+    );
+
+  yield* Effect.addFinalizer(() => close());
+
+  const hostUriRequestsStream = Stream.unwrap(
+    Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          uriListeners += 1;
+        }),
+        () =>
+          Effect.sync(() => {
+            uriListeners -= 1;
+          }),
+      );
+      return Stream.fromQueue(hostUriRequests);
+    }),
+  );
+
+  const stderrStream = Stream.unwrap(
+    Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          stderrListeners += 1;
+        }),
+        () =>
+          Effect.sync(() => {
+            stderrListeners -= 1;
+          }),
+      );
+      return Stream.fromQueue(stderr);
+    }),
+  );
+
+  const respondUi = (response: UiResponseWire): Effect.Effect<void, NeoPiRpcError> =>
+    writeFrame({ type: "extension_ui_response", ...response }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => startupUiPending.delete(response.id)).pipe(
+          Effect.flatMap((removed) =>
+            removed ? Queue.offer(startupUiChanges, undefined).pipe(Effect.asVoid) : Effect.void,
+          ),
+        ),
+      ),
+    );
+
+  const hostToolUpdate = (
+    id: string,
+    partialResult: AgentToolResultWire,
+  ): Effect.Effect<void, NeoPiRpcError> =>
+    writeFrame({ type: "host_tool_update", id, partialResult });
+
+  const hostToolResult = (
+    id: string,
+    result: AgentToolResultWire,
+    isError?: boolean,
+  ): Effect.Effect<void, NeoPiRpcError> =>
+    writeFrame({
+      type: "host_tool_result",
+      id,
+      result,
+      ...(isError !== undefined ? { isError } : {}),
+    });
+
+  const hostUriResult = (result: HostUriResultWire): Effect.Effect<void, NeoPiRpcError> =>
+    writeFrame(result);
+
+  const ready = yield* Effect.gen(function* () {
+    if (options.onTransportReady) {
+      yield* options.onTransportReady({
+        transportReady: Deferred.await(readyDeferred),
+        events: Stream.fromQueue(events),
+        uiRequests: Stream.fromQueue(uiRequests),
+        respondUi,
+        hostToolCalls: Stream.fromQueue(hostToolCalls),
+        hostToolResult,
+        hostUriRequests: hostUriRequestsStream,
+        hostUriResult,
+        exit,
+      });
+    }
+    return yield* Deferred.await(readyDeferred);
+  }).pipe(
+    Effect.timeout(Duration.millis(requestTimeoutMs)),
+    Effect.catchTag("TimeoutError", () =>
+      Effect.fail(
+        new NeoPiRpcError({
+          code: "timeout",
+          message: "timed out waiting for the ready frame",
+        }),
+      ),
+    ),
+    Effect.tapError(abortTransport),
+  );
+
+  const supported = ready.supportedProtocolVersions;
+  const capabilities = new Set<string>(
+    Array.isArray(ready.capabilities)
+      ? ready.capabilities.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  );
+  if (Array.isArray(supported) && supported.includes(2)) {
+    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 }, true);
+    negotiating = false;
+    startupUiPending.clear();
+    if (!isRecord(result) || result.protocolVersion !== 2) {
+      const error = new NeoPiRpcError({
+        code: "bad_frame",
+        message: "NeoPi/OMP peer did not confirm protocol v2 negotiation",
+      });
+      yield* abortTransport(error);
+      return yield* error;
+    }
+    protocol = 2;
+    capabilities.add("v2");
+  }
+
+  return {
+    ready,
+    capabilities,
+    request,
+    writeFrame,
+    prompt,
+    events: Stream.fromQueue(events),
+    uiRequests: Stream.fromQueue(uiRequests),
+    respondUi,
+    hostToolCalls: Stream.fromQueue(hostToolCalls),
+    hostToolUpdate,
+    hostToolResult,
+    hostUriRequests: hostUriRequestsStream,
+    hostUriResult,
+    stderr: stderrStream,
+    exit,
+    close,
+  } satisfies NeoPiRpcClient;
+});
+
+const completePrompt = (record: PromptRecord, outcome: PromptOutcome): Effect.Effect<void> =>
+  Deferred.isDone(record.outcome).pipe(
+    Effect.flatMap((done) =>
+      done ? Effect.void : Deferred.succeed(record.outcome, outcome).pipe(Effect.ignore),
+    ),
+  );
+
+const responseError = (frame: ResponseFrame): NeoPiRpcError =>
+  new NeoPiRpcError({
+    message: frame.error ?? "command failed",
+    command: frame.command,
+    ...(frame.code !== undefined ? { code: frame.code } : {}),
+  });
+
+const agentInvokedOf = (data: unknown): boolean | undefined => {
+  if (!isRecord(data) || typeof data.agentInvoked !== "boolean") {
+    return undefined;
+  }
+  return data.agentInvoked;
+};
+
+const readCommandId = (cmd: { readonly type: string }): unknown =>
+  "id" in cmd ? cmd.id : undefined;
+
+const pushChunk = (
+  decoder: RpcFrameDecoder,
+  value: unknown,
+): { ok: true; frame: Record<string, unknown> | undefined } | { ok: false; message: string } => {
+  try {
+    return { ok: true, frame: decoder.push(value) };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "bad rpc chunk" };
+  }
+};
+
+const finishChunks = (decoder: RpcFrameDecoder): string | undefined => {
+  try {
+    decoder.finish();
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : "rpc chunk sequence truncated";
+  }
+};

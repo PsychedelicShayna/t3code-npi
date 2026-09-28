@@ -269,6 +269,7 @@ import {
   searchSlashCommandItems,
   slashCommandItemsForPromptPosition,
 } from "./composerSlashCommandSearch";
+import { composerCapabilitiesForProvider } from "./neopiComposerUi";
 import {
   getComposerPromptInjectionState,
   getComposerProviderState,
@@ -1921,6 +1922,30 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // disabled.
   const selectedProvider: ProviderDriverKind =
     selectedProviderEntry?.driverKind ?? requestedDriverKind;
+  const providerComposerCapabilities = composerCapabilitiesForProvider(selectedProvider);
+  const providerComposerUi = useMemo(
+    () =>
+      providerComposerCapabilities?.project(
+        activeThread?.id === activeThreadId ? activeThread.activities : [],
+      ),
+    [activeThread, activeThreadId, providerComposerCapabilities],
+  );
+  useEffect(() => {
+    const suggestion = providerComposerCapabilities?.consumeEditor(
+      composerDraftTargetKey,
+      providerComposerUi?.editor ?? null,
+      prompt,
+    );
+    if (suggestion !== undefined && suggestion !== null)
+      setComposerDraftPrompt(composerDraftTarget, suggestion);
+  }, [
+    composerDraftTarget,
+    composerDraftTargetKey,
+    providerComposerCapabilities,
+    providerComposerUi?.editor,
+    prompt,
+    setComposerDraftPrompt,
+  ]);
 
   const { modelOptions: composerModelOptions, selectedModel } = useEffectiveComposerModelState({
     threadRef: composerDraftTarget,
@@ -2395,7 +2420,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         provider: selectedProvider,
         command,
         label: `/${command.name}`,
-        description: command.description ?? command.input?.hint ?? "Run provider command",
+        description:
+          (command.description ?? command.input?.hint ?? "Run provider command") +
+          (providerComposerCapabilities?.commandSourceLabel(command.source) ?? ""),
       }));
       const query = composerTrigger.query.trim().toLowerCase();
       const skillItems = slashMenuSkills.map((skill) => ({
@@ -3657,7 +3684,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return;
       }
       if (item.type === "skill") {
-        const replacement = `$${item.skill.name} `;
+        const replacement =
+          composerCapabilitiesForProvider(item.provider)?.skillReplacement(item.skill.name) ??
+          `$${item.skill.name} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,
           trigger.rangeEnd,
@@ -6964,6 +6993,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   )}
                 >
                   {composerControlsInStrip ? null : composerControls}
+                  {providerComposerUi?.displayState ? (
+                    <span
+                      data-provider-composer-state="true"
+                      className="shrink-0 truncate text-xs text-muted-foreground"
+                      title={providerComposerUi.displayState}
+                    >
+                      {providerComposerUi.displayState}
+                    </span>
+                  ) : null}
                 </div>
 
                 {/* Right side: send / stop button */}

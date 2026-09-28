@@ -1,0 +1,83 @@
+{
+  "scenario": [
+    {
+      "emit": [
+        {
+          "type": "ready",
+          "protocolVersion": 1,
+          "supportedProtocolVersions": [1, 2],
+          "maxFrameBytes": 1048576,
+          "maxReassembledFrameBytes": 67108864
+        }
+      ]
+    },
+    {
+      "on": { "type": "negotiate_protocol", "protocolVersion": 2 },
+      "emit": [
+        {
+          "id": "$id",
+          "type": "response",
+          "command": "negotiate_protocol",
+          "success": true,
+          "data": { "protocolVersion": 2 }
+        }
+      ]
+    },
+    {
+      "on": { "type": "prompt" },
+      "emit": [
+        {
+          "id": "$id",
+          "type": "response",
+          "command": "prompt",
+          "success": true
+        },
+        { "type": "agent_start" },
+        { "type": "turn_start" },
+        {
+          "type": "message_start",
+          "messageId": "redacted-user",
+          "message": { "role": "user", "content": "say hi" }
+        },
+        {
+          "type": "message_end",
+          "messageId": "redacted-user",
+          "message": { "role": "user", "content": "say hi" }
+        },
+        {
+          "type": "message_update",
+          "messageId": "redacted-assistant",
+          "assistantMessageEvent": { "type": "text_delta", "delta": "hi" }
+        },
+        {
+          "type": "message_end",
+          "messageId": "redacted-assistant",
+          "message": {
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "hi" }]
+          }
+        },
+        { "type": "turn_end" },
+        {
+          "type": "agent_end",
+          "isTerminal": true,
+          "hasFinalResponse": true,
+          "yielded": false,
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [{ "type": "text", "text": "hi" }]
+            }
+          ]
+        },
+        {
+          "type": "prompt_result",
+          "id": "$id",
+          "agentInvoked": true,
+          "status": "completed",
+          "sessionSettled": true
+        }
+      ]
+    }
+  ]
+}

@@ -98,4 +98,62 @@ describe("ComposerCommandMenu", () => {
     expect(markup).toContain(">Repo</span>");
     expect(markup).toContain("Find the right skill or workflow");
   });
+
+  it("renders NeoPi commands and skills in their respective menus", () => {
+    const slash = renderToStaticMarkup(
+      <ComposerCommandMenu
+        items={[
+          {
+            id: "provider-slash-command:neopi:review",
+            type: "provider-slash-command",
+            provider: ProviderDriverKind.make("neopi"),
+            command: {
+              name: "review",
+              description: "Review files",
+              input: { hint: "path" },
+              source: "extension",
+            },
+            label: "/review",
+            description: "Review files · extension",
+          },
+        ]}
+        resolvedTheme="dark"
+        isLoading={false}
+        triggerKind="slash-command"
+        activeItemId="provider-slash-command:neopi:review"
+        onHighlightedItemChange={() => {}}
+        onSelect={() => {}}
+      />,
+    );
+    const skills = renderToStaticMarkup(
+      <ComposerCommandMenu
+        items={[
+          {
+            id: "skill:neopi:unslop",
+            type: "skill",
+            provider: ProviderDriverKind.make("neopi"),
+            skill: {
+              name: "unslop",
+              path: "neopi:skill/unslop",
+              scope: "user",
+              enabled: true,
+              userInvocable: true,
+            },
+            label: "Unslop",
+            description: "Remove slop",
+          },
+        ]}
+        resolvedTheme="dark"
+        isLoading={false}
+        triggerKind="skill"
+        activeItemId="skill:neopi:unslop"
+        onHighlightedItemChange={() => {}}
+        onSelect={() => {}}
+      />,
+    );
+    expect(slash).toContain("/review");
+    expect(slash).toContain("Review files · extension");
+    expect(skills).toContain("Unslop");
+    expect(skills).toContain("Personal Skill");
+  });
 });

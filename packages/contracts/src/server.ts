@@ -71,6 +71,12 @@ export const ServerProviderModel = Schema.Struct({
   name: TrimmedNonEmptyString,
   shortName: Schema.optional(TrimmedNonEmptyString),
   subProvider: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * Native account/provider id for usage probes. Distinct from `subProvider`,
+   * which is only a picker group label. Absent means consumers may use
+   * `subProvider` when that value is itself a protocol id.
+   */
+  quotaProvider: Schema.optional(TrimmedNonEmptyString),
   aliases: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
   badge: Schema.optional(Schema.Literal("new")),
   isCustom: Schema.Boolean,
@@ -89,6 +95,10 @@ export const ServerProviderSlashCommand = Schema.Struct({
   name: TrimmedNonEmptyString,
   description: Schema.optional(TrimmedNonEmptyString),
   input: Schema.optional(ServerProviderSlashCommandInput),
+  /** Native NeoPi/OMP command origin, when the provider reports one. */
+  source: Schema.optional(
+    Schema.Literals(["builtin", "extension", "custom", "mcp_prompt", "file"]),
+  ),
 });
 export type ServerProviderSlashCommand = typeof ServerProviderSlashCommand.Type;
 

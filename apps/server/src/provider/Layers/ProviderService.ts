@@ -32,6 +32,7 @@ import {
   type ProviderInstanceId,
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
+  type RuntimeMode,
   type ProviderSession,
   type ServerSettings as ServerSettingsValue,
 } from "@t3tools/contracts";
@@ -43,6 +44,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -51,6 +53,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { appendUserInputAttachmentPaths } from "../userInputAttachments.ts";
@@ -497,6 +500,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const pendingCompactions = new Map<ThreadId, PendingCompaction>();
   const timedOutNativeCompactions = new Set<ThreadId>();
+  const cursorWriteLock = yield* Semaphore.make(1);
+  type PendingAdmission = {
+    readonly instanceId: ProviderInstanceId;
+    readonly terminalTurns: Set<TurnId>;
+  };
+  const pendingAdmissions = new Map<ThreadId, Set<PendingAdmission>>();
+  const forgetAdmission = (threadId: ThreadId, admission: PendingAdmission | undefined) => {
+    if (!admission) return;
+    const pending = pendingAdmissions.get(threadId);
+    pending?.delete(admission);
+    if (pending?.size === 0) pendingAdmissions.delete(threadId);
+  };
+  const pendingStarts = new Map<
+    ThreadId,
+    {
+      readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+      readonly instanceId: ProviderInstanceId;
+      readonly runtimeMode: RuntimeMode;
+    }
+  >();
   const settleCompaction = (threadId: ThreadId, pending: PendingCompaction, terminal: string) =>
     Effect.gen(function* () {
       if (pendingCompactions.get(threadId) !== pending) return false;
@@ -1108,35 +1131,52 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         canonicalEvent.type === "turn.aborted"
       ) {
         yield* recordTurnCompletedAnalytics(source, canonicalEvent);
-        if (source.provider === "claudeAgent") {
-          // Background Claude turns have no sendTurn response to persist their
-          // new native boundary. Save it before clients can checkpoint the turn.
-          yield* Effect.gen(function* () {
-            const adapter = yield* registry.getByInstance(source.instanceId);
-            const session = (yield* adapter.listSessions()).find(
-              (session) => session.threadId === canonicalEvent.threadId,
-            );
-            if (session?.resumeCursor !== undefined) {
-              const binding = yield* directory.getBinding(session.threadId);
-              if (
-                Option.isNone(binding) ||
-                binding.value.providerInstanceId !== source.instanceId
-              ) {
-                return;
-              }
-              yield* directory.upsert({
-                threadId: session.threadId,
-                provider: source.provider,
-                providerInstanceId: source.instanceId,
-                resumeCursor: session.resumeCursor,
-              });
+        // Only adapters opting into terminal cursor refresh pay for the session
+        // lookup. An ordered adapter also reconciles a terminal event that wins
+        // the race against its still-in-flight send admission.
+        yield* Effect.gen(function* () {
+          const adapter = yield* registry.getByInstance(source.instanceId);
+          const policy = adapter.capabilities.terminalResumeCursor;
+          if (!policy) return;
+          let observedAdmission = false;
+          if (policy === "ordered" && canonicalEvent.turnId) {
+            for (const admission of pendingAdmissions.get(canonicalEvent.threadId) ?? []) {
+              if (admission.instanceId !== source.instanceId) continue;
+              admission.terminalTurns.add(canonicalEvent.turnId);
+              observedAdmission = true;
             }
-          }).pipe(
-            Effect.catch((cause) =>
-              Effect.logWarning("failed to persist Claude turn resume state", { cause }),
-            ),
-          );
-        }
+          }
+          const persist = Effect.gen(function* () {
+            const session = (yield* adapter.listSessions()).find(
+              (item) => item.threadId === canonicalEvent.threadId,
+            );
+            if (session?.resumeCursor === undefined) return;
+            const binding = yield* directory.getBinding(session.threadId);
+            if (Option.isNone(binding) || binding.value.providerInstanceId !== source.instanceId)
+              return;
+            const payload = binding.value.runtimePayload;
+            const activeTurnId =
+              payload && typeof payload === "object" && "activeTurnId" in payload
+                ? payload.activeTurnId
+                : undefined;
+            const isCurrent =
+              activeTurnId === canonicalEvent.turnId || (activeTurnId == null && observedAdmission);
+            yield* directory.upsert({
+              threadId: session.threadId,
+              provider: source.provider,
+              providerInstanceId: source.instanceId,
+              resumeCursor: session.resumeCursor,
+              ...(policy === "ordered" && isCurrent
+                ? { runtimePayload: { activeTurnId: null, lastRuntimeEvent: canonicalEvent.type } }
+                : {}),
+            });
+          });
+          yield* policy === "ordered" ? cursorWriteLock.withPermits(1)(persist) : persist;
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logWarning("failed to persist provider turn resume state", { cause }),
+          ),
+        );
       } else if (canonicalEvent.type === "session.exited") {
         yield* clearTurnAnalyticsSession(source.instanceId, canonicalEvent.threadId);
       }
@@ -1321,7 +1361,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     readonly threadId: ThreadId;
     readonly operation: string;
     readonly allowRecovery: boolean;
+    readonly allowPendingStart?: boolean;
   }) {
+    if (input.allowPendingStart) {
+      const pending = pendingStarts.get(input.threadId);
+      if (pending) {
+        return {
+          ...pending,
+          threadId: input.threadId,
+          isActive: true,
+        } as const;
+      }
+    }
     const bindingOption = yield* directory.getBinding(input.threadId);
     const binding = Option.getOrUndefined(bindingOption);
     if (!binding) {
@@ -1415,6 +1466,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         parsed,
       );
       let metricProvider = parsed.provider ?? String(resolvedInstanceId);
+      let pendingStart:
+        | {
+            readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+            readonly instanceId: ProviderInstanceId;
+            readonly runtimeMode: RuntimeMode;
+          }
+        | undefined;
       yield* Effect.annotateCurrentSpan({
         "provider.operation": "start-session",
         "provider.instance_id": resolvedInstanceId,
@@ -1509,6 +1567,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
+        pendingStart = {
+          adapter,
+          instanceId: resolvedInstanceId,
+          runtimeMode: input.runtimeMode,
+        };
+        pendingStarts.set(threadId, pendingStart);
         const session = yield* adapter
           .startSession({
             ...input,
@@ -1563,6 +1627,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         return sessionWithInstance;
       }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (pendingStarts.get(threadId) === pendingStart) pendingStarts.delete(threadId);
+          }),
+        ),
         withMetrics({
           counter: providerSessionsTotal,
           attributes: () =>
@@ -1731,6 +1800,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId);
       const analyticsModelSelection =
         input.modelSelection?.instanceId === routed.instanceId ? input.modelSelection : undefined;
+      const admission =
+        routed.adapter.capabilities.terminalResumeCursor === "ordered"
+          ? { instanceId: routed.instanceId, terminalTurns: new Set<TurnId>() }
+          : undefined;
+      if (admission) {
+        const pending = pendingAdmissions.get(input.threadId) ?? new Set<PendingAdmission>();
+        pending.add(admission);
+        pendingAdmissions.set(input.threadId, pending);
+      }
       const turn = yield* Effect.acquireUseRelease(
         beginTurnAnalytics({
           providerInstanceId: routed.instanceId,
@@ -1757,23 +1835,34 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             threadId: input.threadId,
             requestId: turnMetadata.requestId,
           }),
-      );
-      yield* directory.upsert({
-        threadId: input.threadId,
-        provider: routed.adapter.provider,
-        providerInstanceId: routed.instanceId,
-        status: "running",
-        ...(turn.resumeCursor !== undefined ? { resumeCursor: turn.resumeCursor } : {}),
-        runtimePayload: {
-          ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-          activeTurnId: turn.turnId,
-          // Admission and marker consumption must survive the same restart.
-          continueAfterServerUpdate: null,
-          continueAfterServerUpdatePrepared: null,
-          lastRuntimeEvent: "provider.sendTurn",
-          lastRuntimeEventAt: yield* nowIso,
-        },
+      ).pipe(Effect.onError(() => Effect.sync(() => forgetAdmission(input.threadId, admission))));
+      const persistAdmission = Effect.gen(function* () {
+        const completed = admission?.terminalTurns.has(turn.turnId) === true;
+        yield* directory.upsert({
+          threadId: input.threadId,
+          provider: routed.adapter.provider,
+          providerInstanceId: routed.instanceId,
+          ...(!completed ? { status: "running" as const } : {}),
+          ...(admission
+            ? {}
+            : turn.resumeCursor !== undefined
+              ? { resumeCursor: turn.resumeCursor }
+              : {}),
+          runtimePayload: {
+            ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+            ...(!completed ? { activeTurnId: turn.turnId } : {}),
+            // Marker consumption still lands when the terminal won the race.
+            continueAfterServerUpdate: null,
+            continueAfterServerUpdatePrepared: null,
+            ...(!completed
+              ? { lastRuntimeEvent: "provider.sendTurn", lastRuntimeEventAt: yield* nowIso }
+              : {}),
+          },
+        });
       });
+      yield* (admission ? cursorWriteLock.withPermits(1)(persistAdmission) : persistAdmission).pipe(
+        Effect.ensuring(Effect.sync(() => forgetAdmission(input.threadId, admission))),
+      );
       yield* analytics.record("provider.turn.sent", {
         provider: routed.adapter.provider,
         model: input.modelSelection?.model,
@@ -1976,6 +2065,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           threadId: input.threadId,
           operation: "ProviderService.respondToRequest",
           allowRecovery: true,
+          allowPendingStart: true,
         });
         metricProvider = routed.adapter.provider;
         yield* Effect.annotateCurrentSpan({
@@ -2015,6 +2105,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId: input.threadId,
         operation: "ProviderService.respondToUserInput",
         allowRecovery: true,
+        allowPendingStart: true,
       });
       metricProvider = routed.adapter.provider;
       yield* Effect.annotateCurrentSpan({
@@ -2238,7 +2329,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.rollback_turns": input.numTurns,
       });
-      yield* routed.adapter.rollbackThread(routed.threadId, input.numTurns);
+      const rollbackResult = yield* Effect.exit(
+        routed.adapter.rollbackThread(routed.threadId, input.numTurns),
+      );
       const session = (yield* routed.adapter.listSessions()).find(
         (session) => session.threadId === routed.threadId,
       );
@@ -2248,6 +2341,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.threadId,
         );
       }
+      // A provider may successfully branch its native session and then fail while
+      // projecting the history. Save its cursor even when projection reports an error.
+      if (Exit.isFailure(rollbackResult)) return yield* Effect.failCause(rollbackResult.cause);
       yield* analytics.record("provider.conversation.rolled_back", {
         provider: routed.adapter.provider,
         turns: input.numTurns,

@@ -95,6 +95,33 @@ checkpoints but cannot roll back its conversation. The [checkpoint boundary](./o
 therefore rejects revert before touching files. Native permission and question option IDs must
 also survive normalization; a display label is not necessarily a valid reply.
 
+NeoPi/OMP (oh-my-pi compatible) uses JSONL `rpc-ui` with a required negotiated
+protocol-v2 transport. The `ready` handshake determines optional features;
+unknown or older peers must not be treated as fully compatible. Native `agent_end`
+can be nonterminal (`isTerminal: false`), so a T3 turn ends only after a terminal
+outcome. Until upstream #102 supplies structured `tool_approval_request`, tool
+approvals arrive as `select` extension dialogs with Approve/Deny replies. Approval
+mode is selected at process launch; changing modes requires restart and resume,
+not a fictitious mid-session RPC setter. A rollback `branch` creates a new native
+session file and its new cursor must be saved before T3 reports completion.
+
+NeoPi fresh session files use the CLI's normal directory only when the compatible
+peer advertises both `session_lease` (#106) and `new_session` (#107); T3 launches
+those sessions with `--new-session`. Otherwise live files stay under the T3 home,
+isolated from the NeoPi/OMP picker. Previously isolated threads resume from their
+saved files even after sharing becomes available. A profile sets `OMP_PROFILE`
+independently for each provider instance. Provider probes do not create shared
+user sessions, and OAuth login metadata does not establish API-key or local-model
+access.
+
+With `set_mode` (#103), a proposed plan settles the visible T3 turn while the
+native proposal request waits for a decision. Implementing in the same thread
+approves it; refinement feedback or interruption rejects it. **Implement in new
+thread** starts another session and cannot decide the proposal in the original
+one: that original request remains pending until its next send, interruption,
+or session stop, which resolves it as a refinement. Rollback cannot remove just
+the refinement continuation without also removing its original native turn.
+
 ## Attachments and stored history
 
 Attachments live outside the project workspace. [ProviderService](../../apps/server/src/provider/Layers/ProviderService.ts)

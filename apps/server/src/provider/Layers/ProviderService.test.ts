@@ -276,6 +276,7 @@ function makeFakeCodexAdapter(
       sessionModelSwitch: "in-session",
       ...(supportsConversationRollback !== undefined ? { supportsConversationRollback } : {}),
       ...(provider === CODEX_DRIVER ? { promptlessTurnContinuation: true } : {}),
+      ...(provider === CLAUDE_AGENT_DRIVER ? { terminalResumeCursor: "refresh" } : {}),
     },
     startSession,
     sendTurn,
@@ -717,6 +718,126 @@ it.effect("ProviderServiceLive shutdown leaves settled session rows untouched", 
     }
     const [stoppedAll] = recordedAnalytics.eventsByName("provider.sessions.stopped_all");
     assert.equal(stoppedAll?.properties?.stoppedSessionCount, 2);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("honors an adapter's ordered terminal cursor when send admission arrives late", () =>
+  Effect.gen(function* () {
+    const native = ProviderDriverKind.make("custom-terminal-cursor");
+    const instanceId = ProviderInstanceId.make("custom-cursor-race");
+    const threadId = asThreadId("custom-delayed-admission");
+    const turnId = asTurnId("new-turn");
+    const previousCursor = {
+      sessionId: "native",
+      turnBoundaries: [{ turnId: "old", userEntryId: "A" }],
+    };
+    const finalCursor = {
+      sessionId: "native",
+      turnBoundaries: [...previousCursor.turnBoundaries, { turnId, userEntryId: "B" }],
+    };
+    const fake = makeFakeCodexAdapter(native);
+    const adapter: ProviderAdapterShape<ProviderAdapterError> = {
+      ...fake.adapter,
+      capabilities: { ...fake.adapter.capabilities, terminalResumeCursor: "ordered" },
+    };
+    const persistence = yield* Layer.build(
+      ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      ),
+    );
+    const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory.pipe(
+      Effect.provide(persistence),
+    );
+    const sendStarted = yield* Deferred.make<void>();
+    const steerStarted = yield* Deferred.make<void>();
+    const releaseSend = yield* Deferred.make<void>();
+    const serviceLayer = makeProviderServiceLive().pipe(
+      Layer.provide(NodeServices.layer),
+      Layer.provide(
+        Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          makeStaticInstanceRegistry([[instanceId, adapter]]),
+        ),
+      ),
+      Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const scope = yield* Scope.make();
+    const context = yield* Layer.build(serviceLayer).pipe(Scope.provide(scope));
+    const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+    yield* provider.startSession(threadId, {
+      provider: native,
+      providerInstanceId: instanceId,
+      threadId,
+      cwd: fixtureCwd("neopi-delayed-admission"),
+      runtimeMode: "full-access",
+    });
+    fake.updateSession(threadId, (session) => ({ ...session, resumeCursor: previousCursor }));
+    let sendsStarted = 0;
+    const deferredSend = () =>
+      Effect.gen(function* () {
+        sendsStarted++;
+        yield* Deferred.succeed(sendsStarted === 1 ? sendStarted : steerStarted, undefined);
+        yield* Deferred.await(releaseSend);
+        return { threadId, turnId, resumeCursor: previousCursor };
+      });
+    fake.sendTurn.mockImplementationOnce(deferredSend).mockImplementationOnce(deferredSend);
+    const send = yield* provider
+      .sendTurn({ threadId, input: "implement", attachments: [] })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(sendStarted);
+    const steer = yield* provider
+      .sendTurn({ threadId, input: "continue", attachments: [] })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(steerStarted);
+    fake.updateSession(threadId, (session) => ({
+      ...session,
+      resumeCursor: finalCursor,
+      status: "ready",
+      activeTurnId: undefined,
+    }));
+    const completed = yield* provider.streamEvents.pipe(
+      Stream.filter((event) => event.threadId === threadId && event.type === "turn.completed"),
+      Stream.runHead,
+      Effect.forkChild,
+    );
+    yield* Effect.yieldNow;
+    fake.emit({
+      type: "turn.completed",
+      eventId: asEventId("neopi-raced-completion"),
+      provider: native,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId,
+      turnId,
+      payload: { state: "completed" },
+    });
+    yield* Fiber.join(completed);
+    const beforeAdmission = Option.getOrThrow(yield* directory.getBinding(threadId));
+    assert.deepEqual(beforeAdmission.resumeCursor, finalCursor);
+    yield* Deferred.succeed(releaseSend, undefined);
+    yield* Fiber.join(send);
+    yield* Fiber.join(steer);
+    const binding = Option.getOrThrow(yield* directory.getBinding(threadId));
+    assert.deepEqual(binding.resumeCursor, finalCursor);
+    assert.equal(binding.status, "running", "the session remains live after its turn finishes");
+    assert.equal((binding.runtimePayload as { activeTurnId?: TurnId | null }).activeTurnId, null);
+    assert.equal(
+      (binding.runtimePayload as { lastRuntimeEvent?: string }).lastRuntimeEvent,
+      "turn.completed",
+    );
+    assert.equal(
+      (binding.runtimePayload as { continueAfterServerUpdate?: unknown }).continueAfterServerUpdate,
+      null,
+    );
+    yield* Scope.close(scope, Exit.void);
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -1618,6 +1739,87 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("routes first-session startup UI through the pending provider before binding", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-startup-ui-pending");
+      const started = yield* Deferred.make<void>();
+      const answered = yield* Deferred.make<void>();
+      const originalStart = routing.codex.startSession.getMockImplementation()!;
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(started, undefined);
+          yield* Deferred.await(answered);
+          return yield* originalStart(input);
+        }),
+      );
+      routing.codex.respondToUserInput.mockImplementationOnce(() =>
+        Deferred.succeed(answered, undefined).pipe(Effect.asVoid),
+      );
+      const starting = yield* provider
+        .startSession(threadId, {
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(started);
+      yield* provider.respondToRequest({
+        threadId,
+        requestId: asRequestId("startup-approval"),
+        decision: "accept",
+      });
+      yield* provider.respondToUserInput({
+        threadId,
+        requestId: asRequestId("startup-confirm"),
+        answers: { resolution: "ok" },
+      });
+      const session = yield* Fiber.join(starting);
+      assert.equal(session.threadId, threadId);
+      assert.deepEqual(routing.codex.respondToUserInput.mock.calls.at(-1), [
+        threadId,
+        asRequestId("startup-confirm"),
+        { resolution: "ok" },
+      ]);
+      assert.deepEqual(routing.codex.respondToRequest.mock.calls.at(-1), [
+        threadId,
+        asRequestId("startup-approval"),
+        "accept",
+      ]);
+      yield* provider.stopSession({ threadId });
+    }),
+  );
+
+  it.effect("discards pending response routing after a failed first start", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-startup-ui-failed");
+      const originalStart = routing.codex.startSession.getMockImplementation()!;
+      routing.codex.startSession.mockImplementationOnce((input) =>
+        originalStart(input).pipe(
+          Effect.map((session) => ({ ...session, provider: CLAUDE_AGENT_DRIVER })),
+        ),
+      );
+      yield* Effect.flip(
+        provider.startSession(threadId, {
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+      const routed = yield* Effect.flip(
+        provider.respondToUserInput({
+          threadId,
+          requestId: asRequestId("stale-startup-ui"),
+          answers: { resolution: "ok" },
+        }),
+      );
+      assert.instanceOf(routed, ProviderValidationError);
+      assert.include(routed.issue, "no persisted provider binding");
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
   it.effect.each([CODEX_DRIVER, CLAUDE_AGENT_DRIVER, CURSOR_DRIVER])(
     "rejects missing, file, and saved workspace paths before starting %s",
     (driver) =>
@@ -1753,6 +1955,8 @@ routing.layer("ProviderServiceLive routing", (it) => {
       yield* provider.interruptTurn({ threadId: session.threadId });
       assert.deepEqual(routing.codex.interruptTurn.mock.calls, [[session.threadId, undefined]]);
 
+      routing.codex.respondToRequest.mockClear();
+      routing.codex.respondToUserInput.mockClear();
       yield* provider.respondToRequest({
         threadId: session.threadId,
         requestId: asRequestId("req-1"),
@@ -1827,6 +2031,51 @@ routing.layer("ProviderServiceLive routing", (it) => {
         assert.equal(startPayload.threadId, session.threadId);
       }
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect("persists a successful branch cursor even when history projection fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-branch-history-failure");
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: fixtureCwd("branch-history-failure"),
+        runtimeMode: "auto",
+      });
+      const branchedCursor = { sessionFile: "/tmp/new-native-branch.jsonl" };
+      routing.codex.rollbackThread.mockImplementationOnce(() =>
+        Effect.sync(() => {
+          routing.codex.updateSession(threadId, (session) => ({
+            ...session,
+            resumeCursor: branchedCursor,
+          }));
+        }).pipe(
+          Effect.flatMap(() =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: CODEX_DRIVER,
+                method: "readThread",
+                detail: "projection failed after branch",
+              }),
+            ),
+          ),
+        ),
+      );
+      const failure = yield* provider
+        .rollbackConversation({ threadId, numTurns: 1 })
+        .pipe(Effect.flip);
+      assert.match(String(failure), /projection failed after branch/);
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const binding = yield* directory.getBinding(threadId);
+      assert(Option.isSome(binding));
+      assert.deepEqual(binding.value.resumeCursor, branchedCursor);
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      yield* provider.sendTurn({ threadId, input: "resume branched state", attachments: [] });
+      assert.deepEqual(routing.codex.startSession.mock.calls[0]?.[0]?.resumeCursor, branchedCursor);
     }),
   );
 

@@ -35,6 +35,8 @@ import { makeSqlitePersistenceLive } from "../src/persistence/Layers/Sqlite.ts";
 import { ProjectionPendingApprovalRepository } from "../src/persistence/Services/ProjectionPendingApprovals.ts";
 import { makeAdapterRegistryMock } from "../src/provider/testUtils/providerAdapterRegistryMock.ts";
 import { ProviderAdapterRegistry } from "../src/provider/Services/ProviderAdapterRegistry.ts";
+import type { ProviderAdapterShape } from "../src/provider/Services/ProviderAdapter.ts";
+import type { ProviderAdapterError } from "../src/provider/Errors.ts";
 import { makeProviderRegistryLayer } from "../src/provider/testUtils/providerRegistryMock.ts";
 import { ProviderSessionDirectoryLive } from "../src/provider/Layers/ProviderSessionDirectory.ts";
 import { ServerSettingsService } from "../src/serverSettings.ts";
@@ -100,7 +102,7 @@ function runGit(cwd: string, args: ReadonlyArray<string>) {
   });
 }
 
-const initializeGitWorkspace = Effect.fn(function* (cwd: string) {
+const initializeGitWorkspace = Effect.fn(function* (cwd: string, skipCommit = false) {
   runGit(cwd, ["init", "--initial-branch=main"]);
   runGit(cwd, ["config", "user.email", "test@example.com"]);
   runGit(cwd, ["config", "user.name", "Test User"]);
@@ -108,7 +110,7 @@ const initializeGitWorkspace = Effect.fn(function* (cwd: string) {
   const { join } = yield* Path.Path;
   yield* fileSystem.writeFileString(join(cwd, "README.md"), "v1\n");
   runGit(cwd, ["add", "."]);
-  runGit(cwd, ["commit", "-m", "Initial"]);
+  if (!skipCommit) runGit(cwd, ["commit", "-m", "Initial"]);
 });
 
 export function gitRefExists(cwd: string, ref: string): boolean {
@@ -232,6 +234,8 @@ export interface OrchestrationIntegrationHarness {
 interface MakeOrchestrationIntegrationHarnessOptions {
   readonly provider?: ProviderDriverKind;
   readonly realCodex?: boolean;
+  /** A real adapter with a controlled native runtime, registered through ProviderService. */
+  readonly adapter?: ProviderAdapterShape<ProviderAdapterError>;
   /** Tracer for every fiber the harness runtime runs, including reactors. */
   readonly tracer?: Tracer.Tracer;
 }
@@ -245,15 +249,17 @@ export const makeOrchestrationIntegrationHarness = (
 
     const provider = options?.provider ?? ProviderDriverKind.make("codex");
     const useRealCodex = options?.realCodex === true;
-    const adapterHarness = useRealCodex
-      ? null
-      : yield* makeTestProviderAdapterHarness({
-          provider,
-        });
-    const fakeRegistry = adapterHarness
+    const adapterHarness =
+      useRealCodex || options?.adapter
+        ? null
+        : yield* makeTestProviderAdapterHarness({
+            provider,
+          });
+    const selectedAdapter = options?.adapter ?? adapterHarness?.adapter;
+    const fakeRegistry = selectedAdapter
       ? Layer.succeed(
           ProviderAdapterRegistry,
-          makeAdapterRegistryMock({ [adapterHarness.provider]: adapterHarness.adapter }),
+          makeAdapterRegistryMock({ [provider]: selectedAdapter }),
         )
       : null;
     const rootDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -265,7 +271,9 @@ export const makeOrchestrationIntegrationHarness = (
     );
     yield* fileSystem.makeDirectory(workspaceDir, { recursive: true });
     yield* fileSystem.makeDirectory(stateDir, { recursive: true });
-    yield* initializeGitWorkspace(workspaceDir);
+    // Adapter/ingestion identity tests do not need a checkpoint baseline.
+    // Leave that fixture uncommitted so it never depends on host signing keys.
+    yield* initializeGitWorkspace(workspaceDir, options?.adapter !== undefined);
 
     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
     const orchestrationLayer = OrchestrationEngineLive.pipe(

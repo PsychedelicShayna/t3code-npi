@@ -127,6 +127,7 @@ import { OrchestrationThreadSettleBlockedError } from "./orchestration/Errors.ts
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
+import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
@@ -768,6 +769,7 @@ const buildAppUnderTest = (options?: {
       // database. Its own, in memory: nothing here shares a table with the auth store.
       makeRoutesLayer.pipe(
         Layer.provide(Layer.mergeAll(serviceLauncherClientLayer, SqlitePersistenceMemory)),
+        Layer.provideMerge(PreviewAutomationBroker.layer),
       ),
       {
         disableListenLog: true,

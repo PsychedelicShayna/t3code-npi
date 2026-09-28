@@ -1,3 +1,4 @@
+import { createElement, type SVGProps } from "react";
 import type { UsageProviderKind } from "@t3tools/contracts";
 
 import {
@@ -9,6 +10,17 @@ import {
   OpenAI,
   OpenCodeIcon,
 } from "../Icons";
+
+/** NeoPi mark: pi bars plus the orange plugin connector from assets/icon.svg. */
+const NeoPiMark: Icon = (props: SVGProps<SVGSVGElement>) =>
+  createElement(
+    "svg",
+    { viewBox: "0 0 120 90", fill: "none", ...props },
+    createElement("rect", { x: 10, y: 8, width: 100, height: 12, rx: 2, fill: "currentColor" }),
+    createElement("rect", { x: 25, y: 20, width: 12, height: 62, rx: 2, fill: "currentColor" }),
+    createElement("rect", { x: 75, y: 20, width: 12, height: 45, rx: 2, fill: "currentColor" }),
+    createElement("rect", { x: 71, y: 55, width: 20, height: 16, rx: 3, fill: "#f97316" }),
+  );
 
 type UsageProviderPresentation = {
   readonly label: string;
@@ -41,6 +53,7 @@ export const PROVIDER_PRESENTATION = {
   cursor: { label: "Cursor", color: "#8b8b8b", mark: CursorIcon },
   opencode: { label: "OpenCode", color: "#5b9bbd", mark: OpenCodeIcon },
   antigravity: { label: "Antigravity", color: "#8c7bd1", mark: AntigravityIcon },
+  neopi: { label: "NeoPi/OMP", color: "#f97316", mark: NeoPiMark },
 } satisfies Record<UsageProviderKind, UsageProviderPresentation>;
 
 /** Stable provider reading order across charts, summaries, tables, and hover rows. */

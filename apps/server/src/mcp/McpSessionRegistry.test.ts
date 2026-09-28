@@ -7,6 +7,7 @@ import * as NetAddress from "effect/unstable/net/NetAddress";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as McpProviderSession from "./McpProviderSession.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
@@ -162,4 +163,33 @@ it.effect("does not keep credentials of other threads alive", () =>
 
     expect(yield* registry.resolve(token)).toBeUndefined();
   }),
+);
+
+it.effect("revoking an active thread removes its credential and provider configuration", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const registry = yield* McpSessionRegistry.McpSessionRegistry;
+      const threadId = ThreadId.make("thread-revoked");
+      const issued = yield* McpSessionRegistry.issueActiveMcpCredential({
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(["preview"]),
+      });
+      expect(issued).toBeDefined();
+      McpProviderSession.setMcpProviderSession(issued!.config);
+      expect(
+        yield* McpSessionRegistry.resolveActiveMcpCredential(issued!.config.authorizationHeader),
+      ).toBeDefined();
+      yield* McpSessionRegistry.revokeActiveMcpThread(threadId);
+      expect(
+        yield* registry.resolve(issued!.config.authorizationHeader.slice("Bearer ".length)),
+      ).toBeUndefined();
+      expect(McpProviderSession.readMcpProviderSession(threadId)).toBeUndefined();
+    }).pipe(
+      Effect.provide(McpSessionRegistry.layer),
+      Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+      Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+      Effect.provide(NodeServices.layer),
+    ),
+  ),
 );
