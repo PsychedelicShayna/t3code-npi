@@ -21,7 +21,7 @@ export interface NeoPiSessionRoots {
 }
 
 /** Encode one path segment the same way launch has always encoded profile and project id. */
-export function neopiSessionSegment(value: string): string {
+function neopiSessionSegment(value: string): string {
   const encoded = encodeURIComponent(value.trim());
   return encoded === "" || encoded === "." || encoded === ".."
     ? "default"

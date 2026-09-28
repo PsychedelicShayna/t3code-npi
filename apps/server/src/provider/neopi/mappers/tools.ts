@@ -49,7 +49,7 @@ export interface ToolState {
 }
 
 /** Wire `toolSource` for T3-owned host tools. Key is the plan's `"t3-code"`. */
-export const T3_CODE_TOOL_SOURCE = {
+const T3_CODE_TOOL_SOURCE = {
   key: "t3-code",
   name: "T3 Code",
   kind: "integration",
@@ -74,10 +74,6 @@ export function withHostToolNames(state: ToolState, names: Iterable<string>): To
     if (name.length > 0) hostToolNames.add(name);
   }
   return hostToolNames.size === state.hostToolNames.size ? state : { ...state, hostToolNames };
-}
-
-export function inFlightToolList(state: ToolState): ReadonlyArray<InFlightTool> {
-  return Object.values(state.inFlightTools);
 }
 
 export function mapToolFrame(

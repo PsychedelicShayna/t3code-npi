@@ -8,7 +8,7 @@ const object = (value: unknown): Record<string, unknown> =>
     ? (value as Record<string, unknown>)
     : {};
 
-export class NeoPiRollbackError extends Error {}
+class NeoPiRollbackError extends Error {}
 export class NeoPiRollbackIntegrityError extends NeoPiRollbackError {}
 
 /** NeoPi branch takes the user entry to REMOVE, not the entry preceding it. */

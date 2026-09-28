@@ -14,9 +14,9 @@ import { scopedItemId, type MapCtx } from "./MapCtx.ts";
  * `get_state` snapshot. `t3.compaction` covers a manual compact that did
  * not also surface `auto_compaction_end`.
  */
-export const T3_TURN_OUTCOME_TYPE = "t3.turn.outcome";
-export const T3_STATE_TYPE = "t3.state";
-export const T3_COMPACTION_TYPE = "t3.compaction";
+const T3_TURN_OUTCOME_TYPE = "t3.turn.outcome";
+const T3_STATE_TYPE = "t3.state";
+const T3_COMPACTION_TYPE = "t3.compaction";
 
 const TURN_STATES = ["completed", "failed", "interrupted", "cancelled"] as const;
 type TurnState = (typeof TURN_STATES)[number];
