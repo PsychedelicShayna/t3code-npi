@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as Fs from "node:fs";
-import * as Os from "node:os";
-import * as Path from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import type { NeoPiSettings } from "@t3tools/contracts";
@@ -155,30 +155,45 @@ it.live(
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
 );
-it.live("falls back only when the default npi executable is missing", () =>
+it.live("prefers PATH npi, then the packaged npi, then PATH omp without masking failures", () =>
   Effect.gen(function* () {
-    const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "t3-neopi-bin-"));
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-neopi-bin-"));
     try {
-      const omp = Path.join(dir, "omp");
-      Fs.writeFileSync(omp, "#!/bin/sh\necho 'omp v1.2.3'\n", { mode: 0o755 });
+      const omp = NodePath.join(dir, "omp");
+      NodeFS.writeFileSync(omp, "#!/bin/sh\necho 'omp v1.2.3'\n", { mode: 0o755 });
       const env = { PATH: dir };
       const fallback = yield* resolveNeoPiBinary({ binaryPath: "npi" }, env, dir);
       assert.equal(fallback?.binary, "omp");
       assert.equal(fallback?.version, "1.2.3");
-      const npi = Path.join(dir, "npi");
-      Fs.writeFileSync(npi, "#!/bin/sh\nexit 17\n", { mode: 0o755 });
-      const failure = yield* resolveNeoPiBinary({ binaryPath: "npi" }, env, dir);
+
+      const resourcesPath = NodePath.join(dir, "resources");
+      const bundled = NodePath.join(resourcesPath, "bin", "npi");
+      NodeFS.mkdirSync(NodePath.dirname(bundled), { recursive: true });
+      NodeFS.writeFileSync(bundled, "#!/bin/sh\necho 'npi v2.3.4'\n", { mode: 0o755 });
+      const packagedEnv = { ...env, T3CODE_DESKTOP_RESOURCES_PATH: resourcesPath };
+      const packaged = yield* resolveNeoPiBinary({ binaryPath: "npi" }, packagedEnv, dir);
+      assert.equal(packaged?.binary, bundled);
+      assert.equal(packaged?.version, "2.3.4");
+
+      const npi = NodePath.join(dir, "npi");
+      NodeFS.writeFileSync(npi, "#!/bin/sh\necho 'npi v3.4.5'\n", { mode: 0o755 });
+      const override = yield* resolveNeoPiBinary({ binaryPath: "npi" }, packagedEnv, dir);
+      assert.equal(override?.binary, "npi");
+      assert.equal(override?.version, "3.4.5");
+
+      NodeFS.writeFileSync(npi, "#!/bin/sh\nexit 17\n", { mode: 0o755 });
+      const failure = yield* resolveNeoPiBinary({ binaryPath: "npi" }, packagedEnv, dir);
       assert.equal(failure?.binary, "npi");
       assert.match(failure?.error ?? "", /exited 17/);
       const explicit = yield* resolveNeoPiBinary(
-        { binaryPath: Path.join(dir, "absent") },
-        env,
+        { binaryPath: NodePath.join(dir, "absent") },
+        packagedEnv,
         dir,
       );
-      assert.equal(explicit?.binary, Path.join(dir, "absent"));
+      assert.equal(explicit?.binary, NodePath.join(dir, "absent"));
       assert.notEqual(explicit?.error, null);
     } finally {
-      Fs.rmSync(dir, { recursive: true, force: true });
+      NodeFS.rmSync(dir, { recursive: true, force: true });
     }
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -248,10 +263,10 @@ const previousCatalog = {
 };
 
 const writeSlowPeer = (dir: string): string => {
-  const peer = Path.join(dir, "peer.mjs");
-  const binary = Path.join(dir, "npi");
+  const peer = NodePath.join(dir, "peer.mjs");
+  const binary = NodePath.join(dir, "npi");
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-  Fs.writeFileSync(
+  NodeFS.writeFileSync(
     peer,
     [
       "import readline from 'node:readline';",
@@ -285,7 +300,7 @@ const writeSlowPeer = (dir: string): string => {
       "",
     ].join("\n"),
   );
-  Fs.writeFileSync(
+  NodeFS.writeFileSync(
     binary,
     `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "npi v9.9.9"; exit 0; fi\nexec ${quote(process.execPath)} ${quote(peer)}\n`,
     { mode: 0o755 },
@@ -295,7 +310,7 @@ const writeSlowPeer = (dir: string): string => {
 
 it.live("publishes ready capabilities when metadata times out and keeps the previous catalog", () =>
   Effect.gen(function* () {
-    const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "t3-neopi-slow-meta-"));
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-neopi-slow-meta-"));
     try {
       const binary = writeSlowPeer(dir);
       const capabilities = new Set<string>();
@@ -327,7 +342,7 @@ it.live("publishes ready capabilities when metadata times out and keeps the prev
       assert.equal(capabilities.has(NEOPI_CAPABILITIES.setMode), true);
       assert.equal(capabilities.has(NEOPI_CAPABILITIES.getRoles), true);
     } finally {
-      Fs.rmSync(dir, { recursive: true, force: true });
+      NodeFS.rmSync(dir, { recursive: true, force: true });
     }
   }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -336,7 +351,7 @@ it.live(
   "names a handshake timeout and does not publish capabilities from a peer that never readied",
   () =>
     Effect.gen(function* () {
-      const dir = Fs.mkdtempSync(Path.join(Os.tmpdir(), "t3-neopi-slow-handshake-"));
+      const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-neopi-slow-handshake-"));
       try {
         const binary = writeSlowPeer(dir);
         const capabilities = new Set<string>();
@@ -361,7 +376,7 @@ it.live(
         assert.equal(result.showInteractionModeToggle, false);
         assert.equal(capabilities.size, 0);
       } finally {
-        Fs.rmSync(dir, { recursive: true, force: true });
+        NodeFS.rmSync(dir, { recursive: true, force: true });
       }
     }).pipe(Effect.provide(NodeServices.layer)),
 );

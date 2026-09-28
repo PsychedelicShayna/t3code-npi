@@ -27,6 +27,8 @@ import {
   DESKTOP_EXTRA_RESOURCES,
   LINUX_CAPTURE_EXTRA_RESOURCES,
   LINUX_BROWSER_SECRET_EXTRA_RESOURCES,
+  NPI_BUNDLE_EXTRA_RESOURCE,
+  NpiBundleSourceInvalidError,
   LINUX_FILE_EXCLUSIONS,
   MAC_FILE_EXCLUSIONS,
   InvalidMacPasskeyRpDomainError,
@@ -66,6 +68,7 @@ import {
   stageResourceMonitor,
   stageLinuxCaptureHelper,
   stageWslRuntimeArchive,
+  stageNpiBundle,
   bundlesWslRuntime,
   STAGE_INSTALL_ARGS,
   ancestorNodeModulesPaths,
@@ -1998,6 +2001,29 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     assert.equal(resourceMonitorExecutableName("mac"), "t3-resource-monitor");
     assert.equal(resourceMonitorExecutableName("win"), "t3-resource-monitor.exe");
   });
+
+  it.effect("rejects a missing or non-executable npi instead of creating a staged resource", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-npi-invalid-" });
+        const sourcePath = path.join(root, "npi");
+        const destinationPath = path.join(root, "app", NPI_BUNDLE_EXTRA_RESOURCE.from);
+        const missing = yield* stageNpiBundle({ sourcePath, destinationPath }).pipe(Effect.flip);
+        assert.instanceOf(missing, NpiBundleSourceInvalidError);
+        assert.match(missing.message, /T3CODE_NPI_BUNDLE_SOURCE/);
+        yield* fs.writeFileString(sourcePath, "not executable");
+        yield* fs.chmod(sourcePath, 0o644);
+        const nonExecutable = yield* stageNpiBundle({ sourcePath, destinationPath }).pipe(
+          Effect.flip,
+        );
+        assert.instanceOf(nonExecutable, NpiBundleSourceInvalidError);
+        assert.match(nonExecutable.message, /not executable/);
+        assert.isFalse(yield* fs.exists(destinationPath));
+      }),
+    ),
+  );
 
   it("ships the Linux CLI release archive as the WSL runtime", () => {
     assert.equal(WSL_RUNTIME_ARCHIVE_NAME, "wsl-runtime.tar.gz");

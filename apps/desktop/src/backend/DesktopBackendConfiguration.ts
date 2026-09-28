@@ -583,6 +583,10 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       cwd: environment.backendCwd,
       env: {
         ...backendChildEnvPatch(),
+        // Packaged provider adapters may load tools shipped as desktop resources.
+        ...(environment.isPackaged && environment.platform === "linux"
+          ? { T3CODE_DESKTOP_RESOURCES_PATH: environment.resourcesPath }
+          : {}),
         ELECTRON_RUN_AS_NODE: "1",
       },
       // Primary wants process.env (PATH, dev-runner's T3CODE_HOME, etc.).

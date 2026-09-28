@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off -- Provider binary paths are resolved before RPC services start.
+import * as NodePath from "node:path";
 import type { NeoPiSettings, ServerProvider, ServerProviderModel } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
 import type { NeoPiRpcClient, SpawnFn } from "effect-neopi-rpc/client";
@@ -163,7 +165,12 @@ export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
   cwd: string,
 ) {
   const useDefaultSearch = !settings.binaryPath || settings.binaryPath === "npi";
-  const commands = useDefaultSearch ? ["npi", "omp"] : [settings.binaryPath];
+  const bundled = environment.T3CODE_DESKTOP_RESOURCES_PATH
+    ? NodePath.join(environment.T3CODE_DESKTOP_RESOURCES_PATH, "bin", "npi")
+    : undefined;
+  const commands = useDefaultSearch
+    ? ["npi", ...(bundled ? [bundled] : []), "omp"]
+    : [settings.binaryPath];
   for (const candidate of commands) {
     const probe = yield* spawnAndCollect(
       candidate,
@@ -178,7 +185,7 @@ export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
     }
     if (
       useDefaultSearch &&
-      candidate === "npi" &&
+      candidate !== "omp" &&
       Result.isFailure(probe) &&
       isCommandMissingCause(probe.failure)
     )
