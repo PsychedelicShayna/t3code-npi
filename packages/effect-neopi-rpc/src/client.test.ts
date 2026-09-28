@@ -49,6 +49,8 @@ const asCommand = (value: unknown): CapturedCommand | undefined =>
 
 const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
   readonly ready?: Record<string, unknown>;
+  /** Leave stderr open after exit, as a descendant inheriting the pipe would. */
+  readonly holdStderr?: boolean;
   readonly onLine: (
     message: CapturedCommand,
     emit: (frame: unknown) => Effect.Effect<void>,
@@ -71,9 +73,12 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
   const finish = (status: { code: number | null; signal: string | null }) =>
     Effect.gen(function* () {
       yield* Queue.end(stdout).pipe(Effect.ignore);
-      yield* Queue.end(stderr).pipe(Effect.ignore);
+      if (!input.holdStderr) yield* Queue.end(stderr).pipe(Effect.ignore);
       yield* Deferred.succeed(exitGate, status).pipe(Effect.ignore);
     });
+
+  const exitProcess = (status: { code: number | null; signal: string | null }) =>
+    Deferred.succeed(exitGate, status).pipe(Effect.ignore);
 
   if (input.ready) yield* emit(input.ready);
   yield* Effect.gen(function* () {
@@ -142,6 +147,7 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
     handle,
     emit,
     finish,
+    exitProcess,
     endStdout: Queue.end(stdout),
     writeStderr: (text: string) => Queue.offer(stderr, encoder.encode(text)).pipe(Effect.asVoid),
     signals,
@@ -718,6 +724,104 @@ it.live("fails ready when stdout ends but the process remains alive", () =>
         }),
       );
       assert.equal(error.code, "exited");
+    }),
+  ),
+);
+
+it.live("fails an admitted turn when stdout ends after ready while the process stays alive", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v1Ready,
+        onLine: (message, emit) =>
+          message.type === "prompt"
+            ? emit({
+                id: message.id,
+                type: "response",
+                command: "prompt",
+                success: true,
+                data: { agentInvoked: true },
+              })
+            : Effect.void,
+      });
+      const client = yield* makeClient(peer);
+      const handle = yield* client.prompt({ type: "prompt", message: "hi" });
+      const admitted = yield* Deferred.await(handle.outcome).pipe(Effect.timeout("2 seconds"));
+      assert.equal(admitted.kind, "agent");
+      const pending = yield* Effect.forkChild(client.request({ type: "get_state" }));
+      yield* Effect.yieldNow;
+      yield* peer.endStdout;
+      const outcome = yield* Fiber.join(pending).pipe(Effect.timeout("2 seconds"), Effect.result);
+      assert.equal(outcome._tag, "Failure");
+      if (outcome._tag === "Failure") {
+        assert.equal(outcome.failure._tag, "NeoPiRpcError");
+        if (outcome.failure._tag === "NeoPiRpcError") assert.equal(outcome.failure.code, "closed");
+      }
+      const exit = yield* Deferred.await(client.exit).pipe(Effect.timeout("2 seconds"));
+      assert.equal(peer.signals.includes("SIGTERM"), true);
+      assert.equal(exit.code === 0 && exit.signal === null, false);
+    }),
+  ),
+);
+
+it.live("completes close when a descendant keeps stderr open after the process exits", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v1Ready,
+        holdStderr: true,
+        onLine: () => Effect.void,
+      });
+      const client = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 2_000,
+      });
+      yield* peer.writeStderr("held-by-descendant\n");
+      yield* peer.exitProcess({ code: 0, signal: null });
+      const exit = yield* Deferred.await(client.exit).pipe(Effect.timeout("2 seconds"));
+      assert.equal(exit.code, 0);
+      assert.equal(exit.stderrTail.includes("held-by-descendant"), true);
+      yield* client.close(40).pipe(Effect.timeout("2 seconds"));
+    }),
+  ),
+);
+
+it.live("does not retain stderr written before any consumer subscribes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v1Ready,
+        onLine: () => Effect.void,
+      });
+      const client = yield* makeClient(peer);
+      for (let index = 0; index < 200; index++) {
+        yield* peer.writeStderr(`early-${index}\n`);
+      }
+      yield* Effect.sleep("30 millis");
+      const seen = yield* Queue.unbounded<string>();
+      yield* Stream.runForEach(client.stderr, (text) => Queue.offer(seen, text)).pipe(
+        Effect.forkScoped,
+      );
+      yield* Effect.sleep("20 millis");
+      yield* peer.writeStderr("after-subscribe\n");
+      const received: Array<string> = [];
+      yield* Effect.gen(function* () {
+        while (!received.some((text) => text.includes("after-subscribe"))) {
+          received.push(yield* Queue.take(seen).pipe(Effect.timeout("1 second")));
+        }
+      });
+      assert.equal(
+        received.some((text) => text.includes("early-0")),
+        false,
+      );
+      assert.equal(
+        received.some((text) => text.includes("after-subscribe")),
+        true,
+      );
     }),
   ),
 );

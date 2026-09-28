@@ -2,6 +2,7 @@ import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
@@ -62,6 +63,10 @@ export type SpawnFn = (
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_STDERR_TAIL_BYTES = 16 * 1024;
+/** Caps live stderr retention when a subscriber is attached. Unused sessions offer nothing. */
+export const DEFAULT_STDERR_QUEUE_CAPACITY = 32;
+/** How long to drain stdout/stderr after process death before releasing readers. */
+export const DEFAULT_STDIO_DRAIN_MS = 250;
 export const DEFAULT_CLOSE_GRACE_MS = 5_000;
 
 export interface NeoPiRpcClientOptions {
@@ -204,7 +209,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     Cause.Done<void>
   >();
   const hostUriRequests = yield* Queue.unbounded<HostUriRequestFrame, Cause.Done<void>>();
-  const stderr = yield* Queue.unbounded<string, Cause.Done<void>>();
+  const stderr = yield* Queue.sliding<string, Cause.Done<void>>(DEFAULT_STDERR_QUEUE_CAPACITY);
   const exit = yield* Deferred.make<ProcessExit>();
   const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
 
@@ -216,6 +221,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   let fatal: NeoPiRpcError | undefined;
   let closed = false;
   let uriListeners = 0;
+  let stderrListeners = 0;
   const stderrTail = emptyStderrTail();
   const decoder = { current: new RpcFrameDecoder(ceiling) };
 
@@ -548,7 +554,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   const stdoutDone = yield* Deferred.make<void>();
   const stderrDone = yield* Deferred.make<void>();
 
-  yield* Stream.runForEach(stdoutLines(handle.stdout), ingestLine).pipe(
+  const stdoutFiber = yield* Stream.runForEach(stdoutLines(handle.stdout), ingestLine).pipe(
     Effect.catch((error) =>
       abortTransport(
         new NeoPiRpcError({
@@ -564,18 +570,32 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     ),
     Effect.andThen(
       Effect.gen(function* () {
-        if (yield* Deferred.isDone(readyDeferred)) return;
-        // A startup_error on stderr can arrive just after stdout closes.
-        // A still-running peer with closed stdout must nevertheless fail promptly.
-        yield* Deferred.await(stderrDone).pipe(Effect.timeoutOption("100 millis"));
-        if (!(yield* Deferred.isDone(readyDeferred)))
-          yield* abortTransport(
-            startupError(stderrTailText(stderrTail)) ??
-              new NeoPiRpcError({
-                code: "exited",
-                message: "NeoPi/OMP stdout ended before the ready frame",
-              }),
-          );
+        if (!(yield* Deferred.isDone(readyDeferred))) {
+          // A startup_error on stderr can arrive just after stdout closes.
+          // A still-running peer with closed stdout must nevertheless fail promptly.
+          yield* Deferred.await(stderrDone).pipe(Effect.timeoutOption("100 millis"));
+          if (!(yield* Deferred.isDone(readyDeferred)))
+            yield* abortTransport(
+              startupError(stderrTailText(stderrTail)) ??
+                new NeoPiRpcError({
+                  code: "exited",
+                  message: "NeoPi/OMP stdout ended before the ready frame",
+                }),
+            );
+          return;
+        }
+        // Handshake already completed. A live peer with no response channel
+        // cannot deliver agent_end. Intentional close and observed process
+        // death keep their own paths.
+        if (closed || fatal) return;
+        yield* Effect.sleep("20 millis");
+        if (closed || fatal || !(yield* handle.isRunning)) return;
+        yield* abortTransport(
+          new NeoPiRpcError({
+            code: "closed",
+            message: "NeoPi/OMP stdout ended while the process was still running",
+          }),
+        );
       }),
     ),
     Effect.ensuring(Deferred.succeed(stdoutDone, undefined).pipe(Effect.ignore)),
@@ -583,13 +603,15 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   );
 
   const stderrDecoder = new TextDecoder("utf-8", { fatal: false });
-  yield* Stream.runForEach(handle.stderr, (chunk) =>
+  const stderrFiber = yield* Stream.runForEach(handle.stderr, (chunk) =>
     Effect.sync(() => {
       pushStderrTail(stderrTail, chunk, stderrTailBytes);
       return stderrDecoder.decode(chunk, { stream: true });
     }).pipe(
       Effect.flatMap((text) =>
-        text.length === 0 ? Effect.void : Queue.offer(stderr, text).pipe(Effect.ignore),
+        text.length === 0 || stderrListeners === 0
+          ? Effect.void
+          : Queue.offer(stderr, text).pipe(Effect.ignore),
       ),
     ),
   ).pipe(
@@ -623,7 +645,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       Effect.gen(function* () {
         yield* Effect.all([Deferred.await(stdoutDone), Deferred.await(stderrDone)], {
           concurrency: "unbounded",
-        });
+        }).pipe(Effect.timeout(Duration.millis(DEFAULT_STDIO_DRAIN_MS)), Effect.ignore);
+        yield* Fiber.interrupt(stdoutFiber).pipe(Effect.ignore);
+        yield* Fiber.interrupt(stderrFiber).pipe(Effect.ignore);
         if (!(yield* Deferred.isDone(readyDeferred))) {
           yield* Deferred.fail(
             readyDeferred,
@@ -663,7 +687,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     Effect.uninterruptible(
       Effect.gen(function* () {
         if (closed) {
-          return yield* Deferred.await(exit).pipe(Effect.ignore);
+          return yield* Deferred.await(exit).pipe(
+            Effect.timeout(Duration.millis(DEFAULT_STDIO_DRAIN_MS)),
+            Effect.ignore,
+          );
         }
         closed = true;
         yield* failPending(
@@ -685,7 +712,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
             .kill({ killSignal: "SIGTERM", forceKillAfter: Duration.millis(graceMs) })
             .pipe(Effect.ignore);
         }
-        yield* Deferred.await(exit).pipe(Effect.ignore);
+        yield* Deferred.await(exit).pipe(
+          Effect.timeout(Duration.millis(graceMs + DEFAULT_STDIO_DRAIN_MS + 500)),
+          Effect.ignore,
+        );
       }),
     );
 
@@ -703,6 +733,21 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           }),
       );
       return Stream.fromQueue(hostUriRequests);
+    }),
+  );
+
+  const stderrStream = Stream.unwrap(
+    Effect.gen(function* () {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          stderrListeners += 1;
+        }),
+        () =>
+          Effect.sync(() => {
+            stderrListeners -= 1;
+          }),
+      );
+      return Stream.fromQueue(stderr);
     }),
   );
 
@@ -792,7 +837,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     hostToolResult,
     hostUriRequests: hostUriRequestsStream,
     hostUriResult,
-    stderr: Stream.fromQueue(stderr),
+    stderr: stderrStream,
     exit,
     close,
   } satisfies NeoPiRpcClient;

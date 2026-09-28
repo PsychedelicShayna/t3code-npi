@@ -57,10 +57,31 @@ export function neoPiRolesFromRpc(data: unknown): GetRolesResult | undefined {
   return { roles: data.roles, ...(data.activeRole ? { activeRole: data.activeRole } : {}) };
 }
 
+/** Picker group for role aliases. Never a native provider id. */
+export const NEOPI_ROLE_PICKER_GROUP = "Roles";
+
 /** Role aliases are deliberately disjoint from native `provider/model` slugs. */
 export function neoPiRoleFromModelSlug(slug: string): string | undefined {
   if (!slug.startsWith("@") || slug.length === 1 || slug.includes("/")) return undefined;
   return slug.slice(1);
+}
+
+/**
+ * Native provider id for usage probes. Role models keep `subProvider` as the
+ * picker group and store the resolved provider on `quotaProvider`.
+ */
+export function neoPiUsageProviderId(
+  models: ReadonlyArray<
+    Pick<ServerProviderModel, "isDefault" | "slug" | "subProvider" | "quotaProvider">
+  >,
+): string {
+  const selected = models.find((model) => model.isDefault === true);
+  if (!selected) return "";
+  const quota = selected.quotaProvider?.trim();
+  if (quota && quota !== NEOPI_ROLE_PICKER_GROUP) return quota;
+  if (neoPiRoleFromModelSlug(selected.slug)) return "";
+  const sub = selected.subProvider?.trim() ?? "";
+  return sub === NEOPI_ROLE_PICKER_GROUP ? "" : sub;
 }
 
 function toServerProviderRoleModels(
@@ -75,7 +96,8 @@ function toServerProviderRoleModels(
         slug,
         name: role.name,
         shortName: role.tag || role.id,
-        subProvider: "Roles",
+        subProvider: NEOPI_ROLE_PICKER_GROUP,
+        ...(role.resolved?.provider ? { quotaProvider: role.resolved.provider } : {}),
         aliases: slug === role.alias ? [role.id] : [role.id, role.alias],
         isCustom: false,
         ...(result.activeRole === role.id ? { isDefault: true } : {}),
@@ -121,6 +143,7 @@ export function toServerProviderModels(
         name: typeof model.name === "string" && model.name ? model.name : (model.id as string),
         shortName: model.id as string,
         subProvider: model.provider as string,
+        quotaProvider: model.provider as string,
         isCustom: false,
         ...(currentSlug === slug && !roleResult?.activeRole ? { isDefault: true } : {}),
         capabilities: createModelCapabilities({

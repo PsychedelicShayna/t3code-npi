@@ -328,13 +328,33 @@ const textFromMessage = (message: unknown): string => {
   return textFromContent(message.content);
 };
 
+const isFailedAssistant = (message: unknown): boolean => {
+  if (!isRecord(message) || message.role !== "assistant") return false;
+  if (message.stopReason === "error" || message.stopReason === "aborted") return true;
+  return typeof message.errorMessage === "string" && message.errorMessage.length > 0;
+};
+
 const textFromAgentEnd = (frame: SessionEventFrame): string => {
   const messages = frame.messages;
-  if (!Array.isArray(messages)) {
-    return "";
+  if (!Array.isArray(messages)) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (isFailedAssistant(message)) continue;
+    const text = textFromMessage(message);
+    if (text.length > 0) return text;
   }
-  return messages.map((message) => textFromMessage(message)).join("");
+  return "";
 };
+
+interface AssistantAttempt {
+  messageId?: string;
+  deltas: string;
+  snapshot: string;
+  failed: boolean;
+}
+
+const messageIdOf = (frame: SessionEventFrame): string | undefined =>
+  typeof frame.messageId === "string" && frame.messageId.length > 0 ? frame.messageId : undefined;
 
 const collectAssistantText = (
   client: NeoPiRpcClient,
@@ -342,22 +362,50 @@ const collectAssistantText = (
   operation: string,
 ): Effect.Effect<void, never, Scope.Scope> =>
   Effect.gen(function* () {
-    let deltas = "";
-    let snapshot = "";
+    let current: AssistantAttempt = { deltas: "", snapshot: "", failed: false };
+    const beginAttempt = (messageId?: string): void => {
+      current = { deltas: "", snapshot: "", failed: false, ...(messageId ? { messageId } : {}) };
+    };
     yield* Stream.runForEach(client.events, (frame) =>
       Effect.gen(function* () {
+        if (
+          frame.type === "message_start" &&
+          isRecord(frame.message) &&
+          frame.message.role === "assistant"
+        ) {
+          beginAttempt(messageIdOf(frame));
+        }
+        if (frame.type === "auto_retry_start") {
+          current.failed = true;
+          beginAttempt();
+        }
         const delta = textDelta(frame);
-        if (delta !== undefined) deltas += delta;
+        if (delta !== undefined) {
+          const messageId = messageIdOf(frame);
+          if (
+            current.failed ||
+            (messageId !== undefined &&
+              current.messageId !== undefined &&
+              messageId !== current.messageId)
+          ) {
+            beginAttempt(messageId);
+          } else if (messageId !== undefined && current.messageId === undefined) {
+            current.messageId = messageId;
+          }
+          current.deltas += delta;
+        }
         if (frame.type === "message_end") {
           const text = textFromMessage(frame.message);
-          if (text.length > 0) snapshot = text;
+          if (text.length > 0) current.snapshot = text;
+          if (isFailedAssistant(frame.message)) current.failed = true;
         }
         if (isTerminalAgentEnd(frame)) {
-          const text = textFromAgentEnd(frame);
-          if (text.length > 0) snapshot = text;
-          yield* Deferred.succeed(settled, deltas.trim().length > 0 ? deltas : snapshot).pipe(
-            Effect.ignore,
-          );
+          const authoritative = textFromAgentEnd(frame);
+          const sameAttempt = !current.failed ? current.snapshot || current.deltas : "";
+          yield* Deferred.succeed(
+            settled,
+            authoritative.length > 0 ? authoritative : sameAttempt,
+          ).pipe(Effect.ignore);
         }
       }),
     ).pipe(Effect.forkScoped);

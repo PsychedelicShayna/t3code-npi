@@ -14,6 +14,7 @@ import {
   resolveUsageLimitsAfterProbe,
 } from "../providerUsageLimits.ts";
 import { spawnAndCollect } from "../providerSnapshot.ts";
+import { NEOPI_ROLE_PICKER_GROUP } from "../neopi/NeoPiModelCatalog.ts";
 
 /** Managed-snapshot refresh is minutes; this only collapses a burst of probes. */
 const PROBE_CACHE_TTL_MS = 60_000;
@@ -205,7 +206,7 @@ export const applyUsageLimits = Effect.fn("applyNeoPiUsageLimits")(function* (
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const activeProvider = input.activeProvider.trim();
-  if (activeProvider === "") {
+  if (activeProvider === "" || activeProvider === NEOPI_ROLE_PICKER_GROUP) {
     return makeUnavailableUsageLimits({
       checkedAt,
       reason: "unsupported",

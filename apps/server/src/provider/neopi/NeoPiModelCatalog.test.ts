@@ -2,6 +2,7 @@ import { expect, it } from "vite-plus/test";
 import {
   neoPiRoleFromModelSlug,
   neoPiRolesFromRpc,
+  neoPiUsageProviderId,
   toServerProviderModels,
 } from "./NeoPiModelCatalog.ts";
 
@@ -104,6 +105,7 @@ it("adds visible RPC roles as a distinct picker group and selects the active rol
       name: "Fast",
       shortName: "SMOL",
       subProvider: "Roles",
+      quotaProvider: "openai",
       aliases: ["smol"],
       isCustom: false,
       isDefault: true,
@@ -118,6 +120,7 @@ it("adds visible RPC roles as a distinct picker group and selects the active rol
       name: "Luna",
       shortName: "gpt-5.6-luna",
       subProvider: "openai",
+      quotaProvider: "openai",
       isCustom: false,
       capabilities: {
         optionDescriptors: [
@@ -128,6 +131,32 @@ it("adds visible RPC roles as a distinct picker group and selects the active rol
   ]);
   expect(neoPiRoleFromModelSlug("@smol")).toBe("smol");
   expect(neoPiRoleFromModelSlug("openai/gpt-5.6-luna")).toBeUndefined();
+  expect(neoPiUsageProviderId(models)).toBe("openai");
+  expect(models[0]?.subProvider).toBe("Roles");
+});
+
+it("does not treat the role picker group as a usage provider", () => {
+  const unresolved = toServerProviderModels(
+    [{ provider: "openai", id: "gpt-5.6-luna", name: "Luna" }],
+    { provider: "openai", id: "gpt-5.6-luna" },
+    false,
+    neoPiRolesFromRpc({
+      roles: [
+        {
+          id: "smol",
+          alias: "@smol",
+          name: "Fast",
+          source: "builtin",
+          patterns: [],
+          hidden: false,
+        },
+      ],
+      activeRole: "smol",
+    }),
+  );
+  expect(unresolved[0]?.subProvider).toBe("Roles");
+  expect(unresolved[0]?.quotaProvider).toBeUndefined();
+  expect(neoPiUsageProviderId(unresolved)).toBe("");
 });
 
 it("rejects malformed role catalogs instead of exposing partial picker entries", () => {

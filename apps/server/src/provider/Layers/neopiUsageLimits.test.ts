@@ -364,6 +364,26 @@ describe("applyUsageLimits", () => {
     }),
   );
 
+  it.effect("does not probe the role picker label as a native provider", () =>
+    Effect.gen(function* () {
+      const commands: ChildProcess.StandardCommand[] = [];
+      const requested: string[] = [];
+      const result = yield* applyUsageLimits({
+        binary: "/bin/npi",
+        activeProvider: "Roles",
+        cwd: "/work",
+        getLiveUsage: (provider) =>
+          Effect.sync(() => {
+            requested.push(provider);
+            return { reports: [] };
+          }),
+      }).pipe(Effect.provide(scriptedSpawner(commands, () => handle({ code: 0, stdout: "{}" }))));
+      expect(commands).toHaveLength(0);
+      expect(requested).toEqual([]);
+      expect(result.unavailable?.reason).toBe("unsupported");
+    }),
+  );
+
   it.effect("times out as probeFailed and keeps the previous windows", () =>
     Effect.gen(function* () {
       clearNeoPiUsageProbeCache();

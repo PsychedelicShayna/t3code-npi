@@ -165,6 +165,31 @@ lines.on("line", (line) => {
 });
 `;
 
+const jsonText = (value: unknown): string => outputText(encodeJson(value));
+
+const streamingPeer = (frames: ReadonlyArray<unknown>): string => {
+  const body = frames.map((frame) => `await write(${JSON.stringify(frame)});`).join("\n      ");
+  return `
+import * as readline from "node:readline";
+const write = (frame) => new Promise((resolve) => process.stdout.write(JSON.stringify(frame) + "\\n", resolve));
+const ready = { type: "ready", protocolVersion: 1, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576, maxReassembledFrameBytes: 67108864, capabilities: ["rpc-ui"] };
+await write(ready);
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.type === "negotiate_protocol") {
+    void write({ id: message.id, type: "response", command: "negotiate_protocol", success: true, data: { protocolVersion: 2 } });
+  } else if (message.type === "prompt") {
+    void (async () => {
+      await write({ id: message.id, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
+      await write({ type: "agent_start" });
+      ${body}
+    })();
+  }
+});
+`;
+};
+
 const makeHarness = (
   options: HarnessOptions = {},
 ): Effect.Effect<Harness, never, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope> =>
@@ -354,6 +379,130 @@ it.live("fails invalid JSON as TextGenerationError and still removes the session
         }
         expect(captures).toHaveLength(1);
         expect(NodeFS.existsSync(captures[0]!.sessionDir)).toBe(false);
+      }),
+    ),
+  ),
+);
+
+it.live("keeps only the successful retry after a partial JSON draft fails", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const failed = jsonText({ title: "Partial draft", needsRefinement: true });
+        const succeeded = jsonText({ title: "Recovered title", needsRefinement: false });
+        const { textGeneration } = yield* makeHarness({
+          peerSource: streamingPeer([
+            { type: "message_start", message: { role: "assistant" }, messageId: "m1" },
+            {
+              type: "message_update",
+              messageId: "m1",
+              assistantMessageEvent: { type: "text_delta", delta: failed.slice(0, 12) },
+            },
+            {
+              type: "message_update",
+              messageId: "m1",
+              assistantMessageEvent: {
+                type: "error",
+                reason: "error",
+                error: { errorMessage: "retryable" },
+              },
+            },
+            { type: "auto_retry_start", attempt: 1 },
+            { type: "message_start", message: { role: "assistant" }, messageId: "m2" },
+            {
+              type: "message_update",
+              messageId: "m2",
+              assistantMessageEvent: { type: "text_delta", delta: succeeded },
+            },
+            {
+              type: "message_end",
+              messageId: "m2",
+              message: {
+                role: "assistant",
+                content: [{ type: "text", text: succeeded }],
+                stopReason: "stop",
+              },
+            },
+            {
+              type: "agent_end",
+              isTerminal: true,
+              messages: [
+                {
+                  role: "assistant",
+                  content: [{ type: "text", text: failed }],
+                  stopReason: "error",
+                  errorMessage: "retryable",
+                },
+                {
+                  role: "assistant",
+                  content: [{ type: "text", text: succeeded }],
+                  stopReason: "stop",
+                },
+              ],
+            },
+          ]),
+        });
+        const title = yield* textGeneration.generateThreadTitle({
+          cwd: process.cwd(),
+          message: "Generate a title",
+          modelSelection: TEST_MODEL,
+        });
+        expect(title.title).toBe("Recovered title");
+      }),
+    ),
+  ),
+);
+
+it.live("uses the last complete answer when the model corrects itself", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const first = jsonText({ title: "First complete title", needsRefinement: false });
+        const second = jsonText({ title: "Corrected final title", needsRefinement: false });
+        const { textGeneration } = yield* makeHarness({
+          peerSource: streamingPeer([
+            { type: "message_start", message: { role: "assistant" }, messageId: "m1" },
+            {
+              type: "message_update",
+              messageId: "m1",
+              assistantMessageEvent: { type: "text_delta", delta: first },
+            },
+            {
+              type: "message_end",
+              messageId: "m1",
+              message: { role: "assistant", content: [{ type: "text", text: first }] },
+            },
+            { type: "message_start", message: { role: "assistant" }, messageId: "m2" },
+            {
+              type: "message_update",
+              messageId: "m2",
+              assistantMessageEvent: { type: "text_delta", delta: second },
+            },
+            {
+              type: "message_end",
+              messageId: "m2",
+              message: { role: "assistant", content: [{ type: "text", text: second }] },
+            },
+            {
+              type: "agent_end",
+              isTerminal: true,
+              messages: [
+                { role: "assistant", content: [{ type: "text", text: first }], stopReason: "stop" },
+                {
+                  role: "assistant",
+                  content: [{ type: "text", text: second }],
+                  stopReason: "stop",
+                },
+              ],
+            },
+          ]),
+        });
+        const title = yield* textGeneration.generateThreadTitle({
+          cwd: process.cwd(),
+          message: "Generate a title",
+          modelSelection: TEST_MODEL,
+        });
+        expect(title.title).toBe("Corrected final title");
       }),
     ),
   ),
