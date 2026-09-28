@@ -70,6 +70,7 @@ describe("NeoPi launch plan", () => {
           "--yolo",
           "--auto-approve",
           "--no-session",
+          "--new-session",
         ]) {
           const result = yield* buildNeoPiLaunchPlan({
             ...input,
@@ -91,6 +92,28 @@ describe("NeoPi launch plan", () => {
       assert.equal(isolated.env.OMP_PROFILE, process.env.OMP_PROFILE);
       assert.ok(isolated.args.includes("--session-dir"));
       assert.ok(!isolated.args.includes("--new-session"));
+    }),
+  );
+  it.effect("requires both cooperating capabilities and retains saved isolated cursors", () =>
+    Effect.gen(function* () {
+      const shared = yield* buildNeoPiLaunchPlan({ ...input, sharedSession: true });
+      assert.ok(shared.args.includes("--new-session"));
+      assert.ok(!shared.args.includes("--session-dir"));
+      assert.equal(shared.sessionDir, "");
+      const resumed = yield* buildNeoPiLaunchPlan({
+        ...input,
+        sharedSession: true,
+        cursor: {
+          v: 1,
+          sessionFile: "/tmp/t3home/neopi/sessions/work/project-1/old.jsonl",
+          sessionDir: "/tmp/t3home/neopi/sessions/work/project-1",
+          sessionId: "old",
+          turnBoundaries: [],
+        },
+      });
+      assert.ok(!resumed.args.includes("--new-session"));
+      assert.ok(resumed.args.includes("--session-dir"));
+      assert.equal(resumed.identity.kind, "resume");
     }),
   );
   it.effect(

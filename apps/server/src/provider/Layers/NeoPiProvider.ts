@@ -1,6 +1,6 @@
 import type { NeoPiSettings, ServerProvider, ServerProviderModel } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
-import type { SpawnFn } from "effect-neopi-rpc/client";
+import type { NeoPiRpcClient, SpawnFn } from "effect-neopi-rpc/client";
 import { make as makeClient } from "effect-neopi-rpc/client";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -19,8 +19,8 @@ import {
 import { providerModelsFromSettings } from "../providerSnapshot.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
 import type { NeoPiDiscoveryProbe } from "../neopi/NeoPiDiscoveryProbe.ts";
-import { neopiCompatibility } from "../neopi/NeoPiCompatibility.ts";
-import { toServerProviderModels } from "../neopi/NeoPiModelCatalog.ts";
+import { NEOPI_CAPABILITIES, neopiCompatibility } from "../neopi/NeoPiCompatibility.ts";
+import { neoPiRolesFromRpc, toServerProviderModels } from "../neopi/NeoPiModelCatalog.ts";
 
 const PRESENTATION = {
   displayName: "NeoPi/OMP",
@@ -47,10 +47,15 @@ const fromProbe = (
     message?: string;
     models?: ReadonlyArray<ServerProviderModel>;
     compatibilityAdvisory?: ReturnType<typeof neopiCompatibility>;
+    showInteractionModeToggle?: boolean;
   },
 ): ServerProviderDraft => ({
   ...buildServerProvider({
-    presentation: { ...PRESENTATION, reportsContextWindow: input.status === "ready" },
+    presentation: {
+      ...PRESENTATION,
+      showInteractionModeToggle: input.showInteractionModeToggle === true,
+      reportsContextWindow: input.status === "ready",
+    },
     enabled: settings.enabled,
     checkedAt,
     models: input.models ?? fallbackModels(settings),
@@ -100,6 +105,7 @@ export function modelsFromNeoPiRpc(
   data: unknown,
   current?: unknown,
   fastModeEnabled = false,
+  roles?: unknown,
 ): ReadonlyArray<ServerProviderModel> {
   if (
     typeof data !== "object" ||
@@ -108,7 +114,20 @@ export function modelsFromNeoPiRpc(
     !Array.isArray(data.models)
   )
     return [];
-  return toServerProviderModels(data.models, current, fastModeEnabled);
+  return toServerProviderModels(data.models, current, fastModeEnabled, neoPiRolesFromRpc(roles));
+}
+
+export function requestNeoPiProviderMetadata(
+  client: Pick<NeoPiRpcClient, "capabilities" | "request">,
+) {
+  return Effect.all({
+    login: client.request({ type: "get_login_providers" }),
+    models: client.request({ type: "get_available_models" }),
+    state: client.request({ type: "get_state" }),
+    roles: client.capabilities.has(NEOPI_CAPABILITIES.getRoles)
+      ? client.request({ type: "get_roles" })
+      : Effect.succeed(undefined),
+  });
 }
 
 export const resolveNeoPiBinary = Effect.fn("resolveNeoPiBinary")(function* (
@@ -180,7 +199,9 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
   cwd: string,
   spawn: SpawnFn,
   hub: NeoPiDiscoveryHub,
+  sharedSessionCapabilities?: Set<string>,
 ): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
+  sharedSessionCapabilities?.clear();
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   if (!settings.enabled)
     return fromProbe(settings, checkedAt, { installed: false, status: "warning" });
@@ -219,13 +240,20 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
       });
       const compatibility = neopiCompatibility(client.ready, client.capabilities.has("v2"));
       if (compatibility.status === "unsupported")
-        return { login: null, models: null, state: null, compatibility };
-      const [login, models, state] = yield* Effect.all([
-        client.request({ type: "get_login_providers" }),
-        client.request({ type: "get_available_models" }),
-        client.request({ type: "get_state" }),
-      ]);
-      return { login, models, state, compatibility };
+        return {
+          login: null,
+          models: null,
+          roles: undefined,
+          state: null,
+          compatibility,
+          readyCapabilities: [],
+        };
+      const metadata = yield* requestNeoPiProviderMetadata(client);
+      return {
+        ...metadata,
+        compatibility,
+        readyCapabilities: client.ready.capabilities ?? [],
+      };
     }),
   ).pipe(Effect.timeoutOption("20 seconds"), Effect.result);
   if (Result.isFailure(metadata) || Option.isNone(metadata.success))
@@ -235,7 +263,8 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
       status: "warning",
       message: "NeoPi/OMP RPC metadata probe failed; check the CLI and profile.",
     });
-  const { login, models, state, compatibility } = metadata.success.value;
+  const { login, models, roles, state, compatibility, readyCapabilities } = metadata.success.value;
+  for (const capability of readyCapabilities) sharedSessionCapabilities?.add(capability);
   const current =
     typeof state === "object" && state !== null && "model" in state ? state.model : undefined;
   const currentProvider =
@@ -251,7 +280,7 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
     state !== null &&
     "fastModeEnabled" in state &&
     state.fastModeEnabled === true;
-  const available = modelsFromNeoPiRpc(models, current, fastModeEnabled);
+  const available = modelsFromNeoPiRpc(models, current, fastModeEnabled, roles);
   const missingCurrent = available.some((model) => model.isCustom);
   const snapshot = fromProbe(settings, checkedAt, {
     installed: true,
@@ -266,6 +295,7 @@ export const checkNeoPiProviderStatus = Effect.fn("checkNeoPiProviderStatus")(fu
       : {}),
     compatibilityAdvisory: compatibility,
     auth,
+    showInteractionModeToggle: readyCapabilities.includes(NEOPI_CAPABILITIES.setMode),
     models: providerModelsFromSettings(
       available,
       settings.customModels ?? [],

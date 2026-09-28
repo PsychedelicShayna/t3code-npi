@@ -78,6 +78,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         continuationGroupKey: continuationIdentity.continuationKey,
       });
       const discovery = yield* makeNeoPiDiscoveryHub();
+      const sharedSessionCapabilities = new Set<string>();
       const resolved = enabled
         ? yield* resolveNeoPiBinary(effectiveConfig, env, serverConfig.cwd).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -101,6 +102,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         environment: env,
         spawn: spawner.spawn,
         discovery,
+        sharedSessionCapabilities,
         makeHostBridge: makeNeoPiHostToolBridge,
       });
       const textGeneration = makeNeoPiTextGeneration({
@@ -129,6 +131,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
           serverConfig.cwd,
           spawner.spawn,
           discovery,
+          sharedSessionCapabilities,
         ).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.map(stamp),
@@ -146,6 +149,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
               profile: config.profile,
               cwd: serverConfig.cwd,
               environment: env,
+              getLiveUsage: adapter.getLiveUsage,
               ...(previous ? { previous } : {}),
             }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner));
             yield* publishSnapshot({ ...probed, usageLimits });

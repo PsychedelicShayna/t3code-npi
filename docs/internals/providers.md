@@ -105,12 +105,22 @@ mode is selected at process launch; changing modes requires restart and resume,
 not a fictitious mid-session RPC setter. A rollback `branch` creates a new native
 session file and its new cursor must be saved before T3 reports completion.
 
-NeoPi session files live under the T3 home, isolated from the normal NeoPi/OMP
-session picker. Sharing the CLI's session directory requires a cooperating
-session lease (#106) and an explicit fresh-session flag (#107); merely advertising
-one capability must not enable sharing. A profile sets `OMP_PROFILE` independently
-for each provider instance. Provider probes do not create shared user sessions,
-and OAuth login metadata does not establish API-key or local-model access.
+NeoPi fresh session files use the CLI's normal directory only when the compatible
+peer advertises both `session_lease` (#106) and `new_session` (#107); T3 launches
+those sessions with `--new-session`. Otherwise live files stay under the T3 home,
+isolated from the NeoPi/OMP picker. Previously isolated threads resume from their
+saved files even after sharing becomes available. A profile sets `OMP_PROFILE`
+independently for each provider instance. Provider probes do not create shared
+user sessions, and OAuth login metadata does not establish API-key or local-model
+access.
+
+With `set_mode` (#103), a proposed plan settles the visible T3 turn while the
+native proposal request waits for a decision. Implementing in the same thread
+approves it; refinement feedback or interruption rejects it. **Implement in new
+thread** starts another session and cannot decide the proposal in the original
+one: that original request remains pending until its next send, interruption,
+or session stop, which resolves it as a refinement. Rollback cannot remove just
+the refinement continuation without also removing its original native turn.
 
 ## Attachments and stored history
 

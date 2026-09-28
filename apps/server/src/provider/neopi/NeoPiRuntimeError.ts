@@ -10,6 +10,7 @@ export class NeoPiRuntimeError extends Data.TaggedError("NeoPiRuntimeError")<{
     | "spawn"
     | "rpc"
     | "startup"
+    | "session_in_use"
     | "runtime_mode_deferred"
     | "closed";
   readonly message: string;

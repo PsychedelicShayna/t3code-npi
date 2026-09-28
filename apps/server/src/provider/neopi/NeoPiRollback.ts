@@ -27,6 +27,10 @@ export async function rollbackNeoPiConversation(input: {
   const target = removed.find(
     (turn): turn is Extract<typeof turn, { userEntryId: string }> => "userEntryId" in turn,
   );
+  if (!target && removed.some((turn) => "kind" in turn && turn.kind === "continuation"))
+    throw new NeoPiRollbackError(
+      "rollback unavailable for a plan refinement without its original native turn",
+    );
   if (!target) return { ...cursor, turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns) };
   const { entries, leafId } = object(await request({ type: "get_entries" }));
   if (!Array.isArray(entries) || !(typeof leafId === "string" || leafId === null))
@@ -151,6 +155,14 @@ export function groupNeoPiHistory(
       "userEntryId" in boundary ? [[boundary.userEntryId, boundary.turnId] as const] : [],
     ),
   );
+  for (const boundary of cursor.turnBoundaries) {
+    if (!("kind" in boundary) || boundary.kind !== "continuation") continue;
+    const preceding = ancestry.findIndex((entry) => entry.id === boundary.afterEntryId);
+    if (preceding < 0)
+      throw new NeoPiRollbackError("NeoPi/OMP plan refinement boundary left the active ancestry");
+    const next = ancestry[preceding + 1];
+    if (next && typeof next.id === "string") boundaries.set(next.id, boundary.turnId);
+  }
   const turns: Array<{ id: TurnId; items: unknown[] }> = [];
   let messageIndex = 0;
   for (const entry of ancestry) {

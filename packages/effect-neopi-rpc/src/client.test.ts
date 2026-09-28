@@ -138,7 +138,15 @@ const scriptedPeer = Effect.fn("scriptedPeer")(function* (input: {
     unref: Effect.succeed(Effect.void),
   });
 
-  return { handle, emit, finish, endStdout: Queue.end(stdout), signals, stdin: captured };
+  return {
+    handle,
+    emit,
+    finish,
+    endStdout: Queue.end(stdout),
+    writeStderr: (text: string) => Queue.offer(stderr, encoder.encode(text)).pipe(Effect.asVoid),
+    signals,
+    stdin: captured,
+  };
 });
 
 const makeClient = (
@@ -665,6 +673,30 @@ it.live("fails ready immediately when the peer exits without sending a ready fra
         }),
       );
       assert.equal(error.code, "exited");
+    }),
+  ),
+);
+
+it.live("surfaces a leased-session startup failure with its file and owner", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({ onLine: () => Effect.void });
+      yield* peer.writeStderr(
+        '{"type":"startup_error","code":"session_in_use","pid":42,"sessionFile":"/tmp/busy.jsonl"}\n',
+      );
+      yield* peer.finish({ code: 1, signal: null });
+      const error = yield* Effect.flip(
+        Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui", "--session", "/tmp/busy.jsonl"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 2_000,
+        }),
+      );
+      assert.equal(error.code, "session_in_use");
+      assert.match(error.message, /already in use.*busy\.jsonl.*PID 42/);
     }),
   ),
 );

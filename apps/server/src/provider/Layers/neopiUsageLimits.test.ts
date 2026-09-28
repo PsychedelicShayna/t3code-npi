@@ -225,6 +225,62 @@ describe("toUsageLimits", () => {
 });
 
 describe("applyUsageLimits", () => {
+  it.effect("uses a capable live session report without spawning the CLI fallback", () =>
+    Effect.gen(function* () {
+      clearNeoPiUsageProbeCache();
+      const commands: ChildProcess.StandardCommand[] = [];
+      const requestedProviders: string[] = [];
+      const result = yield* applyUsageLimits({
+        binary: "/bin/npi",
+        activeProvider: "openai-codex",
+        cwd: "/work",
+        previous,
+        getLiveUsage: (activeProvider) =>
+          Effect.sync(() => {
+            requestedProviders.push(activeProvider);
+            return payload([codexReport]);
+          }),
+      }).pipe(
+        Effect.provide(
+          scriptedSpawner(commands, () => handle({ code: 1, stdout: "must not spawn" })),
+        ),
+      );
+
+      expect(requestedProviders).toEqual(["openai-codex"]);
+      expect(commands).toHaveLength(0);
+      expect(result.windows).toEqual([
+        expect.objectContaining({
+          id: "neopi:openai-codex:openai-codex:primary",
+          usedPercent: 5,
+        }),
+      ]);
+      expect(containsText(result, secret)).toBe(false);
+    }),
+  );
+  it.effect("rejects a malformed live report without leaking into the CLI fallback", () =>
+    Effect.gen(function* () {
+      const commands: ChildProcess.StandardCommand[] = [];
+      const result = yield* applyUsageLimits({
+        binary: "/bin/npi",
+        activeProvider: "openai-codex",
+        cwd: "/work",
+        previous,
+        getLiveUsage: () =>
+          Effect.succeed({
+            generatedAt: resetsAt,
+            reports: [{ provider: "openai-codex", limits: [{ id: 42 }] }],
+          }),
+      }).pipe(
+        Effect.provide(
+          scriptedSpawner(commands, () => handle({ code: 0, stdout: JSON.stringify(payload([])) })),
+        ),
+      );
+
+      expect(commands).toHaveLength(0);
+      expect(result).toBe(previous);
+    }),
+  );
+
   it.effect("probes the active provider and keeps previous windows when the command fails", () =>
     Effect.gen(function* () {
       clearNeoPiUsageProbeCache();
@@ -242,6 +298,7 @@ describe("applyUsageLimits", () => {
         cwd: "/work",
         environment: { PATH: "/usr/bin" },
         previous,
+        getLiveUsage: () => Effect.succeed(undefined),
       }).pipe(Effect.provide(spawner));
       expect(commands[0]?.args).toEqual([
         "usage",

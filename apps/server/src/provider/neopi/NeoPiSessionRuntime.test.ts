@@ -21,7 +21,7 @@ import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { makeNeoPiSessionRuntime, type NeoPiRuntimeInput } from "./NeoPiSessionRuntime.ts";
 import type { NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
 import { makeNeoPiAdapter } from "../Layers/NeoPiAdapter.ts";
@@ -122,6 +122,7 @@ const make = (
   spawn: NeoPiRuntimeInput["spawn"],
   cursor?: { sessionId: string; sessionFile: string; sessionDir: string; v: 1; turnBoundaries: [] },
   hostBridge?: NeoPiRuntimeInput["hostBridge"],
+  sharedSessionCapabilities?: ReadonlySet<string>,
 ) =>
   makeNeoPiSessionRuntime({
     threadId: "thread-test" as ThreadId,
@@ -133,6 +134,7 @@ const make = (
     spawn,
     ...(cursor ? { cursor } : {}),
     ...(hostBridge ? { hostBridge } : {}),
+    ...(sharedSessionCapabilities ? { sharedSessionCapabilities } : {}),
     closeGraceMs: 20,
   });
 const turn = (id: string) => ({ turnId: id as TurnId, text: "hello", images: [] });
@@ -157,6 +159,236 @@ const awaitOutcomes = (frames: Array<Record<string, unknown>>, count: number) =>
       `Expected ${count} outcomes, observed ${frames.filter((frame) => frame.type === "t3.turn.outcome").length}`,
     );
   });
+
+it.live("uses shared files only with both lease and fresh-session capabilities", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const advertised of [
+        [],
+        ["session_lease"],
+        ["new_session"],
+        ["session_lease", "new_session"],
+      ]) {
+        const shared = advertised.length === 2;
+        const file = shared ? "/tmp/omp-sessions/session.jsonl" : sessionFile;
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            cmd.type === "negotiate_protocol"
+              ? answer(cmd, emit, { protocolVersion: 2 })
+              : cmd.type === "get_state"
+                ? answer(cmd, emit, { sessionId: "s1", sessionFile: file, messageCount: 0 })
+                : basicHandler(cmd, emit),
+          { ...defaultReady, capabilities: ["rpc-ui", ...advertised] },
+        );
+        const launches: ReadonlyArray<string>[] = [];
+        const runtime = yield* make(
+          (command) =>
+            Effect.sync(() => {
+              if (!ChildProcess.isStandardCommand(command))
+                throw new Error("Expected a standard NeoPi command");
+              launches.push(command.args);
+              return peer.handle;
+            }),
+          undefined,
+          undefined,
+          new Set(advertised),
+        );
+        yield* runtime.start;
+        NodeAssert.equal(launches[0]?.includes("--new-session"), shared);
+        NodeAssert.equal(launches[0]?.includes("--session-dir"), !shared);
+        NodeAssert.equal(
+          (yield* SubscriptionRef.get(runtime.cursor)).sessionDir,
+          shared ? "/tmp/omp-sessions" : sessionDir,
+        );
+        yield* runtime.stop;
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("routes role aliases through set_role only when get_roles is advertised", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const advertiseRole of [false, true]) {
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            cmd.type === "negotiate_protocol"
+              ? answer(cmd, emit, { protocolVersion: 2 })
+              : basicHandler(cmd, emit),
+          {
+            ...defaultReady,
+            capabilities: advertiseRole ? ["rpc-ui", "get_roles"] : ["rpc-ui"],
+          },
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        yield* runtime.start;
+        yield* runtime.applyModelSelection({
+          instanceId: ProviderInstanceId.make("neopi"),
+          model: "@smol",
+        });
+        NodeAssert.deepEqual(
+          peer.commands
+            .filter((command) => command.type === "set_role")
+            .map(({ id: _, ...command }) => command),
+          advertiseRole ? [{ type: "set_role", role: "smol" }] : [],
+        );
+        yield* runtime.stop;
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("holds a plan proposal until refine feedback continues a new T3 turn", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let promptStarted = false;
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_entries")
+              return yield* answer(
+                cmd,
+                emit,
+                promptStarted
+                  ? {
+                      entries: [
+                        {
+                          id: "native-user",
+                          type: "message",
+                          parentId: null,
+                          message: { role: "user", content: [{ type: "text", text: "plan this" }] },
+                        },
+                        {
+                          id: "proposal-tool",
+                          type: "message",
+                          parentId: "native-user",
+                          message: {
+                            role: "assistant",
+                            content: [{ type: "text", text: "# Plan" }],
+                          },
+                        },
+                      ],
+                      leafId: "proposal-tool",
+                    }
+                  : { entries: [], leafId: null },
+              );
+            if (cmd.type === "prompt") {
+              promptStarted = true;
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({
+                type: "plan_proposal_request",
+                id: "proposal-1",
+                title: "Plan",
+                planFilePath: "xd://plan/test",
+                planMarkdown: "# Plan",
+              });
+              return;
+            }
+            if (cmd.type === "plan_proposal_response") {
+              yield* emit({
+                type: "agent_end",
+                isTerminal: true,
+                messages: [{ role: "assistant", stopReason: "stop" }],
+              });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn({ ...turn("source"), text: "plan this" });
+      yield* awaitOutcomes(frames, 1);
+      NodeAssert.equal(
+        peer.commands.some((cmd) => cmd.type === "plan_proposal_response"),
+        false,
+      );
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+        { turnId: "source", userEntryId: "native-user" },
+      ]);
+      yield* runtime.resolvePlanProposal(
+        { decision: "refine", feedback: "Please simplify step two" },
+        { ...turn("refine"), text: "Please simplify step two" },
+      );
+      yield* awaitOutcomes(frames, 2);
+      NodeAssert.deepEqual(
+        peer.commands
+          .filter((cmd) => cmd.type === "plan_proposal_response")
+          .map(({ type, id, decision, feedback }) => ({ type, id, decision, feedback })),
+        [
+          {
+            type: "plan_proposal_response",
+            id: "proposal-1",
+            decision: "refine",
+            feedback: "Please simplify step two",
+          },
+        ],
+      );
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+        { turnId: "source", userEntryId: "native-user" },
+        { turnId: "refine", kind: "continuation", afterEntryId: "proposal-tool" },
+      ]);
+      NodeAssert.equal(
+        frames.some((frame) => frame.type === "t3.turn.outcome" && frame.turnId === "refine"),
+        true,
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("interrupting a pending plan proposal refuses it without approval", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "prompt") {
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({
+                type: "plan_proposal_request",
+                id: "pending-plan",
+                planMarkdown: "# Plan",
+              });
+              return;
+            }
+            if (cmd.type === "abort") {
+              yield* answer(cmd, emit);
+              yield* emit({ type: "agent_end", isTerminal: true });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn({ ...turn("source"), text: "plan this" });
+      yield* awaitOutcomes(frames, 1);
+      yield* runtime.interrupt;
+      NodeAssert.deepEqual(
+        peer.commands
+          .filter((cmd) => cmd.type === "plan_proposal_response")
+          .map(({ type, id, decision }) => ({ type, id, decision })),
+        [{ type: "plan_proposal_response", id: "pending-plan", decision: "refine" }],
+      );
+      NodeAssert.equal(
+        peer.commands.some((cmd) => cmd.type === "abort"),
+        true,
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.live("rejects a v1-only peer during live session admission", () =>
   Effect.scoped(

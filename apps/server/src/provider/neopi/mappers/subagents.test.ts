@@ -429,6 +429,7 @@ effectIt.live("child subagent text does not enter the parent message through ing
             steer: () => Effect.void,
             interrupt: SubscriptionRef.set(state, "ready"),
             compact: () => Effect.void,
+            resolvePlanProposal: () => Effect.void,
             respondUi: () => Effect.void,
             writeFrame: () => Effect.void,
             request: () => Effect.succeed({ messages: [] }),

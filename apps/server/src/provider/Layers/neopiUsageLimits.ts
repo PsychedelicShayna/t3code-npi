@@ -19,6 +19,58 @@ import { spawnAndCollect } from "../providerSnapshot.ts";
 const PROBE_CACHE_TTL_MS = 60_000;
 const DEFAULT_PROBE_TIMEOUT = "20 seconds";
 
+const UsageAmountSchema = Schema.Struct({
+  used: Schema.optional(Schema.Number),
+  limit: Schema.optional(Schema.Number),
+  remaining: Schema.optional(Schema.Number),
+  usedFraction: Schema.optional(Schema.Number),
+  remainingFraction: Schema.optional(Schema.Number),
+  unit: Schema.optional(Schema.String),
+});
+
+const UsageWindowSchema = Schema.Struct({
+  id: Schema.String,
+  label: Schema.optional(Schema.String),
+  durationMs: Schema.optional(Schema.Number),
+  resetsAt: Schema.optional(Schema.Number),
+});
+
+const UsageLimitSchema = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+  scope: Schema.optional(Schema.Unknown),
+  window: Schema.optional(UsageWindowSchema),
+  amount: UsageAmountSchema,
+  status: Schema.optional(Schema.Unknown),
+  notes: Schema.optional(Schema.Array(Schema.String)),
+});
+
+const ResetCreditSchema = Schema.Struct({
+  id: Schema.String,
+  expiresAt: Schema.optional(Schema.String),
+});
+
+const UsageReportSchema = Schema.Struct({
+  provider: Schema.String,
+  fetchedAt: Schema.optional(Schema.Number),
+  limits: Schema.Array(UsageLimitSchema),
+  resetCredits: Schema.optional(
+    Schema.Struct({
+      availableCount: Schema.Number,
+      nextCreditId: Schema.optional(Schema.String),
+      credits: Schema.optional(Schema.Array(ResetCreditSchema)),
+    }),
+  ),
+  notes: Schema.optional(Schema.Array(Schema.String)),
+});
+
+const UsageResponseSchema = Schema.Struct({
+  generatedAt: Schema.Number,
+  reports: Schema.Array(UsageReportSchema),
+});
+
+const decodeUsageResponse = Schema.decodeUnknownOption(UsageResponseSchema);
+
 interface CachedProbe {
   readonly atMs: number;
   readonly limits: ServerProviderUsageLimits;
@@ -130,12 +182,23 @@ export interface ApplyNeoPiUsageLimitsInput {
   /** Kept when the probe fails or times out. An unsupported provider replaces it. */
   readonly previous?: ServerProviderUsageLimits;
   readonly timeout?: Duration.Input;
+  /**
+   * Reads usage from a ready live session when one advertises `get_usage`.
+   * `undefined` means no capable live session exists and permits the CLI fallback.
+   */
+  readonly getLiveUsage?: (activeProvider: string) => Effect.Effect<unknown | undefined, Error>;
 }
 
+type LiveUsageResult =
+  | { readonly kind: "failed" }
+  | { readonly kind: "unavailable" }
+  | { readonly kind: "available"; readonly payload: unknown };
+
 /**
- * Probe `<bin> usage --json --redact --provider <activeProvider>` and fold the
- * result into `previous`. Failures keep the last good windows. Successful and
- * unsupported results are cached for one minute.
+ * Read the active provider's usage from a capable live RPC session. When no
+ * such session exists, probe `<bin> usage --json --redact --provider
+ * <activeProvider>`. Failures keep the last good windows. Successful and
+ * unsupported CLI results are cached for one minute.
  */
 export const applyUsageLimits = Effect.fn("applyNeoPiUsageLimits")(function* (
   input: ApplyNeoPiUsageLimitsInput,
@@ -148,6 +211,37 @@ export const applyUsageLimits = Effect.fn("applyNeoPiUsageLimits")(function* (
       reason: "unsupported",
       message: "NeoPi/OMP usage windows need the active model's provider.",
     });
+  }
+
+  if (input.getLiveUsage !== undefined) {
+    const live: LiveUsageResult = yield* input.getLiveUsage(activeProvider).pipe(
+      Effect.match({
+        onFailure: (): LiveUsageResult => ({ kind: "failed" }),
+        onSuccess: (payload): LiveUsageResult =>
+          payload === undefined ? { kind: "unavailable" } : { kind: "available", payload },
+      }),
+    );
+    if (live.kind === "failed") {
+      const failed = makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message: "NeoPi/OMP usage request failed.",
+      });
+      return resolveUsageLimitsAfterProbe({ published: input.previous, probed: failed }) ?? failed;
+    }
+    if (live.kind === "available") {
+      const decoded = decodeUsageResponse(live.payload);
+      const mapped = Option.isSome(decoded)
+        ? toUsageLimits({ payload: decoded.value, activeProvider, checkedAt })
+        : undefined;
+      const failed = makeUnavailableUsageLimits({
+        checkedAt,
+        reason: "probeFailed",
+        message: "NeoPi/OMP usage request returned an invalid report.",
+      });
+      const probed = mapped ?? failed;
+      return resolveUsageLimitsAfterProbe({ published: input.previous, probed }) ?? probed;
+    }
   }
 
   const environmentHash = createHash("sha256");

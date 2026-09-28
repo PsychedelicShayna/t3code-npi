@@ -4,6 +4,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import type * as PlatformError from "effect/PlatformError";
 import { ChildProcess, type ChildProcessSpawner } from "effect/unstable/process";
@@ -150,6 +151,30 @@ const unsupportedUriResult = (id: string): HostUriResultWire => ({
   error: "unsupported",
 });
 
+const decodeStartupError = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("startup_error"),
+      code: Schema.Literal("session_in_use"),
+      pid: Schema.optional(Schema.Number),
+      sessionFile: Schema.optional(Schema.String),
+    }),
+  ),
+);
+const startupError = (tail: string): NeoPiRpcError | undefined => {
+  for (const line of tail.split("\n")) {
+    try {
+      const value = decodeStartupError(line);
+      return new NeoPiRpcError({
+        code: value.code,
+        message: `NeoPi/OMP session is already in use${value.sessionFile ? `: ${value.sessionFile}` : ""}${value.pid !== undefined ? ` (PID ${value.pid})` : ""}`,
+      });
+    } catch {
+      // Stderr can also contain diagnostics unrelated to startup.
+    }
+  }
+  return undefined;
+};
 export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* (
   options: NeoPiRpcClientOptions,
 ) {
@@ -538,18 +563,20 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       ),
     ),
     Effect.andThen(
-      Deferred.isDone(readyDeferred).pipe(
-        Effect.flatMap((done) =>
-          done
-            ? Effect.void
-            : abortTransport(
-                new NeoPiRpcError({
-                  code: "exited",
-                  message: "NeoPi/OMP stdout ended before the ready frame",
-                }),
-              ),
-        ),
-      ),
+      Effect.gen(function* () {
+        if (yield* Deferred.isDone(readyDeferred)) return;
+        // A startup_error on stderr can arrive just after stdout closes.
+        // A still-running peer with closed stdout must nevertheless fail promptly.
+        yield* Deferred.await(stderrDone).pipe(Effect.timeoutOption("100 millis"));
+        if (!(yield* Deferred.isDone(readyDeferred)))
+          yield* abortTransport(
+            startupError(stderrTailText(stderrTail)) ??
+              new NeoPiRpcError({
+                code: "exited",
+                message: "NeoPi/OMP stdout ended before the ready frame",
+              }),
+          );
+      }),
     ),
     Effect.ensuring(Deferred.succeed(stdoutDone, undefined).pipe(Effect.ignore)),
     Effect.forkScoped,
@@ -594,15 +621,19 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   yield* readExit.pipe(
     Effect.flatMap((status) =>
       Effect.gen(function* () {
-        if (!(yield* Deferred.isDone(readyDeferred))) {
-          yield* Deferred.fail(
-            readyDeferred,
-            new NeoPiRpcError({ code: "exited", message: "NeoPi/OMP process exited before ready" }),
-          ).pipe(Effect.ignore);
-        }
         yield* Effect.all([Deferred.await(stdoutDone), Deferred.await(stderrDone)], {
           concurrency: "unbounded",
         });
+        if (!(yield* Deferred.isDone(readyDeferred))) {
+          yield* Deferred.fail(
+            readyDeferred,
+            startupError(stderrTailText(stderrTail)) ??
+              new NeoPiRpcError({
+                code: "exited",
+                message: "NeoPi/OMP process exited before ready",
+              }),
+          ).pipe(Effect.ignore);
+        }
         if (fatal) {
           yield* failPending(fatal);
         } else if (!closed) {

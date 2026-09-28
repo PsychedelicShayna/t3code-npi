@@ -96,6 +96,85 @@ export interface NeoPiChatModeState {
   readonly chatMode?: NeoPiChatMode;
 }
 
+export type NeoPiInteractionMode = "default" | "plan";
+
+export interface SetModeCommand {
+  readonly type: "set_mode";
+  readonly mode: NeoPiInteractionMode;
+  readonly planFilePath?: string;
+}
+
+export interface SetModeResult {
+  readonly mode: NeoPiInteractionMode;
+  readonly planFilePath?: string;
+}
+
+export interface ModeChangedFrame {
+  readonly type: "mode_changed";
+  readonly mode: NeoPiInteractionMode;
+  readonly planFilePath?: string;
+}
+
+export interface NeoPiModeState {
+  readonly mode?: NeoPiInteractionMode;
+  readonly planMode?: {
+    readonly planFilePath: string;
+    readonly workflow: string;
+  };
+}
+
+export interface PlanProposalRequestFrame {
+  readonly type: "plan_proposal_request";
+  readonly id: string;
+  readonly title: string;
+  readonly planFilePath: string;
+  readonly planMarkdown: string;
+}
+
+export interface PlanProposalResponseFrame {
+  readonly type: "plan_proposal_response";
+  readonly id: string;
+  readonly decision: "approve" | "refine";
+  readonly feedback?: string;
+}
+
+export interface NeoPiRole {
+  readonly id: string;
+  readonly alias: string;
+  readonly name: string;
+  readonly tag?: string;
+  readonly section?: string;
+  readonly source: "builtin" | "configured";
+  readonly configured?: string;
+  readonly patterns: ReadonlyArray<string>;
+  readonly resolved?: {
+    readonly provider: string;
+    readonly modelId: string;
+    readonly thinkingLevel?: string;
+  };
+  readonly hidden: boolean;
+}
+
+export interface GetRolesResult {
+  readonly roles: ReadonlyArray<NeoPiRole>;
+  readonly activeRole?: string;
+}
+
+export interface SetRoleCommand {
+  readonly type: "set_role";
+  readonly role: string;
+}
+
+export interface SetRoleResult {
+  readonly role: string;
+  readonly model: unknown;
+  readonly thinkingLevel?: string;
+}
+
+export interface NeoPiRoleState {
+  readonly activeRole?: string;
+}
+
 export type Frame =
   | ReadyFrame
   | ResponseFrame
@@ -103,6 +182,8 @@ export type Frame =
   | HostToolCallFrame
   | HostToolCancelFrame
   | HostUriRequestFrame
+  | ModeChangedFrame
+  | PlanProposalRequestFrame
   | SessionEventFrame;
 
 export interface PromptImage {

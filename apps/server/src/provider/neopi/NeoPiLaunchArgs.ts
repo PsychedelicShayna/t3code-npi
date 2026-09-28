@@ -17,6 +17,8 @@ export interface NeoPiLaunchInput {
   readonly launchArgs?: string;
   readonly runtimeMode: RuntimeMode;
   readonly cursor?: NeoPiResumeCursor;
+  /** Both session_lease and new_session were advertised by a preflight RPC peer. */
+  readonly sharedSession?: boolean;
 }
 
 const approvalModes: Record<RuntimeMode, string> = {
@@ -40,6 +42,7 @@ const protectedFlags = new Set([
   "--yolo",
   "--auto-approve",
   "--no-session",
+  "--new-session",
 ]);
 
 export const buildNeoPiLaunchPlan = (
@@ -58,23 +61,20 @@ export const buildNeoPiLaunchPlan = (
         });
       }
     }
-    // Flag advertisement alone is not a cooperating lifetime lease.
+    // A saved cursor always retains its original directory, even after shared
+    // sessions become available on a newer peer.
     const sessionDir =
       input.cursor?.sessionDir ??
-      neopiProjectSessionDir({
-        baseDir: input.t3Home,
-        ...(input.profile !== undefined ? { profile: input.profile } : {}),
-        projectId: input.projectId,
-      });
-    const args = [
-      "--mode",
-      "rpc-ui",
-      "--cwd",
-      input.cwd,
-      "--no-title",
-      "--session-dir",
-      sessionDir,
-    ];
+      (input.sharedSession
+        ? ""
+        : neopiProjectSessionDir({
+            baseDir: input.t3Home,
+            ...(input.profile !== undefined ? { profile: input.profile } : {}),
+            projectId: input.projectId,
+          }));
+    const args = ["--mode", "rpc-ui", "--cwd", input.cwd, "--no-title"];
+    if (sessionDir) args.push("--session-dir", sessionDir);
+    else args.push("--new-session");
     if (input.cursor) {
       if (
         !input.cursor.sessionFile ||

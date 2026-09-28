@@ -10,7 +10,12 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import type { SpawnFn } from "effect-neopi-rpc/client";
-import type { NeoPiChatMode, SetChatModeCommand } from "effect-neopi-rpc/schema";
+import type {
+  NeoPiChatMode,
+  NeoPiInteractionMode,
+  SetChatModeCommand,
+  SetModeCommand,
+} from "effect-neopi-rpc/schema";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -39,6 +44,7 @@ import {
   NEOPI_CAP_TOOL_APPROVAL,
   type PendingUi,
 } from "../neopi/mappers/ui.ts";
+import { mapPlanProposal, neoPiInteractionModeFromFrame } from "../neopi/mappers/mode.ts";
 import { toNeoPiCommandCatalog, type NeoPiAvailableCommand } from "../neopi/NeoPiCommandCatalog.ts";
 import { NEOPI_CAPABILITIES } from "../neopi/NeoPiCompatibility.ts";
 import type { NeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
@@ -81,7 +87,10 @@ function parseResumeCursor(value: unknown): NeoPiResumeCursor | undefined {
         entry.turnId.length > 0 &&
         ((typeof entry.userEntryId === "string" && entry.userEntryId.length > 0) ||
           entry.kind === "local" ||
-          entry.kind === "unknown")
+          entry.kind === "unknown" ||
+          (entry.kind === "continuation" &&
+            typeof entry.afterEntryId === "string" &&
+            entry.afterEntryId.length > 0))
       );
     })
   )
@@ -99,6 +108,8 @@ interface Session {
   ui: ReturnType<typeof emptyUiState>;
   activeTurnId?: TurnId;
   lastChatMode?: Exclude<NeoPiChatMode, "off">;
+  interactionMode?: NeoPiInteractionMode;
+  pendingPlan?: { readonly id: string; readonly planMarkdown: string };
 }
 
 export interface NeoPiAdapterOptions {
@@ -111,6 +122,7 @@ export interface NeoPiAdapterOptions {
   readonly environment: Record<string, string>;
   readonly spawn: SpawnFn;
   readonly discovery: NeoPiDiscoveryHub;
+  readonly sharedSessionCapabilities?: Set<string>;
   readonly makeRuntime?: (
     input: NeoPiRuntimeInput,
   ) => Effect.Effect<NeoPiSessionRuntimeShape, never, FileSystem.FileSystem>;
@@ -183,6 +195,8 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             : undefined;
       if (chatMode === "chat" || chatMode === "erp" || chatMode === "raw")
         session.lastChatMode = chatMode;
+      const interactionMode = neoPiInteractionModeFromFrame(frame);
+      if (interactionMode) session.interactionMode = interactionMode;
       if (
         data.type === "extension_ui_request" &&
         data.method === "cancel" &&
@@ -204,7 +218,15 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         [...(toolState.get(session)?.hostToolNames ?? [])],
       );
       subagentState.set(session, subagents.state);
-      yield* publish([...core.events, ...tools.events, ...subagents.events, ...ui.events]);
+      const proposal = mapPlanProposal(ctx, frame, session.runtime.capabilities);
+      if (proposal.proposal) session.pendingPlan = proposal.proposal;
+      yield* publish([
+        ...core.events,
+        ...tools.events,
+        ...subagents.events,
+        ...ui.events,
+        ...proposal.events,
+      ]);
       if (data.type === "t3.turn.outcome") {
         delete session.activeTurnId;
         session.session = {
@@ -333,6 +355,9 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         ...(resume ? { cursor: resume } : {}),
         spawn: options.spawn,
         ...(hostBridge ? { hostBridge } : {}),
+        ...(options.sharedSessionCapabilities
+          ? { sharedSessionCapabilities: options.sharedSessionCapabilities }
+          : {}),
       };
       const runtime = yield* (options.makeRuntime ?? makeNeoPiSessionRuntime)(runtimeInput).pipe(
         Effect.provideService(FileSystem.FileSystem, fs),
@@ -390,7 +415,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         resumeCursor: yield* SubscriptionRef.get(runtime.cursor),
         updatedAt: DateTime.formatIso(yield* DateTime.now),
       };
-      if (runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode)) {
+      if (
+        runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) ||
+        runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)
+      ) {
         const state = yield* runtime.request({ type: "get_state" }).pipe(Effect.option);
         if (state._tag === "Some")
           yield* processFrame(entry, { type: "t3.state", state: state.value });
@@ -440,6 +468,57 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         ...(selection ? { modelSelection: selection } : {}),
         turnId,
       };
+      if (session.pendingPlan && session.runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)) {
+        const implement =
+          input.interactionMode === "default" &&
+          prompt.images.length === 0 &&
+          prompt.text === `PLEASE IMPLEMENT THIS PLAN:\n${session.pendingPlan.planMarkdown}`;
+        if (implement) {
+          yield* session.runtime
+            .resolvePlanProposal({ decision: "approve" })
+            .pipe(
+              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
+            );
+          delete session.pendingPlan;
+        } else if (input.interactionMode === "plan") {
+          yield* session.runtime
+            .resolvePlanProposal({ decision: "refine", feedback: prompt.text }, prompt)
+            .pipe(
+              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
+            );
+          delete session.pendingPlan;
+          session.activeTurnId = turnId;
+          session.session = {
+            ...session.session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: DateTime.formatIso(yield* DateTime.now),
+          };
+          return {
+            threadId: input.threadId,
+            turnId,
+            resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
+          };
+        } else {
+          yield* session.runtime
+            .resolvePlanProposal({ decision: "refine" })
+            .pipe(
+              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
+            );
+          delete session.pendingPlan;
+        }
+      }
+      if (
+        session.runtime.capabilities.has(NEOPI_CAPABILITIES.setMode) &&
+        input.interactionMode !== undefined &&
+        session.interactionMode !== input.interactionMode
+      ) {
+        const command: SetModeCommand = { type: "set_mode", mode: input.interactionMode };
+        yield* session.runtime
+          .request(command)
+          .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_mode", cause)));
+        session.interactionMode = input.interactionMode;
+      }
       if (
         session.runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) &&
         /^\/chat(?:\s|$)/.test(prompt.text)
@@ -624,6 +703,11 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       Effect.flatMap(requireSession(threadId), (session) =>
         session.runtime.interrupt.pipe(
           Effect.mapError((cause) => rpcError(threadId, "abort", cause)),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              delete session.pendingPlan;
+            }),
+          ),
         ),
       ),
     respondToRequest: (threadId, requestId, decision) =>
@@ -645,6 +729,19 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         return state !== "failed" && state !== "stopped" && state !== "stopping";
       }),
     readThread,
+    getLiveUsage: (activeProvider) =>
+      Effect.gen(function* () {
+        for (const session of sessions.values()) {
+          if (!session.runtime.capabilities.has(NEOPI_CAPABILITIES.getUsage)) continue;
+          if ((yield* SubscriptionRef.get(session.runtime.state)) !== "ready") continue;
+          return yield* session.runtime
+            .request({ type: "get_usage", provider: activeProvider, redact: true })
+            .pipe(
+              Effect.mapError((cause) => rpcError(session.session.threadId, "get_usage", cause)),
+            );
+        }
+        return undefined;
+      }),
     rollbackThread: (threadId, numTurns) =>
       Effect.gen(function* () {
         const session = yield* requireSession(threadId);

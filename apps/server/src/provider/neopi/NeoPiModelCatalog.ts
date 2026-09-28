@@ -1,5 +1,7 @@
 import type { ServerProviderModel } from "@t3tools/contracts";
 import { createModelCapabilities } from "@t3tools/shared/model";
+import type { GetRolesResult, NeoPiRole } from "effect-neopi-rpc/schema";
+import { isRecord } from "effect-neopi-rpc/schema";
 
 type RpcModel = Record<string, unknown>;
 const asRecord = (value: unknown): RpcModel | null =>
@@ -13,11 +15,91 @@ const modelSlug = (model: RpcModel | null): string | null =>
     ? `${model.provider}/${model.id}`
     : null;
 
+const isOptionalString = (value: unknown): value is string | undefined =>
+  value === undefined || typeof value === "string";
+
+const isResolvedRole = (value: unknown): boolean => {
+  if (value === undefined) return true;
+  return (
+    isRecord(value) &&
+    typeof value.provider === "string" &&
+    value.provider.length > 0 &&
+    typeof value.modelId === "string" &&
+    value.modelId.length > 0 &&
+    isOptionalString(value.thinkingLevel)
+  );
+};
+
+const isNeoPiRole = (value: unknown): value is NeoPiRole => {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.id === "string" &&
+    value.id.length > 0 &&
+    typeof value.alias === "string" &&
+    value.alias.length > 0 &&
+    typeof value.name === "string" &&
+    value.name.length > 0 &&
+    isOptionalString(value.tag) &&
+    isOptionalString(value.section) &&
+    (value.source === "builtin" || value.source === "configured") &&
+    isOptionalString(value.configured) &&
+    Array.isArray(value.patterns) &&
+    value.patterns.every((pattern) => typeof pattern === "string") &&
+    isResolvedRole(value.resolved) &&
+    typeof value.hidden === "boolean"
+  );
+};
+
+export function neoPiRolesFromRpc(data: unknown): GetRolesResult | undefined {
+  if (!isRecord(data) || !Array.isArray(data.roles) || !data.roles.every(isNeoPiRole))
+    return undefined;
+  if (data.activeRole !== undefined && typeof data.activeRole !== "string") return undefined;
+  return { roles: data.roles, ...(data.activeRole ? { activeRole: data.activeRole } : {}) };
+}
+
+/** Role aliases are deliberately disjoint from native `provider/model` slugs. */
+export function neoPiRoleFromModelSlug(slug: string): string | undefined {
+  if (!slug.startsWith("@") || slug.length === 1 || slug.includes("/")) return undefined;
+  return slug.slice(1);
+}
+
+function toServerProviderRoleModels(
+  result: GetRolesResult,
+  fastModeEnabled: boolean,
+): ReadonlyArray<ServerProviderModel> {
+  return result.roles.flatMap((role): ServerProviderModel[] => {
+    if (role.hidden === true) return [];
+    const slug = `@${role.id}`;
+    return [
+      {
+        slug,
+        name: role.name,
+        shortName: role.tag || role.id,
+        subProvider: "Roles",
+        aliases: slug === role.alias ? [role.id] : [role.id, role.alias],
+        isCustom: false,
+        ...(result.activeRole === role.id ? { isDefault: true } : {}),
+        capabilities: createModelCapabilities({
+          optionDescriptors: [
+            {
+              id: "fastMode",
+              type: "boolean",
+              label: "Fast mode",
+              currentValue: result.activeRole === role.id && fastModeEnabled,
+            },
+          ],
+        }),
+      },
+    ];
+  });
+}
+
 /** The native catalog defines each model's effort ladder; never invent unsupported levels. */
 export function toServerProviderModels(
   models: ReadonlyArray<unknown>,
   current?: unknown,
   fastModeEnabled = false,
+  roleResult?: GetRolesResult,
 ): ReadonlyArray<ServerProviderModel> {
   const currentRecord = asRecord(current);
   const currentSlug = modelSlug(currentRecord);
@@ -40,7 +122,7 @@ export function toServerProviderModels(
         shortName: model.id as string,
         subProvider: model.provider as string,
         isCustom: false,
-        ...(currentSlug === slug ? { isDefault: true } : {}),
+        ...(currentSlug === slug && !roleResult?.activeRole ? { isDefault: true } : {}),
         capabilities: createModelCapabilities({
           optionDescriptors: [
             ...(efforts.length
@@ -71,9 +153,16 @@ export function toServerProviderModels(
       },
     ];
   });
-  if (currentSlug && !available.some((model) => model.slug === currentSlug)) {
-    const missing = toServerProviderModels([current], current, fastModeEnabled)[0];
-    if (missing) return [...available, { ...missing, isCustom: true }];
-  }
-  return available;
+  const withCurrent =
+    currentSlug && !available.some((model) => model.slug === currentSlug)
+      ? (() => {
+          const missing = toServerProviderModels([current], current, fastModeEnabled)[0];
+          if (!missing) return available;
+          const custom = { ...missing, isCustom: true };
+          if (roleResult?.activeRole) delete custom.isDefault;
+          return [...available, custom];
+        })()
+      : available;
+  if (!roleResult) return withCurrent;
+  return [...toServerProviderRoleModels(roleResult, fastModeEnabled), ...withCurrent];
 }

@@ -81,6 +81,65 @@ for (const numTurns of [1, 3])
     assert.notEqual(result.sessionFile, cursor.sessionFile);
   });
 
+it("keeps a proposal refinement tied to its original native rollback boundary", async () => {
+  const refined: NeoPiResumeCursor = {
+    ...cursor,
+    turnBoundaries: [
+      { turnId: TurnId.make("proposal"), userEntryId: "first" },
+      { turnId: TurnId.make("refinement"), kind: "continuation", afterEntryId: "proposal" },
+    ],
+  };
+  const calls: string[] = [];
+  await rejects(
+    rollbackNeoPiConversation({
+      cursor: refined,
+      numTurns: 1,
+      request: async (command) => {
+        calls.push(command.type);
+        return {};
+      },
+    }),
+    /without its original native turn/,
+  );
+  assert.deepEqual(calls, [], "a continuation cannot be branched by itself");
+  let branched = false;
+  const planEntries = [
+    user("first", null, "plan this"),
+    assistant("proposal", "first", "# Plan"),
+    assistant("refinement", "proposal", "Updated plan"),
+  ];
+  assert.deepEqual(
+    groupNeoPiHistory(
+      planEntries.map((entry) => entry.message),
+      planEntries,
+      "refinement",
+      refined,
+    ).map((turn) => ({ id: turn.id, count: turn.items.length })),
+    [
+      { id: "proposal", count: 2 },
+      { id: "refinement", count: 1 },
+    ],
+  );
+  const removed = await rollbackNeoPiConversation({
+    cursor: refined,
+    numTurns: 2,
+    request: async ({ type, entryId }) => {
+      calls.push(`${type}:${entryId ?? ""}`);
+      if (type === "get_entries") return { entries: planEntries, leafId: "refinement" };
+      if (type === "get_messages_page")
+        return { messages: branched ? [] : planEntries.map((entry) => entry.message) };
+      if (type === "branch") {
+        branched = true;
+        return { cancelled: false };
+      }
+      return { sessionId: "refined-branch", sessionFile: "/tmp/refined-branch.jsonl" };
+    },
+  });
+  assert.equal(removed.sessionId, "refined-branch");
+  assert.deepEqual(removed.turnBoundaries, []);
+  assert.equal(calls.includes("branch:first"), true);
+});
+
 it("does not branch a missing ancestry entry, a hidden entry, or a cancelled request", async () => {
   for (const leafId of ["a1", "a5"]) {
     const sent: string[] = [];

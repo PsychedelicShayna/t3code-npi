@@ -77,6 +77,7 @@ it.live("streams a turn, steers the same turn, routes UI responses, and stops it
           }),
         interrupt: SubscriptionRef.set(state, "ready"),
         compact: () => Effect.void,
+        resolvePlanProposal: () => Effect.void,
         respondUi: (reply) =>
           Effect.sync(() => {
             replies.push(reply);
@@ -254,6 +255,251 @@ it.live("streams a turn, steers the same turn, routes UI responses, and stops it
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+for (const capable of [false, true])
+  it.live(`${capable ? "uses" : "does not use"} gated mode, proposal, and usage RPC features`, () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const home = yield* fs.makeTempDirectoryScoped({ prefix: "neopi-gated-adapter-" });
+        const hub = yield* makeNeoPiDiscoveryHub();
+        const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+        const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
+        const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
+          v: 1,
+          sessionId: "gated-session",
+          sessionFile: `${home}/session.jsonl`,
+          sessionDir: home,
+          turnBoundaries: [],
+        });
+        const requests: Array<{
+          readonly type: string;
+          readonly mode?: unknown;
+          readonly provider?: unknown;
+          readonly redact?: unknown;
+        }> = [];
+        const writes: unknown[] = [];
+        let proposalId = "proposal-1";
+        const turns: string[] = [];
+        const capabilities = capable ? new Set(["v2", "set_mode", "get_usage"]) : new Set(["v2"]);
+        const runtime: NeoPiSessionRuntimeShape = {
+          threadId,
+          state,
+          cursor,
+          capabilities,
+          start: SubscriptionRef.set(state, "ready"),
+          startTurn: (input) =>
+            Effect.sync(() => {
+              turns.push(input.text);
+            }).pipe(
+              Effect.andThen(SubscriptionRef.set(state, "running")),
+              Effect.as({ turnId: input.turnId }),
+            ),
+          steer: () => Effect.void,
+          interrupt: SubscriptionRef.set(state, "ready"),
+          compact: () => Effect.void,
+          resolvePlanProposal: (response, continuation) =>
+            Effect.gen(function* () {
+              writes.push({ type: "plan_proposal_response", id: proposalId, ...response });
+              if (continuation) yield* SubscriptionRef.set(state, "running");
+            }),
+          respondUi: () => Effect.void,
+          writeFrame: (frame) =>
+            Effect.sync(() => {
+              writes.push(frame);
+            }),
+          request: (command) =>
+            Effect.sync(() => {
+              requests.push(command);
+              if (command.type === "get_state") return { mode: "default" };
+              if (command.type === "get_usage") return { provider: "openai", windows: [] };
+              return {};
+            }),
+          frames: Stream.fromQueue(frames),
+          restart: () => Effect.void,
+          stop: Effect.void,
+          setRuntimeMode: () => Effect.void,
+          onSessionIdentityMayHaveChanged: Effect.void,
+          applyModelSelection: () => Effect.void,
+        };
+        const adapter = yield* makeNeoPiAdapter({
+          settings,
+          instanceId,
+          binary: "npi",
+          cwd: home,
+          t3Home: home,
+          attachmentsDir: home,
+          environment: {},
+          spawn: spawner.spawn,
+          discovery: hub,
+          makeRuntime: () => Effect.succeed(runtime),
+        });
+        const observed: ProviderRuntimeEvent[] = [];
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            observed.push(event);
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("neopi"),
+          providerInstanceId: instanceId,
+          cwd: home,
+          runtimeMode: "auto",
+        });
+        const started = yield* adapter.sendTurn({
+          threadId,
+          input: "plan this",
+          interactionMode: "plan",
+        });
+        assert.deepEqual(turns, ["plan this"]);
+        const usage = yield* SubscriptionRef.set(state, "ready").pipe(
+          Effect.andThen(adapter.getLiveUsage("openai")),
+        );
+        yield* Queue.offer(frames, {
+          type: "plan_proposal_request",
+          id: "proposal-1",
+          title: "Implementation plan",
+          planFilePath: "xd://plan/test",
+          planMarkdown: "# Plan\n\n- Implement it",
+          turnId: started.turnId,
+        });
+        for (
+          let attempt = 0;
+          attempt < 100 &&
+          (capable
+            ? !observed.some((event) => event.type === "turn.proposed.completed")
+            : attempt < 2);
+          attempt++
+        )
+          yield* Effect.sleep("10 millis");
+        assert.deepEqual(writes, [], "displaying a proposed plan cannot approve it");
+        yield* Queue.offer(frames, {
+          type: "t3.turn.outcome",
+          state: "completed",
+          turnId: started.turnId,
+        });
+        for (
+          let attempt = 0;
+          attempt < 100 && !observed.some((event) => event.type === "turn.completed");
+          attempt++
+        )
+          yield* Effect.sleep("10 millis");
+        if (capable) {
+          const refined = yield* adapter.sendTurn({
+            threadId,
+            input: "Please simplify step two",
+            interactionMode: "plan",
+          });
+          assert.deepEqual(writes, [
+            {
+              type: "plan_proposal_response",
+              id: "proposal-1",
+              decision: "refine",
+              feedback: "Please simplify step two",
+            },
+          ]);
+          assert.deepEqual(turns, ["plan this"], "feedback resumes the native turn");
+          yield* Queue.offer(frames, {
+            type: "t3.turn.outcome",
+            state: "completed",
+            turnId: refined.turnId,
+          });
+          for (
+            let attempt = 0;
+            attempt < 100 && observed.filter((event) => event.type === "turn.completed").length < 2;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+          yield* SubscriptionRef.set(state, "ready");
+          const repeated = yield* adapter.sendTurn({
+            threadId,
+            input: "plan again",
+            interactionMode: "plan",
+          });
+          proposalId = "proposal-2";
+          yield* Queue.offer(frames, {
+            type: "plan_proposal_request",
+            id: proposalId,
+            title: "Revised plan",
+            planFilePath: "xd://plan/revised",
+            planMarkdown: "# Plan\n\n- Implement it",
+            turnId: repeated.turnId,
+          });
+          for (
+            let attempt = 0;
+            attempt < 100 &&
+            observed.filter((event) => event.type === "turn.proposed.completed").length < 2;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+          assert.equal(writes.length, 1, "displaying a revised plan cannot approve it");
+          yield* Queue.offer(frames, {
+            type: "t3.turn.outcome",
+            state: "completed",
+            turnId: repeated.turnId,
+          });
+          for (
+            let attempt = 0;
+            attempt < 100 && observed.filter((event) => event.type === "turn.completed").length < 3;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+        }
+        yield* adapter.sendTurn({
+          threadId,
+          input: capable
+            ? "PLEASE IMPLEMENT THIS PLAN:\n# Plan\n\n- Implement it"
+            : "implement this",
+          interactionMode: "default",
+        });
+        assert.deepEqual(
+          turns,
+          capable
+            ? ["plan this", "plan again", "PLEASE IMPLEMENT THIS PLAN:\n# Plan\n\n- Implement it"]
+            : ["plan this", "implement this"],
+        );
+
+        const setModeRequests = requests.filter((command) => command.type === "set_mode");
+        const usageRequests = requests.filter((command) => command.type === "get_usage");
+        if (capable) {
+          assert.deepEqual(setModeRequests, [
+            { type: "set_mode", mode: "plan" },
+            { type: "set_mode", mode: "default" },
+          ]);
+          assert.deepEqual(usageRequests, [
+            { type: "get_usage", provider: "openai", redact: true },
+          ]);
+          assert.deepEqual(usage, { provider: "openai", windows: [] });
+          assert.deepEqual(writes, [
+            {
+              type: "plan_proposal_response",
+              id: "proposal-1",
+              decision: "refine",
+              feedback: "Please simplify step two",
+            },
+            { type: "plan_proposal_response", id: "proposal-2", decision: "approve" },
+          ]);
+          assert.equal(
+            observed.find((event) => event.type === "turn.proposed.completed")?.payload
+              .planMarkdown,
+            "# Plan\n\n- Implement it",
+          );
+        } else {
+          assert.deepEqual(setModeRequests, []);
+          assert.deepEqual(usageRequests, []);
+          assert.equal(usage, undefined);
+          assert.deepEqual(writes, []);
+          assert.equal(
+            observed.some((event) => event.type === "turn.proposed.completed"),
+            false,
+          );
+        }
+        yield* adapter.stopAll();
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
 for (const skipConversationRestore of [false, true])
   it.live(
     `rollback ${skipConversationRestore ? "rejects preserved live messages" : "persists the branched cursor"}`,
@@ -322,6 +568,7 @@ for (const skipConversationRestore of [false, true])
               });
             }),
             compact: () => Effect.void,
+            resolvePlanProposal: () => Effect.void,
             respondUi: () => Effect.void,
             writeFrame: () => Effect.void,
             request: (cmd) =>
@@ -520,6 +767,7 @@ it.live("seeds host tool names before startup and renews permissions on credenti
               steer: () => Effect.die("unused"),
               interrupt: Effect.void,
               compact: () => Effect.void,
+              resolvePlanProposal: () => Effect.void,
               respondUi: () => Effect.void,
               writeFrame: () => Effect.void,
               request: () => Effect.succeed({}),

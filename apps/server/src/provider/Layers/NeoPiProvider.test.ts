@@ -8,11 +8,13 @@ import type { NeoPiSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
+import { NEOPI_CAPABILITIES } from "../neopi/NeoPiCompatibility.ts";
 import {
   authFromLoginProviders,
   buildInitialNeoPiProviderSnapshot,
   checkNeoPiProviderStatus,
   modelsFromNeoPiRpc,
+  requestNeoPiProviderMetadata,
   resolveNeoPiBinary,
 } from "./NeoPiProvider.ts";
 
@@ -65,6 +67,64 @@ it.effect(
         ],
       );
     }),
+);
+
+it.effect("does not ask a mock peer for roles without the get_roles capability", () =>
+  Effect.gen(function* () {
+    const requests: string[] = [];
+    const metadata = yield* requestNeoPiProviderMetadata({
+      capabilities: new Set(),
+      request: <C extends { type: string }>(command: C): Effect.Effect<unknown> => {
+        requests.push(command.type);
+        return Effect.succeed({});
+      },
+    });
+    assert.deepEqual(requests, ["get_login_providers", "get_available_models", "get_state"]);
+    assert.equal(metadata.roles, undefined);
+  }),
+);
+
+it.effect("asks a capable mock peer for roles and exposes them in the picker", () =>
+  Effect.gen(function* () {
+    const requests: string[] = [];
+    const metadata = yield* requestNeoPiProviderMetadata({
+      capabilities: new Set([NEOPI_CAPABILITIES.getRoles]),
+      request: <C extends { type: string }>(command: C): Effect.Effect<unknown> => {
+        requests.push(command.type);
+        return Effect.succeed(
+          command.type === "get_roles"
+            ? {
+                roles: [
+                  {
+                    id: "smol",
+                    alias: "@smol",
+                    name: "Fast",
+                    source: "builtin",
+                    patterns: ["openai/gpt-5.6-luna:low"],
+                    hidden: false,
+                  },
+                ],
+              }
+            : {},
+        );
+      },
+    });
+    assert.deepEqual(requests, [
+      "get_login_providers",
+      "get_available_models",
+      "get_state",
+      "get_roles",
+    ]);
+    assert.equal(
+      modelsFromNeoPiRpc(
+        { models: [{ provider: "openai", id: "gpt-5.6-luna" }] },
+        undefined,
+        false,
+        metadata.roles,
+      )[0]?.slug,
+      "@smol",
+    );
+  }),
 );
 
 it.live(

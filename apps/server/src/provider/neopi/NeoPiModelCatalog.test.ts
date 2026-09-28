@@ -1,5 +1,9 @@
 import { expect, it } from "vite-plus/test";
-import { toServerProviderModels } from "./NeoPiModelCatalog.ts";
+import {
+  neoPiRoleFromModelSlug,
+  neoPiRolesFromRpc,
+  toServerProviderModels,
+} from "./NeoPiModelCatalog.ts";
 
 it("preserves each model's actual effort ladder and current default", () => {
   const models = toServerProviderModels(
@@ -55,4 +59,81 @@ it("retains a current model absent from a refreshed catalog and reflects active 
     },
     { id: "fastMode", type: "boolean", label: "Fast mode", currentValue: true },
   ]);
+});
+
+it("adds visible RPC roles as a distinct picker group and selects the active role", () => {
+  const roles = neoPiRolesFromRpc({
+    roles: [
+      {
+        id: "smol",
+        alias: "@smol",
+        name: "Fast",
+        tag: "SMOL",
+        section: "chat",
+        source: "builtin",
+        patterns: ["openai/gpt-5.6-luna:low"],
+        resolved: {
+          provider: "openai",
+          modelId: "gpt-5.6-luna",
+          thinkingLevel: "low",
+        },
+        hidden: false,
+      },
+      {
+        id: "private",
+        alias: "@private",
+        name: "Private",
+        section: "chat",
+        source: "configured",
+        patterns: [],
+        hidden: true,
+      },
+    ],
+    activeRole: "smol",
+  });
+  expect(roles).toBeDefined();
+  const models = toServerProviderModels(
+    [{ provider: "openai", id: "gpt-5.6-luna", name: "Luna" }],
+    { provider: "openai", id: "gpt-5.6-luna" },
+    true,
+    roles,
+  );
+  expect(models).toEqual([
+    {
+      slug: "@smol",
+      name: "Fast",
+      shortName: "SMOL",
+      subProvider: "Roles",
+      aliases: ["smol"],
+      isCustom: false,
+      isDefault: true,
+      capabilities: {
+        optionDescriptors: [
+          { id: "fastMode", type: "boolean", label: "Fast mode", currentValue: true },
+        ],
+      },
+    },
+    {
+      slug: "openai/gpt-5.6-luna",
+      name: "Luna",
+      shortName: "gpt-5.6-luna",
+      subProvider: "openai",
+      isCustom: false,
+      capabilities: {
+        optionDescriptors: [
+          { id: "fastMode", type: "boolean", label: "Fast mode", currentValue: true },
+        ],
+      },
+    },
+  ]);
+  expect(neoPiRoleFromModelSlug("@smol")).toBe("smol");
+  expect(neoPiRoleFromModelSlug("openai/gpt-5.6-luna")).toBeUndefined();
+});
+
+it("rejects malformed role catalogs instead of exposing partial picker entries", () => {
+  expect(
+    neoPiRolesFromRpc({
+      roles: [{ id: "smol", alias: "@smol", name: "Fast", source: "builtin" }],
+    }),
+  ).toBeUndefined();
 });

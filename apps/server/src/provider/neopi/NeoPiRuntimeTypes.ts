@@ -30,6 +30,7 @@ export type NeoPiResumeCursor = {
   readonly turnBoundaries: ReadonlyArray<
     | { readonly turnId: TurnId; readonly userEntryId: string }
     | { readonly turnId: TurnId; readonly kind: "local" | "unknown" }
+    | { readonly turnId: TurnId; readonly kind: "continuation"; readonly afterEntryId: string }
   >;
 };
 
@@ -66,6 +67,10 @@ export interface NeoPiSessionRuntimeShape {
   readonly steer: (input: NeoPiTurnInput) => Effect.Effect<void, NeoPiRuntimeError>;
   readonly interrupt: Effect.Effect<void, NeoPiRuntimeError>;
   readonly compact: (customInstructions?: string) => Effect.Effect<void, NeoPiRuntimeError>;
+  readonly resolvePlanProposal: (
+    response: { readonly decision: "approve" | "refine"; readonly feedback?: string },
+    continuation?: NeoPiTurnInput,
+  ) => Effect.Effect<void, NeoPiRuntimeError>;
   readonly respondUi: NeoPiRpcClient["respondUi"];
   readonly request: NeoPiRpcClient["request"];
   readonly writeFrame: NeoPiRpcClient["writeFrame"];
