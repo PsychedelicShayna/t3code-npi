@@ -1,6 +1,7 @@
 import { NeoPiSettings, ProviderDriverKind } from "@t3tools/contracts";
 import { make as makeClient } from "effect-neopi-rpc/client";
 import * as Effect from "effect/Effect";
+import * as Ref from "effect/Ref";
 import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -15,6 +16,7 @@ import {
   checkNeoPiProviderStatus,
   resolveNeoPiBinary,
   neoPiSnapshotForCwd,
+  type NeoPiRetainedCatalog,
 } from "../Layers/NeoPiProvider.ts";
 import { applyUsageLimits } from "../Layers/neopiUsageLimits.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
@@ -80,6 +82,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
       });
       const discovery = yield* makeNeoPiDiscoveryHub();
       const sharedSessionCapabilities = new Set<string>();
+      const retainedCatalog = yield* Ref.make<NeoPiRetainedCatalog | null>(null);
       const resolved = enabled
         ? yield* resolveNeoPiBinary(effectiveConfig, env, serverConfig.cwd).pipe(
             Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -126,14 +129,21 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,
         initialSnapshot: (settings) =>
           buildInitialNeoPiProviderSnapshot(settings.provider).pipe(Effect.map(stamp)),
-        checkProvider: checkNeoPiProviderStatus(
-          effectiveConfig,
-          env,
-          serverConfig.cwd,
-          spawner.spawn,
-          discovery,
-          sharedSessionCapabilities,
-        ).pipe(
+        checkProvider: Ref.get(retainedCatalog).pipe(
+          Effect.flatMap((previous) =>
+            checkNeoPiProviderStatus(
+              effectiveConfig,
+              env,
+              serverConfig.cwd,
+              spawner.spawn,
+              discovery,
+              sharedSessionCapabilities,
+              {
+                ...(previous ? { previous } : {}),
+                onSuccessfulCatalog: (catalog) => Ref.set(retainedCatalog, catalog),
+              },
+            ),
+          ),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.map(stamp),
         ),
