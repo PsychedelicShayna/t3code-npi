@@ -662,6 +662,184 @@ it.live("bounds the whole transport handshake even when the hook waits for ready
   ),
 );
 
+it.live("pauses negotiation while a startup confirmation awaits the user, then runs a prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let negotiationId: string | undefined;
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) => {
+          if (message.type === "negotiate_protocol") {
+            negotiationId = message.id;
+            return emit({
+              type: "extension_ui_request",
+              id: "startup-confirm",
+              method: "confirm",
+              title: "Enable extension?",
+            });
+          }
+          if (message.type === "extension_ui_response" && negotiationId)
+            return negotiate({ type: "negotiate_protocol", id: negotiationId }, emit).pipe(
+              Effect.asVoid,
+            );
+          if (message.type === "prompt")
+            return emit({
+              type: "response",
+              id: message.id,
+              command: "prompt",
+              success: true,
+            }).pipe(Effect.andThen(emit({ type: "agent_start" })));
+          return Effect.void;
+        },
+      });
+      const scope = yield* Effect.scope;
+      const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
+      const startupTransport = yield* Deferred.make<Client.NeoPiRpcTransport>();
+      const clientFiber = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 60,
+        onTransportReady: (transport) =>
+          Deferred.succeed(startupTransport, transport).pipe(
+            Effect.andThen(
+              Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
+                Effect.forkIn(scope),
+              ),
+            ),
+            Effect.asVoid,
+          ),
+      }).pipe(Effect.forkScoped);
+      const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
+      assert.equal(confirmation.id, "startup-confirm");
+      yield* Effect.sleep("120 millis");
+      assert.equal(peer.signals.length, 0);
+      yield* peer.emit({
+        type: "extension_ui_request",
+        id: "irrelevant-cancel",
+        method: "cancel",
+        targetId: "unknown",
+      });
+      yield* Effect.sleep("40 millis");
+      assert.equal(peer.signals.length, 0);
+      yield* (yield* Deferred.await(startupTransport)).respondUi({
+        id: confirmation.id,
+        confirmed: true,
+      });
+      const client = yield* Fiber.join(clientFiber).pipe(Effect.timeout("2 seconds"));
+      yield* Effect.addFinalizer(() => client.close(20));
+      assert.equal(client.capabilities.has("v2"), true);
+      const prompt = yield* client.prompt({ type: "prompt", message: "hello after startup" });
+      assert.deepEqual(yield* Deferred.await(prompt.outcome).pipe(Effect.timeout("2 seconds")), {
+        kind: "agent",
+      });
+    }),
+  ),
+);
+
+it.live("still times out a silent negotiation without a pending dialog", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const notify of [false, true]) {
+        const peer = yield* scriptedPeer({
+          ready: v2Ready,
+          onLine: (message, emit) =>
+            notify && message.type === "negotiate_protocol"
+              ? emit({ type: "extension_ui_request", id: "info", method: "notify" })
+              : Effect.void,
+        });
+        const error = yield* Client.make({
+          spawn: () => Effect.succeed(peer.handle),
+          command: "npi",
+          args: ["--mode", "rpc-ui"],
+          cwd: "/tmp",
+          env: {},
+          requestTimeoutMs: 60,
+        }).pipe(Effect.flip);
+        assert.equal(error.code, "timeout");
+        assert.equal(error.command, "negotiate_protocol");
+        assert.match(error.message, /timed out waiting for negotiate_protocol/);
+      }
+    }),
+  ),
+);
+
+it.live("resumes the negotiation deadline when a startup dialog is cancelled", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          message.type === "negotiate_protocol"
+            ? emit({ type: "extension_ui_request", id: "cancel-me", method: "confirm" })
+            : Effect.void,
+      });
+      const scope = yield* Effect.scope;
+      const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
+      const startup = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 60,
+        onTransportReady: (transport) =>
+          Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
+            Effect.forkIn(scope),
+            Effect.asVoid,
+          ),
+      }).pipe(Effect.forkScoped);
+      const confirmation = yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"));
+      assert.equal(confirmation.id, "cancel-me");
+      yield* Effect.sleep("120 millis");
+      yield* peer.emit({
+        type: "extension_ui_request",
+        id: "cancel-frame",
+        method: "cancel",
+        targetId: "cancel-me",
+      });
+      const error = yield* Fiber.join(startup).pipe(Effect.flip, Effect.timeout("2 seconds"));
+      assert.equal(error.code, "timeout");
+      assert.equal(error.command, "negotiate_protocol");
+    }),
+  ),
+);
+
+it.live("fails promptly when a peer exits during a pending startup dialog", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* scriptedPeer({
+        ready: v2Ready,
+        onLine: (message, emit) =>
+          message.type === "negotiate_protocol"
+            ? emit({ type: "extension_ui_request", id: "abandoned", method: "confirm" })
+            : Effect.void,
+      });
+      const scope = yield* Effect.scope;
+      const ui = yield* Queue.unbounded<Client.UiRequestFrame>();
+      const startup = yield* Client.make({
+        spawn: () => Effect.succeed(peer.handle),
+        command: "npi",
+        args: ["--mode", "rpc-ui"],
+        cwd: "/tmp",
+        env: {},
+        requestTimeoutMs: 60,
+        onTransportReady: (transport) =>
+          Stream.runForEach(transport.uiRequests, (frame) => Queue.offer(ui, frame)).pipe(
+            Effect.forkIn(scope),
+            Effect.asVoid,
+          ),
+      }).pipe(Effect.forkScoped);
+      assert.equal((yield* Queue.take(ui).pipe(Effect.timeout("2 seconds"))).id, "abandoned");
+      yield* peer.finish({ code: 1, signal: null });
+      const error = yield* Fiber.join(startup).pipe(Effect.flip, Effect.timeout("2 seconds"));
+      assert.equal(error.code, "exited");
+    }),
+  ),
+);
+
 it.live("fails ready immediately when the peer exits without sending a ready frame", () =>
   Effect.scoped(
     Effect.gen(function* () {

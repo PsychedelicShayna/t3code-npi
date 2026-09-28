@@ -214,6 +214,8 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   const exit = yield* Deferred.make<ProcessExit>();
   const readyDeferred = yield* Deferred.make<ReadyFrame, NeoPiRpcError>();
 
+  const startupUiPending = new Set<string>();
+  const startupUiChanges = yield* Queue.unbounded<void>();
   const pending = new Map<string, PendingRequest>();
   const prompts = new Map<string, PromptRecord>();
   let nextRequestId = 0;
@@ -224,6 +226,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   let promptEntryIds = false;
   let uriListeners = 0;
   let stderrListeners = 0;
+  let negotiating = false;
   const stderrTail = emptyStderrTail();
   const decoder = { current: new RpcFrameDecoder(ceiling) };
 
@@ -286,7 +289,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
     return `npi-${nextRequestId}`;
   };
 
-  const request = <C extends { type: string }>(cmd: C): Effect.Effect<unknown, NeoPiRpcError> =>
+  const request = <C extends { type: string }>(
+    cmd: C,
+    pauseForStartupUi = false,
+  ): Effect.Effect<unknown, NeoPiRpcError> =>
     Effect.gen(function* () {
       if (fatal) {
         return yield* fatal;
@@ -309,8 +315,32 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           }),
         ),
       );
-      return yield* Deferred.await(deferred).pipe(
-        Effect.timeout(Duration.millis(requestTimeoutMs)),
+      const awaitReply = Deferred.await(deferred);
+      const wait = pauseForStartupUi
+        ? Effect.gen(function* () {
+            let remaining = requestTimeoutMs;
+            while (true) {
+              const changed = Queue.take(startupUiChanges).pipe(
+                Effect.as({ kind: "changed" as const }),
+              );
+              const replied = awaitReply.pipe(
+                Effect.map((value) => ({ kind: "reply" as const, value })),
+              );
+              if (startupUiPending.size > 0) {
+                const result = yield* Effect.raceFirst(replied, changed);
+                if (result.kind === "reply") return result.value;
+                continue;
+              }
+              const started = performance.now();
+              const result = yield* Effect.raceFirst(replied, changed).pipe(
+                Effect.timeout(Duration.millis(Math.max(0, remaining))),
+              );
+              remaining -= performance.now() - started;
+              if (result.kind === "reply") return result.value;
+            }
+          })
+        : awaitReply.pipe(Effect.timeout(Duration.millis(requestTimeoutMs)));
+      return yield* wait.pipe(
         Effect.catchTag("TimeoutError", () =>
           Effect.fail(
             new NeoPiRpcError({
@@ -364,8 +394,18 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           } else {
             yield* Deferred.fail(requestRecord.deferred, responseError(frame)).pipe(Effect.ignore);
           }
+          return;
         }
       }
+      // Proposal responses have no success ack, but a cancelled proposal gets
+      // a response-only error. Surface it to the runtime instead of dropping it.
+      if (frame.command === "plan_proposal_response" && !frame.success && id)
+        yield* Queue.offer(events, {
+          type: "t3.plan.proposal.rejected",
+          id,
+          error: frame.error ?? "Plan proposal rejected",
+          code: frame.code,
+        }).pipe(Effect.ignore);
     });
 
   const onPromptResponse = (record: PromptRecord, frame: ResponseFrame): Effect.Effect<void> =>
@@ -494,6 +534,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           decoder.current = new RpcFrameDecoder(ceiling);
         }
         promptEntryIds = ready.capabilities?.includes("prompt_entry_ids") === true;
+        negotiating = ready.supportedProtocolVersions?.includes(2) === true;
         yield* Deferred.succeed(readyDeferred, ready).pipe(Effect.ignore);
         return;
       }
@@ -501,8 +542,26 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       switch (frame.type) {
         case "response":
           return yield* onResponse(frame as ResponseFrame);
-        case "extension_ui_request":
-          return yield* Queue.offer(uiRequests, frame as UiRequestFrame).pipe(Effect.ignore);
+        case "extension_ui_request": {
+          const ui = frame as UiRequestFrame;
+          if (
+            negotiating &&
+            (ui.method === "cancel" ||
+              ui.method === "select" ||
+              ui.method === "confirm" ||
+              ui.method === "input" ||
+              ui.method === "editor")
+          ) {
+            if (ui.method === "cancel") {
+              if (typeof ui.targetId === "string" && startupUiPending.delete(ui.targetId))
+                yield* Queue.offer(startupUiChanges, undefined);
+            } else if (!startupUiPending.has(ui.id)) {
+              startupUiPending.add(ui.id);
+              yield* Queue.offer(startupUiChanges, undefined);
+            }
+          }
+          return yield* Queue.offer(uiRequests, ui).pipe(Effect.ignore);
+        }
         case "host_tool_call":
         case "host_tool_cancel":
           return yield* Queue.offer(
@@ -776,7 +835,15 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   );
 
   const respondUi = (response: UiResponseWire): Effect.Effect<void, NeoPiRpcError> =>
-    writeFrame({ type: "extension_ui_response", ...response });
+    writeFrame({ type: "extension_ui_response", ...response }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => startupUiPending.delete(response.id)).pipe(
+          Effect.flatMap((removed) =>
+            removed ? Queue.offer(startupUiChanges, undefined).pipe(Effect.asVoid) : Effect.void,
+          ),
+        ),
+      ),
+    );
 
   const hostToolUpdate = (
     id: string,
@@ -834,7 +901,9 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       : [],
   );
   if (Array.isArray(supported) && supported.includes(2)) {
-    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 });
+    const result = yield* request({ type: "negotiate_protocol", protocolVersion: 2 }, true);
+    negotiating = false;
+    startupUiPending.clear();
     if (!isRecord(result) || result.protocolVersion !== 2) {
       const error = new NeoPiRpcError({
         code: "bad_frame",
