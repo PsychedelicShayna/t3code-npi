@@ -49,6 +49,7 @@ interface Settlement {
 
 export interface UiState {
   readonly capabilities: Set<string>;
+  planMode?: "plan" | "default";
   readonly inFlightTools: Record<string, { readonly toolName: string; readonly args: unknown }>;
   readonly open: Map<string, OpenUi>;
   readonly settlements: Settlement[];
@@ -148,15 +149,32 @@ export function mapUiRequest(
     }
     return { events, state };
   }
-  if (type === "t3.state" || type === "chat_mode_changed") {
-    const mode = type === "t3.state" ? record(data.state)?.chatMode : data.mode;
-    if (mode === "off" || mode === "chat" || mode === "erp" || mode === "raw")
+  if (type === "t3.state" || type === "chat_mode_changed" || type === "mode_changed") {
+    const chatMode = type === "t3.state" ? record(data.state)?.chatMode : data.mode;
+    if (
+      (type === "t3.state" || type === "chat_mode_changed") &&
+      (chatMode === "off" || chatMode === "chat" || chatMode === "erp" || chatMode === "raw")
+    )
       events.push(
         makeEvent(ctx, frame, "runtime.warning", {
-          message: `NeoPi/OMP chat mode: ${mode}`,
-          detail: { neopiUi: { kind: "chat-mode", mode } },
+          message: `NeoPi/OMP chat mode: ${chatMode}`,
+          detail: { neopiUi: { kind: "chat-mode", mode: chatMode } },
         }),
       );
+    const planMode = type === "t3.state" ? record(data.state)?.mode : data.mode;
+    if (
+      (type === "t3.state" || type === "mode_changed") &&
+      (planMode === "default" || planMode === "plan") &&
+      state.planMode !== planMode
+    ) {
+      state.planMode = planMode;
+      events.push(
+        makeEvent(ctx, frame, "runtime.warning", {
+          message: `NeoPi/OMP native plan mode: ${planMode}`,
+          detail: { neopiUi: { kind: "plan-mode", mode: planMode } },
+        }),
+      );
+    }
     return { events, state };
   }
   if (type === "tool_execution_start") {
@@ -219,11 +237,16 @@ export function mapUiRequest(
           (detail): detail is string => typeof detail === "string" && detail.length > 0,
         )
       : [];
+    const argumentsDetail =
+      details.length === 0 && Object.hasOwn(data, "args")
+        ? `Arguments: ${JSON.stringify(data.args)}`
+        : undefined;
     const detail =
       [
         `Allow tool: ${toolName}`,
         ...(nonempty(data.reason) ? [`Reason: ${data.reason}`] : []),
         ...details,
+        ...(argumentsDetail ? [argumentsDetail] : []),
       ].join("\n") + timeoutSuffix(data.timeout);
     const toolCallId = nonempty(data.toolCallId);
     state.open.set(id, { kind: "approval", requestType, frame });

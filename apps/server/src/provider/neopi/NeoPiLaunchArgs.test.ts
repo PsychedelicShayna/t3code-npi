@@ -2,7 +2,7 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { buildNeoPiLaunchPlan } from "./NeoPiLaunchArgs.ts";
+import { buildNeoPiLaunchPlan, isSharedNeoPiCursor } from "./NeoPiLaunchArgs.ts";
 
 const input = {
   binary: "npi",
@@ -114,6 +114,37 @@ describe("NeoPi launch plan", () => {
       assert.ok(!resumed.args.includes("--new-session"));
       assert.ok(resumed.args.includes("--session-dir"));
       assert.equal(resumed.identity.kind, "resume");
+    }),
+  );
+  it.effect("keeps legacy isolated cursors isolated but protects unmarked shared cursors", () =>
+    Effect.gen(function* () {
+      const cursor = {
+        v: 1 as const,
+        sessionId: "s",
+        sessionDir: "/tmp/t3home/neopi/sessions/old-profile/old-project",
+        sessionFile: "/tmp/t3home/neopi/sessions/old-profile/old-project/session.jsonl",
+        turnBoundaries: [],
+      };
+      assert.equal(isSharedNeoPiCursor(cursor, input.t3Home), false);
+      assert.equal(
+        isSharedNeoPiCursor(
+          {
+            ...cursor,
+            sessionDir: "/tmp/omp-sessions",
+            sessionFile: "/tmp/omp-sessions/session.jsonl",
+          },
+          input.t3Home,
+        ),
+        true,
+      );
+      assert.equal(isSharedNeoPiCursor({ ...cursor, sharedSession: true }, input.t3Home), true);
+      assert.equal(
+        isSharedNeoPiCursor(
+          { ...cursor, sharedSession: false, sessionDir: "/tmp/omp-sessions" },
+          input.t3Home,
+        ),
+        true,
+      );
     }),
   );
   it.effect(

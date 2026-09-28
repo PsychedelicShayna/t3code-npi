@@ -140,6 +140,90 @@ it("keeps a proposal refinement tied to its original native rollback boundary", 
   assert.equal(calls.includes("branch:first"), true);
 });
 
+it("rejects a removed plan continuation before a later native turn without branching", async () => {
+  const boundaries: NeoPiResumeCursor = {
+    ...cursor,
+    turnBoundaries: [
+      { turnId: TurnId.make("plan"), userEntryId: "first" },
+      { turnId: TurnId.make("implementation"), kind: "continuation", afterEntryId: "a1" },
+      { turnId: TurnId.make("ordinary"), userEntryId: "third" },
+    ],
+  };
+  const commands: string[] = [];
+  await rejects(
+    rollbackNeoPiConversation({
+      cursor: boundaries,
+      numTurns: 2,
+      request: async ({ type }) => {
+        commands.push(type);
+        return {};
+      },
+    }),
+    /without its original native turn/,
+  );
+  assert.deepEqual(commands, []);
+});
+
+it("branches a user-invoked skill entry and verifies it by advertised entry id", async () => {
+  const skill = {
+    id: "skill",
+    parentId: null,
+    type: "custom_message",
+    customType: "skill-prompt",
+    attribution: "user",
+    content: "skill invocation",
+  };
+  const reply = assistant("skill-reply", "skill", "done");
+  let branched = false;
+  const result = await rollbackNeoPiConversation({
+    cursor: {
+      ...cursor,
+      turnBoundaries: [{ turnId: TurnId.make("skill-turn"), userEntryId: "skill" }],
+    },
+    numTurns: 1,
+    useMessageEntryIds: true,
+    request: async ({ type, entryId }) => {
+      if (type === "get_entries") return { entries: [skill, reply], leafId: "skill-reply" };
+      if (type === "get_messages_page")
+        return {
+          messages: branched
+            ? []
+            : [
+                { entryId: "skill", role: "custom", content: "expanded invocation" },
+                { entryId: "skill-reply", role: "assistant", content: "done" },
+              ],
+        };
+      if (type === "branch") {
+        assert.equal(entryId, "skill");
+        branched = true;
+        return { cancelled: false };
+      }
+      return { sessionId: "skill-branch", sessionFile: "/tmp/skill-branch.jsonl" };
+    },
+  });
+  assert.equal(result.sessionId, "skill-branch");
+});
+
+it("marks every failure after a confirmed branch as requiring restoration", async () => {
+  for (const state of ["throw", "invalid"]) {
+    await rejects(
+      rollbackNeoPiConversation({
+        cursor,
+        numTurns: 1,
+        request: async ({ type }) => {
+          if (type === "get_entries") return { entries, leafId: "a5" };
+          if (type === "get_messages_page")
+            return { messages: entries.map((entry) => entry.message) };
+          if (type === "branch") return { cancelled: false };
+          if (state === "throw") throw new Error("state unavailable");
+          return { sessionId: "old", sessionFile: "/tmp/old.jsonl" };
+        },
+      }),
+      /rollback integrity error/,
+    );
+  }
+});
+
 it("does not branch a missing ancestry entry, a hidden entry, or a cancelled request", async () => {
   for (const leafId of ["a1", "a5"]) {
     const sent: string[] = [];
@@ -409,8 +493,18 @@ it("groups advertised entry ids even when native message content differs", () =>
       [TurnId.make("next-turn"), 1],
     ],
   );
+  assert.deepEqual(
+    groupNeoPiHistory(
+      [{ role: "user", content: "transient context" }, ...messages],
+      history,
+      "next",
+      cursor,
+      true,
+    ).flatMap((turn) => turn.items),
+    messages,
+  );
   assert.throws(
-    () => groupNeoPiHistory([{ role: "user" }], history, "next", cursor, true),
+    () => groupNeoPiHistory([{ entryId: "missing", role: "user" }], history, "next", cursor, true),
     /unmatched native entry id/,
   );
   assert.throws(

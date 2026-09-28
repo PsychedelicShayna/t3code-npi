@@ -3,7 +3,7 @@ import { resolve, sep } from "node:path";
 import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
 import type { RuntimeMode } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import { neopiProjectSessionDir } from "./NeoPiPaths.ts";
+import { neopiProjectSessionDir, neopiSessionRoot } from "./NeoPiPaths.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
 import type { NeoPiLaunchPlan, NeoPiResumeCursor } from "./NeoPiRuntimeTypes.ts";
 
@@ -19,6 +19,13 @@ export interface NeoPiLaunchInput {
   readonly cursor?: NeoPiResumeCursor;
   /** Both session_lease and new_session were advertised by a preflight RPC peer. */
   readonly sharedSession?: boolean;
+}
+
+/** Older cursors predate the marker: only the T3-owned root was ever isolated. */
+export function isSharedNeoPiCursor(cursor: NeoPiResumeCursor, t3Home: string): boolean {
+  if (cursor.sharedSession === true) return true;
+  const root = neopiSessionRoot({ baseDir: t3Home }) + sep;
+  return !resolve(cursor.sessionDir).startsWith(root);
 }
 
 const approvalModes: Record<RuntimeMode, string> = {

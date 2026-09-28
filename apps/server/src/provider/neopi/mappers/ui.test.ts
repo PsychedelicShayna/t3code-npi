@@ -147,6 +147,30 @@ describe("NeoPi UI mapper", () => {
     ]);
   });
 
+  it("shows the exact prelude operation when no native approval details exist", () => {
+    const state = emptyUiState();
+    send(state, { type: "ready", capabilities: [NEOPI_CAP_TOOL_APPROVAL] });
+    const result = send(state, {
+      type: "tool_approval_request",
+      id: "prelude-approval",
+      toolCallId: "prelude-browser-abc",
+      toolName: "browser",
+      args: { url: "https://example.org/private", action: "navigate" },
+      details: [],
+    });
+    expect(result.events[0]).toMatchObject({
+      type: "request.opened",
+      payload: {
+        detail:
+          'Allow tool: browser\nArguments: {"url":"https://example.org/private","action":"navigate"}',
+      },
+    });
+    expect(result.pending?.reply("decline")).toEqual({
+      _tag: "ToolApproval",
+      frame: { type: "tool_approval_response", id: "prelude-approval", decision: "deny" },
+    });
+  });
+
   it("maps an ask select, editor and next select into successive questions with verbatim answers", () => {
     const state = emptyUiState();
     const first = send(state, {
@@ -355,5 +379,35 @@ describe("NeoPi UI mapper", () => {
       expect(result.pending).toBeUndefined();
       expect(result.events.at(-1)).toMatchObject({ type, payload });
     }
+  });
+  it("projects native plan exits once and records the resumed native mode", () => {
+    const state = emptyUiState();
+    expect(
+      send(state, { type: "t3.state", state: { mode: "plan", chatMode: "off" } }).events,
+    ).toContainEqual(
+      expect.objectContaining({
+        payload: {
+          message: "NeoPi/OMP native plan mode: plan",
+          detail: { neopiUi: { kind: "plan-mode", mode: "plan" } },
+        },
+      }),
+    );
+    expect(send(state, { type: "mode_changed", mode: "default" }).events).toContainEqual(
+      expect.objectContaining({
+        payload: {
+          message: "NeoPi/OMP native plan mode: default",
+          detail: { neopiUi: { kind: "plan-mode", mode: "default" } },
+        },
+      }),
+    );
+    expect(send(state, { type: "t3.state", state: { mode: "default" } }).events).toEqual([]);
+    expect(send(state, { type: "mode_changed", mode: "plan" }).events).toContainEqual(
+      expect.objectContaining({
+        payload: {
+          message: "NeoPi/OMP native plan mode: plan",
+          detail: { neopiUi: { kind: "plan-mode", mode: "plan" } },
+        },
+      }),
+    );
   });
 });

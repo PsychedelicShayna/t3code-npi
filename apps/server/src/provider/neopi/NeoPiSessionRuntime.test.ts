@@ -15,6 +15,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
@@ -202,6 +203,55 @@ it.live("uses shared files only with both lease and fresh-session capabilities",
         );
         yield* runtime.stop;
       }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("refuses to reopen a shared session when the replacement peer lacks a lease", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const sharedCursor = {
+        v: 1 as const,
+        sessionId: "s1",
+        sessionFile: "/tmp/omp-sessions/session.jsonl",
+        sessionDir: "/tmp/omp-sessions",
+        sharedSession: true,
+        turnBoundaries: [] as [],
+      };
+      for (const [advertised, expected] of [
+        [[], false],
+        [["session_lease"], true],
+      ] as const) {
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            cmd.type === "negotiate_protocol"
+              ? answer(cmd, emit, { protocolVersion: 2 })
+              : cmd.type === "get_state"
+                ? answer(cmd, emit, {
+                    sessionId: "s1",
+                    sessionFile: sharedCursor.sessionFile,
+                    messageCount: 0,
+                  })
+                : basicHandler(cmd, emit),
+          { ...defaultReady, capabilities: ["rpc-ui", ...advertised] },
+        );
+        const runtime = yield* make(
+          () => Effect.succeed(peer.handle),
+          sharedCursor,
+          undefined,
+          new Set(advertised),
+        );
+        if (expected) yield* runtime.start;
+        else NodeAssert.equal((yield* Effect.flip(runtime.start)).code, "startup");
+        yield* runtime.stop;
+      }
+      const unsupported = yield* make(
+        () => Effect.die("A peer without lease support must never open the shared file"),
+        sharedCursor,
+        undefined,
+        new Set(),
+      );
+      NodeAssert.equal((yield* Effect.flip(unsupported.start)).code, "startup");
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -419,6 +469,179 @@ it.live("continues approved plan work in the implementation turn without a secon
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("does not admit an implementation after its proposal cancels during boundary lookup", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let admit = false;
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_entries") {
+              if (admit) {
+                yield* Deferred.succeed(entered, undefined).pipe(Effect.ignore);
+                yield* Deferred.await(release);
+              }
+              return yield* answer(cmd, emit, { entries: [], leafId: "plan-leaf" });
+            }
+            if (cmd.type === "prompt") {
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "plan_proposal_request", id: "plan", planMarkdown: "# Plan" });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode", "plan_proposal_cancel"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("plan"));
+      yield* awaitOutcomes(frames, 1);
+      admit = true;
+      const admission = yield* runtime
+        .resolvePlanProposal({ decision: "approve" }, turn("implementation"))
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* peer.emit({ type: "plan_proposal_cancel", id: "plan", reason: "abort" });
+      yield* peer.emit({ type: "agent_end", isTerminal: true });
+      for (
+        let attempt = 0;
+        attempt < 100 && !frames.some((frame) => frame.type === "t3.plan.proposal.closed");
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.ok(frames.some((frame) => frame.type === "t3.plan.proposal.closed"));
+      yield* Deferred.succeed(release, undefined);
+      NodeAssert.equal((yield* Effect.flip(Fiber.join(admission))).code, "not_ready");
+      NodeAssert.equal(
+        peer.commands.filter((cmd) => cmd.type === "plan_proposal_response").length,
+        0,
+      );
+      NodeAssert.equal(
+        (yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries.some(
+          (boundary) => boundary.turnId === "implementation",
+        ),
+        false,
+      );
+      NodeAssert.equal(yield* SubscriptionRef.get(runtime.state), "ready");
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("fails a provisional implementation when the peer rejects its late proposal response", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let prompted = false;
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_entries")
+              return yield* answer(cmd, emit, { entries: [], leafId: "plan-leaf" });
+            if (cmd.type === "prompt") {
+              prompted = true;
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "plan_proposal_request", id: "plan", planMarkdown: "# Plan" });
+              return;
+            }
+            if (cmd.type === "plan_proposal_response" && prompted)
+              return yield* emit({
+                type: "response",
+                command: "plan_proposal_response",
+                id: cmd.id,
+                success: false,
+                error: "proposal was cancelled",
+                code: "proposal_cancelled",
+              });
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode", "plan_proposal_cancel"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("plan"));
+      yield* awaitOutcomes(frames, 1);
+      yield* runtime.resolvePlanProposal({ decision: "approve" }, turn("implementation"));
+      const outcomes = yield* awaitOutcomes(frames, 2);
+      NodeAssert.deepEqual(
+        outcomes.map((frame) => ({ turnId: frame.turnId, state: frame.state })),
+        [
+          { turnId: "plan", state: "completed" },
+          { turnId: "implementation", state: "failed" },
+        ],
+      );
+      NodeAssert.equal(
+        (yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries.some(
+          (boundary) => boundary.turnId === "implementation",
+        ),
+        false,
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("withdrawal waits for the old native run to end before a new prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "prompt") {
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "plan_proposal_request", id: "plan", planMarkdown: "# Plan" });
+              return;
+            }
+            if (cmd.type === "set_mode") {
+              yield* emit({ type: "plan_proposal_cancel", id: "plan", reason: "mode_change" });
+              yield* emit({ type: "mode_changed", mode: "default" });
+              return yield* answer(cmd, emit, { mode: "default" });
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode", "plan_proposal_cancel"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("plan"));
+      yield* awaitOutcomes(frames, 1);
+      const completed = yield* Deferred.make<void>();
+      const withdrawal = yield* runtime
+        .resolvePlanProposal({ decision: "withdraw" })
+        .pipe(Effect.andThen(Deferred.succeed(completed, undefined)), Effect.forkScoped);
+      for (
+        let attempt = 0;
+        attempt < 100 && !frames.some((frame) => frame.type === "t3.plan.proposal.closed");
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.ok(frames.some((frame) => frame.type === "t3.plan.proposal.closed"));
+      NodeAssert.equal(yield* Deferred.isDone(completed), false);
+      NodeAssert.equal(
+        peer.commands.filter((cmd) => cmd.type === "plan_proposal_response").length,
+        0,
+      );
+      yield* peer.emit({ type: "agent_end", isTerminal: true });
+      yield* Fiber.join(withdrawal);
+      NodeAssert.equal(yield* Deferred.isDone(completed), true);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("expires a native proposal when its unanswered request times out", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -600,37 +823,56 @@ it.live("takes advertised prompt entry ids rather than inferred ancestry", () =>
         NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
           { turnId: "prompt", userEntryId: advertised ? "native-user" : "extension-user" },
         ]);
-        NodeAssert.equal(
-          peer.commands.filter((cmd) => cmd.type === "get_entries").length,
-          advertised ? 1 : 2,
-        );
         yield* runtime.stop;
       }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
-it.live("retains an advertised user entry for a locally handled prompt", () =>
+it.live("distinguishes persisted local entries from reserved and absent prompt ids", () =>
   Effect.scoped(
     Effect.gen(function* () {
-      const peer = yield* testPeer(
-        (cmd, emit) =>
-          cmd.type === "negotiate_protocol"
-            ? answer(cmd, emit, { protocolVersion: 2 })
-            : cmd.type === "prompt"
-              ? answer(cmd, emit, { agentInvoked: false, userEntryId: "local-entry" })
-              : basicHandler(cmd, emit),
-        { ...defaultReady, capabilities: ["rpc-ui", "prompt_entry_ids"] },
-      );
-      const runtime = yield* make(() => Effect.succeed(peer.handle));
-      const frames = yield* capture(runtime);
-      yield* runtime.start;
-      yield* runtime.startTurn(turn("local"));
-      yield* awaitOutcomes(frames, 1);
-      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
-        { turnId: "local", userEntryId: "local-entry" },
-      ]);
-      yield* runtime.stop;
+      for (const scenario of [
+        { id: "committed", persisted: true, boundary: { userEntryId: "committed" } },
+        { id: "reserved", persisted: false, boundary: { kind: "local" } },
+        { id: undefined, persisted: false, boundary: { kind: "local" } },
+      ] as const) {
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            cmd.type === "negotiate_protocol"
+              ? answer(cmd, emit, { protocolVersion: 2 })
+              : cmd.type === "prompt"
+                ? answer(cmd, emit, {
+                    agentInvoked: false,
+                    ...(scenario.id ? { userEntryId: scenario.id } : {}),
+                  })
+                : cmd.type === "get_entries"
+                  ? answer(cmd, emit, {
+                      entries: scenario.persisted
+                        ? [
+                            {
+                              id: scenario.id,
+                              parentId: null,
+                              type: "message",
+                              message: { role: "user" },
+                            },
+                          ]
+                        : [],
+                      leafId: scenario.persisted ? scenario.id : null,
+                    })
+                  : basicHandler(cmd, emit),
+          { ...defaultReady, capabilities: ["rpc-ui", "prompt_entry_ids"] },
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("local"));
+        yield* awaitOutcomes(frames, 1);
+        NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+          { turnId: "local", ...scenario.boundary },
+        ]);
+        yield* runtime.stop;
+      }
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );

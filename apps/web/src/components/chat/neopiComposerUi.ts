@@ -2,6 +2,7 @@ import type { OrchestrationThreadActivity } from "@t3tools/contracts";
 
 export interface NeoPiComposerUi {
   readonly chatMode: "off" | "chat" | "erp" | "raw" | null;
+  readonly nativePlanMode: "default" | "plan" | null;
   readonly labels: ReadonlyArray<string>;
   readonly editor: { readonly eventId: string; readonly text: string } | null;
 }
@@ -18,6 +19,7 @@ export function projectNeoPiComposerUi(
   const status = new Map<string, string>();
   const widgets = new Map<string, string>();
   let chatMode: NeoPiComposerUi["chatMode"] = null;
+  let nativePlanMode: NeoPiComposerUi["nativePlanMode"] = null;
   let editor: NeoPiComposerUi["editor"] = null;
   for (const activity of activities) {
     if (activity.kind !== "runtime.warning") continue;
@@ -29,6 +31,8 @@ export function projectNeoPiComposerUi(
       (ui.mode === "off" || ui.mode === "chat" || ui.mode === "erp" || ui.mode === "raw")
     )
       chatMode = ui.mode;
+    if (ui.kind === "plan-mode" && (ui.mode === "default" || ui.mode === "plan"))
+      nativePlanMode = ui.mode;
     if (ui.kind === "editor" && typeof ui.text === "string")
       editor = { eventId: activity.id, text: ui.text };
     if ((ui.kind === "status" || ui.kind === "widget") && typeof ui.key === "string") {
@@ -43,7 +47,7 @@ export function projectNeoPiComposerUi(
       else destination.delete(ui.key);
     }
   }
-  return { chatMode, editor, labels: [...status.values(), ...widgets.values()] };
+  return { chatMode, nativePlanMode, editor, labels: [...status.values(), ...widgets.values()] };
 }
 
 // Persist acknowledgement for the lifetime of the loaded app, not the composer
@@ -71,7 +75,11 @@ export const composerProviderCapabilities = {
       const ui = projectNeoPiComposerUi(activities);
       return {
         editor: ui.editor,
-        displayState: [ui.chatMode ? `Chat: ${ui.chatMode}` : "", ...ui.labels]
+        displayState: [
+          ui.chatMode ? `Chat: ${ui.chatMode}` : "",
+          ui.nativePlanMode ? `Native: ${ui.nativePlanMode === "plan" ? "Plan" : "Build"}` : "",
+          ...ui.labels,
+        ]
           .filter(Boolean)
           .join(" · "),
       };

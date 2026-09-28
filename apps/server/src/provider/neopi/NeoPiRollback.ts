@@ -17,8 +17,9 @@ export async function rollbackNeoPiConversation(input: {
   numTurns: number;
   request: (command: { type: string; entryId?: string }) => Promise<unknown>;
   onBranched?: (cursor: NeoPiResumeCursor) => Promise<void>;
+  useMessageEntryIds?: boolean;
 }): Promise<NeoPiResumeCursor> {
-  const { cursor, numTurns, request, onBranched } = input;
+  const { cursor, numTurns, request, onBranched, useMessageEntryIds = false } = input;
   if (!Number.isSafeInteger(numTurns) || numTurns < 1 || numTurns > cursor.turnBoundaries.length)
     throw new NeoPiRollbackError("rollback unavailable for turns before boundary capture");
   const removed = cursor.turnBoundaries.slice(-numTurns);
@@ -27,7 +28,11 @@ export async function rollbackNeoPiConversation(input: {
   const target = removed.find(
     (turn): turn is Extract<typeof turn, { userEntryId: string }> => "userEntryId" in turn,
   );
-  if (!target && removed.some((turn) => "kind" in turn && turn.kind === "continuation"))
+  if (
+    removed
+      .slice(0, target ? removed.indexOf(target) : removed.length)
+      .some((turn) => "kind" in turn && turn.kind === "continuation")
+  )
     throw new NeoPiRollbackError(
       "rollback unavailable for a plan continuation without its original native turn",
     );
@@ -54,11 +59,21 @@ export async function rollbackNeoPiConversation(input: {
     if (id === target.userEntryId) selected = entry;
     id = entry.parentId;
   }
-  if (!selected || selected.type !== "message" || object(selected.message).role !== "user")
+  const native = object(selected?.message);
+  const branchable =
+    (selected?.type === "message" &&
+      (native.role === "user" ||
+        (native.role === "custom" &&
+          native.attribution === "user" &&
+          (native.customType === "skill-prompt" || native.customType === "collab-prompt")))) ||
+    (selected?.type === "custom_message" &&
+      selected.attribution === "user" &&
+      (selected.customType === "skill-prompt" || selected.customType === "collab-prompt"));
+  if (!branchable)
     throw new NeoPiRollbackError("Rollback boundary is not a user entry on the active ancestry");
 
   const before = await readMessages(request);
-  const grouped = groupNeoPiHistory(before, entries, leafId, cursor);
+  const grouped = groupNeoPiHistory(before, entries, leafId, cursor, useMessageEntryIds);
   const firstRemoved = grouped.findIndex((turn) => turn.id === target.turnId);
   if (firstRemoved < 0)
     throw new NeoPiRollbackError("Rollback boundary is missing from native conversation history");
@@ -67,38 +82,39 @@ export async function rollbackNeoPiConversation(input: {
   const branch = object(await request({ type: "branch", entryId: target.userEntryId }));
   if (branch.cancelled !== false)
     throw new NeoPiRollbackError("NeoPi/OMP cancelled conversation rollback");
-  const state = object(await request({ type: "get_state" }));
-  if (
-    typeof state.sessionFile !== "string" ||
-    !state.sessionFile ||
-    typeof state.sessionId !== "string" ||
-    !state.sessionId ||
-    resolve(state.sessionFile) === resolve(cursor.sessionFile) ||
-    state.sessionId === cursor.sessionId
-  )
-    throw new NeoPiRollbackError("NeoPi/OMP did not report the branched session identity");
-  const next = {
-    ...cursor,
-    sessionFile: resolve(state.sessionFile),
-    sessionId: state.sessionId,
-    turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns),
-  };
-  // Save the branch identity before checking the live conversation; the adapter
-  // can then restart on the original cursor if the new session proves inconsistent.
-  await onBranched?.(next);
   try {
+    const state = object(await request({ type: "get_state" }));
+    if (
+      typeof state.sessionFile !== "string" ||
+      !state.sessionFile ||
+      typeof state.sessionId !== "string" ||
+      !state.sessionId ||
+      resolve(state.sessionFile) === resolve(cursor.sessionFile) ||
+      state.sessionId === cursor.sessionId
+    )
+      throw new NeoPiRollbackError("NeoPi/OMP did not report the branched session identity");
+    const next = {
+      ...cursor,
+      sessionFile: resolve(state.sessionFile),
+      sessionId: state.sessionId,
+      turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns),
+    };
+    await onBranched?.(next);
     const after = await readMessages(request);
-    if (JSON.stringify(after) !== JSON.stringify(retained))
+    const persisted = useMessageEntryIds
+      ? after.filter((message) => Object.hasOwn(object(message), "entryId"))
+      : after;
+    if (JSON.stringify(persisted) !== JSON.stringify(retained))
       throw new NeoPiRollbackIntegrityError(
         "NeoPi/OMP rollback integrity error: branched conversation still contains removed or unexpected messages",
       );
+    return next;
   } catch (cause) {
     if (cause instanceof NeoPiRollbackIntegrityError) throw cause;
     throw new NeoPiRollbackIntegrityError(
       `NeoPi/OMP rollback integrity error: cannot verify branched conversation: ${String(cause)}`,
     );
   }
-  return next;
 }
 
 async function readMessages(
@@ -168,6 +184,7 @@ export function groupNeoPiHistory(
     const byEntry = new Map<string, unknown[]>();
     for (const message of messages) {
       const entryId = object(message).entryId;
+      if (entryId === undefined && !Object.hasOwn(object(message), "entryId")) continue;
       if (typeof entryId !== "string" || !seen.has(entryId))
         throw new NeoPiRollbackError("NeoPi/OMP transcript contains an unmatched native entry id");
       const items = byEntry.get(entryId);

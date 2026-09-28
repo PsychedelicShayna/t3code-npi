@@ -80,6 +80,7 @@ function parseResumeCursor(value: unknown): NeoPiResumeCursor | undefined {
     typeof cursor.sessionDir !== "string" ||
     !cursor.sessionDir ||
     !Array.isArray(cursor.turnBoundaries) ||
+    (cursor.sharedSession !== undefined && typeof cursor.sharedSession !== "boolean") ||
     !cursor.turnBoundaries.every((boundary) => {
       const entry = record(boundary);
       return (
@@ -109,6 +110,7 @@ interface Session {
   activeTurnId?: TurnId;
   lastChatMode?: Exclude<NeoPiChatMode, "off">;
   interactionMode?: NeoPiInteractionMode;
+  hostPlanHandlerGeneration?: number;
   pendingPlan?: { readonly id: string; readonly planMarkdown: string };
 }
 
@@ -196,7 +198,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       if (chatMode === "chat" || chatMode === "erp" || chatMode === "raw")
         session.lastChatMode = chatMode;
       const interactionMode = neoPiInteractionModeFromFrame(frame);
-      if (interactionMode) session.interactionMode = interactionMode;
+      if (interactionMode) {
+        session.interactionMode = interactionMode;
+        if (interactionMode === "default") delete session.hostPlanHandlerGeneration;
+      }
       if (
         data.type === "extension_ui_request" &&
         data.method === "cancel" &&
@@ -470,6 +475,86 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         ...(selection ? { modelSelection: selection } : {}),
         turnId,
       };
+      if (
+        session.runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) &&
+        /^\/chat(?:\s|$)/.test(prompt.text)
+      ) {
+        if (session.activeTurnId)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Change chat mode after the current turn finishes.",
+          });
+        const match = /^\/chat(?:\s+(chat|erp|raw|off))?(?:\s+--include\s+(\S+))?\s*$/.exec(
+          prompt.text,
+        );
+        if (!match || images.length)
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "sendTurn",
+            issue: "Use /chat [chat|erp|raw|off] [--include categories] without attachments.",
+          });
+        const current = record(
+          yield* session.runtime
+            .request({ type: "get_state" })
+            .pipe(Effect.mapError((cause) => rpcError(input.threadId, "get_state", cause))),
+        );
+        const mode: NeoPiChatMode =
+          match[1] === "chat" || match[1] === "erp" || match[1] === "raw" || match[1] === "off"
+            ? match[1]
+            : current.chatMode === "off"
+              ? (session.lastChatMode ?? "chat")
+              : "off";
+        if (mode !== "off" && input.interactionMode === "plan")
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "set_chat_mode",
+            detail: "Exit Plan mode before enabling NeoPi/OMP chat mode.",
+          });
+        if (
+          input.interactionMode === "default" &&
+          session.runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)
+        ) {
+          if (session.pendingPlan) {
+            yield* session.runtime
+              .resolvePlanProposal({ decision: "withdraw" })
+              .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_mode", cause)));
+            delete session.pendingPlan;
+          } else if (session.interactionMode === "plan") {
+            yield* session.runtime
+              .request({ type: "set_mode", mode: "default" })
+              .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_mode", cause)));
+          }
+          session.interactionMode = "default";
+          delete session.hostPlanHandlerGeneration;
+        }
+        const command: SetChatModeCommand = {
+          type: "set_chat_mode",
+          mode,
+          ...(match[2] ? { include: match[2] } : {}),
+        };
+        yield* session.runtime
+          .request(command)
+          .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_chat_mode", cause)));
+        const updated = record(
+          yield* session.runtime
+            .request({ type: "get_state" })
+            .pipe(Effect.mapError((cause) => rpcError(input.threadId, "get_state", cause))),
+        );
+        const previous = yield* SubscriptionRef.get(session.runtime.cursor);
+        yield* SubscriptionRef.set(session.runtime.cursor, {
+          ...previous,
+          turnBoundaries: [...previous.turnBoundaries, { turnId, kind: "local" }],
+        });
+        yield* processFrame(session, { type: "agent_start", turnId });
+        yield* processFrame(session, { type: "t3.state", state: updated, turnId });
+        yield* processFrame(session, { type: "t3.turn.outcome", state: "completed", turnId });
+        return {
+          threadId: input.threadId,
+          turnId,
+          resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
+        };
+      }
       if (session.pendingPlan && session.runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)) {
         const implement =
           input.interactionMode === "default" &&
@@ -508,81 +593,35 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
           };
         } else {
+          // Leaving plan mode withdraws the pending native proposal. Refining it
+          // would withhold this prompt and can lead to another unanswered proposal.
           yield* session.runtime
-            .resolvePlanProposal({ decision: "refine" })
-            .pipe(
-              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
-            );
+            .resolvePlanProposal({ decision: "withdraw" })
+            .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_mode", cause)));
           delete session.pendingPlan;
+          session.interactionMode = "default";
+          delete session.hostPlanHandlerGeneration;
         }
       }
+      if (session.runtime.prepareForTurn)
+        yield* session.runtime.prepareForTurn.pipe(
+          Effect.mapError((cause) => rpcError(input.threadId, "prepareTurn", cause)),
+        );
       if (
         session.runtime.capabilities.has(NEOPI_CAPABILITIES.setMode) &&
         input.interactionMode !== undefined &&
-        session.interactionMode !== input.interactionMode
+        (session.interactionMode !== input.interactionMode ||
+          (input.interactionMode === "plan" &&
+            session.hostPlanHandlerGeneration !== (session.runtime.processGeneration ?? 0)))
       ) {
         const command: SetModeCommand = { type: "set_mode", mode: input.interactionMode };
         yield* session.runtime
           .request(command)
           .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_mode", cause)));
         session.interactionMode = input.interactionMode;
-      }
-      if (
-        session.runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) &&
-        /^\/chat(?:\s|$)/.test(prompt.text)
-      ) {
-        if (session.activeTurnId)
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "sendTurn",
-            issue: "Change chat mode after the current turn finishes.",
-          });
-        const match = /^\/chat(?:\s+(chat|erp|raw|off))?(?:\s+--include\s+(\S+))?\s*$/.exec(
-          prompt.text,
-        );
-        if (!match || images.length)
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "sendTurn",
-            issue: "Use /chat [chat|erp|raw|off] [--include categories] without attachments.",
-          });
-        const current = record(
-          yield* session.runtime
-            .request({ type: "get_state" })
-            .pipe(Effect.mapError((cause) => rpcError(input.threadId, "get_state", cause))),
-        );
-        const mode: NeoPiChatMode =
-          match[1] === "chat" || match[1] === "erp" || match[1] === "raw" || match[1] === "off"
-            ? match[1]
-            : current.chatMode === "off"
-              ? (session.lastChatMode ?? "chat")
-              : "off";
-        const command: SetChatModeCommand = {
-          type: "set_chat_mode",
-          mode,
-          ...(match[2] ? { include: match[2] } : {}),
-        };
-        yield* session.runtime
-          .request(command)
-          .pipe(Effect.mapError((cause) => rpcError(input.threadId, "set_chat_mode", cause)));
-        const updated = record(
-          yield* session.runtime
-            .request({ type: "get_state" })
-            .pipe(Effect.mapError((cause) => rpcError(input.threadId, "get_state", cause))),
-        );
-        const previous = yield* SubscriptionRef.get(session.runtime.cursor);
-        yield* SubscriptionRef.set(session.runtime.cursor, {
-          ...previous,
-          turnBoundaries: [...previous.turnBoundaries, { turnId, kind: "local" }],
-        });
-        yield* processFrame(session, { type: "agent_start", turnId });
-        yield* processFrame(session, { type: "t3.state", state: updated, turnId });
-        yield* processFrame(session, { type: "t3.turn.outcome", state: "completed", turnId });
-        return {
-          threadId: input.threadId,
-          turnId,
-          resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
-        };
+        if (input.interactionMode === "plan")
+          session.hostPlanHandlerGeneration = session.runtime.processGeneration ?? 0;
+        else delete session.hostPlanHandlerGeneration;
       }
       if (session.activeTurnId)
         yield* session.runtime
@@ -784,6 +823,14 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
               detail: "NeoPi/OMP abort did not settle; refusing to branch a running session",
             });
         }
+        if (session.pendingPlan) {
+          yield* session.runtime
+            .resolvePlanProposal({ decision: "withdraw" })
+            .pipe(Effect.mapError((cause) => rpcError(threadId, "set_mode", cause)));
+          delete session.pendingPlan;
+          session.interactionMode = "default";
+          delete session.hostPlanHandlerGeneration;
+        }
         const cursor = yield* SubscriptionRef.get(session.runtime.cursor);
         const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
         const next = yield* Effect.tryPromise({
@@ -792,6 +839,9 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
               return await rollbackNeoPiConversation({
                 cursor,
                 numTurns,
+                useMessageEntryIds: session.runtime.capabilities.has(
+                  NEOPI_CAPABILITIES.promptEntryIds,
+                ),
                 request: (command) => runPromise(session.runtime.request(command)),
                 onBranched: async (branched) => {
                   await runPromise(SubscriptionRef.set(session.runtime.cursor, branched));
@@ -822,6 +872,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         });
         yield* SubscriptionRef.set(session.runtime.cursor, next);
         session.session = { ...session.session, resumeCursor: next };
+        if (next.sessionId !== cursor.sessionId) {
+          session.interactionMode = "default";
+          delete session.hostPlanHandlerGeneration;
+        }
         return yield* readThread(threadId);
       }),
     stopAll: () => Effect.forEach([...sessions.values()], stopInternal, { discard: true }),

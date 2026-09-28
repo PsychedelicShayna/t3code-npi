@@ -20,7 +20,7 @@ import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { buildNeoPiLaunchPlan } from "./NeoPiLaunchArgs.ts";
+import { buildNeoPiLaunchPlan, isSharedNeoPiCursor } from "./NeoPiLaunchArgs.ts";
 import { NEOPI_CAPABILITIES, neopiCompatibility } from "./NeoPiCompatibility.ts";
 import { neoPiRoleFromModelSlug } from "./NeoPiModelCatalog.ts";
 import { NeoPiRuntimeError } from "./NeoPiRuntimeError.ts";
@@ -131,6 +131,8 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         readonly id: string;
         readonly done: Deferred.Deferred<void, NeoPiRuntimeError>;
         resolving: boolean;
+        withdrawing?: boolean;
+        closed?: boolean;
       }
     | undefined;
   let mode = input.runtimeMode;
@@ -188,19 +190,40 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   const captureBoundary = (turn: ActiveTurn) =>
     Effect.gen(function* () {
       if (capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) {
-        if (turn.promptReady) {
-          const outcome = yield* Deferred.await((yield* Deferred.await(turn.promptReady)).outcome);
-          if (outcome.kind === "agent") turn.agentInvoked = true;
-          if (outcome.kind !== "rejected" && outcome.userEntryId) {
-            const previous = yield* SubscriptionRef.get(cursor);
-            yield* SubscriptionRef.set(cursor, {
-              ...previous,
-              turnBoundaries: [
-                ...previous.turnBoundaries,
-                { turnId: turn.id, userEntryId: outcome.userEntryId },
-              ],
-            });
+        if (!turn.promptReady) return;
+        const outcome = yield* Deferred.await((yield* Deferred.await(turn.promptReady)).outcome);
+        if (outcome.kind === "rejected") return;
+        if (outcome.kind === "agent") turn.agentInvoked = true;
+        let boundary: NeoPiResumeCursor["turnBoundaries"][number] | undefined;
+        if (outcome.userEntryId) {
+          const result = record(
+            yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
+          );
+          const entries = Array.isArray(result.entries) ? result.entries.map(record) : [];
+          const byId = new Map(
+            entries
+              .filter((entry) => typeof entry.id === "string")
+              .map((entry) => [entry.id, entry]),
+          );
+          let id = typeof result.leafId === "string" ? result.leafId : null;
+          const seen = new Set<string>();
+          while (id && !seen.has(id)) {
+            if (id === outcome.userEntryId) {
+              boundary = { turnId: turn.id, userEntryId: id };
+              break;
+            }
+            seen.add(id);
+            const entry = byId.get(id);
+            id = typeof entry?.parentId === "string" ? entry.parentId : null;
           }
+        }
+        if (!boundary && outcome.kind === "local") boundary = { turnId: turn.id, kind: "local" };
+        if (boundary) {
+          const previous = yield* SubscriptionRef.get(cursor);
+          yield* SubscriptionRef.set(cursor, {
+            ...previous,
+            turnBoundaries: [...previous.turnBoundaries, boundary],
+          });
         }
         return;
       }
@@ -284,6 +307,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         else yield* rememberBoundary(turn);
       }
       if (
+        !(turn.continuation && outcome !== "completed") &&
         !(yield* SubscriptionRef.get(cursor)).turnBoundaries.some(
           (boundary) => boundary.turnId === turn.id,
         )
@@ -320,10 +344,42 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         yield* rememberBoundary(turn).pipe(Effect.forkIn(lifetime!));
       }
     });
+  const rejectProposal = (proposal: NonNullable<typeof pendingProposal>, message: string) =>
+    Effect.gen(function* () {
+      if (pendingProposal === proposal) {
+        pendingProposal = undefined;
+        if (!proposal.closed) yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+      }
+      const turn = active;
+      if (turn?.continuation) {
+        const previous = yield* SubscriptionRef.get(cursor);
+        yield* SubscriptionRef.set(cursor, {
+          ...previous,
+          turnBoundaries: previous.turnBoundaries.filter((boundary) => boundary.turnId !== turn.id),
+        });
+        yield* settle(turn, "failed", message);
+      }
+      yield* Deferred.fail(
+        proposal.done,
+        new NeoPiRuntimeError({ code: "not_ready", message }),
+      ).pipe(Effect.ignore);
+    });
   const handleEvent = (frame: NeoPiRuntimeFrame) =>
     Effect.gen(function* () {
       const turn = active;
       yield* emit({ ...frame, ...(turn ? { turnId: turn.id } : {}) });
+      const rejected = pendingProposal;
+      if (
+        frame.type === "t3.plan.proposal.rejected" &&
+        rejected !== undefined &&
+        rejected.id === frame.id
+      ) {
+        yield* rejectProposal(
+          rejected,
+          typeof frame.error === "string" ? frame.error : "NeoPi/OMP rejected the plan proposal",
+        );
+        return;
+      }
       if (
         (frame.type === "model_changed" || frame.type === "config_warnings_changed") &&
         !record(frame).model
@@ -345,20 +401,30 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         yield* settle(turn, "completed");
         return;
       }
-      if (
-        pendingProposal &&
-        ((frame.type === "agent_end" && frame.isTerminal !== false && pendingProposal.resolving) ||
-          (capabilities.has(NEOPI_CAPABILITIES.planProposalCancel)
-            ? frame.type === "plan_proposal_cancel" && frame.id === pendingProposal.id
-            : (frame.type === "agent_end" && frame.isTerminal !== false) ||
-              (frame.type === "mode_changed" &&
-                frame.mode !== "plan" &&
-                !pendingProposal.resolving)))
-      ) {
+      if (pendingProposal) {
         const proposal = pendingProposal;
-        pendingProposal = undefined;
-        yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
-        yield* Deferred.succeed(proposal.done, undefined).pipe(Effect.ignore);
+        const terminal = frame.type === "agent_end" && frame.isTerminal !== false;
+        const cancelled = capabilities.has(NEOPI_CAPABILITIES.planProposalCancel)
+          ? frame.type === "plan_proposal_cancel" && frame.id === proposal.id
+          : (terminal && !proposal.resolving) ||
+            (frame.type === "mode_changed" && frame.mode !== "plan" && !proposal.resolving);
+        if (cancelled && !proposal.closed) {
+          proposal.closed = true;
+          yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+        }
+        if (cancelled && proposal.resolving && !proposal.withdrawing && turn?.continuation) {
+          yield* rejectProposal(proposal, "NeoPi/OMP cancelled the proposed plan");
+          return;
+        }
+        if (
+          (terminal &&
+            (proposal.resolving || !capabilities.has(NEOPI_CAPABILITIES.planProposalCancel))) ||
+          (cancelled && !proposal.withdrawing)
+        ) {
+          pendingProposal = undefined;
+          if (!proposal.closed) yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
+          yield* Deferred.succeed(proposal.done, undefined).pipe(Effect.ignore);
+        }
       }
       if (!turn) return;
       if (
@@ -498,10 +564,21 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     const epoch = ++generation;
     const saved = yield* SubscriptionRef.get(cursor);
     const resume = saved.sessionId ? saved : undefined;
-    const sharedSession =
-      !resume &&
-      input.sharedSessionCapabilities?.has(NEOPI_CAPABILITIES.sessionLease) === true &&
-      input.sharedSessionCapabilities.has(NEOPI_CAPABILITIES.newSession);
+    const sharedSession = resume
+      ? isSharedNeoPiCursor(resume, input.t3Home)
+      : input.sharedSessionCapabilities?.has(NEOPI_CAPABILITIES.sessionLease) === true &&
+        input.sharedSessionCapabilities.has(NEOPI_CAPABILITIES.newSession);
+    if (
+      resume &&
+      sharedSession &&
+      !input.sharedSessionCapabilities?.has(NEOPI_CAPABILITIES.sessionLease)
+    ) {
+      yield* setState("failed");
+      return yield* new NeoPiRuntimeError({
+        code: "startup",
+        message: "NeoPi/OMP cannot reopen a shared session without verified lease support.",
+      });
+    }
     const launch = yield* buildNeoPiLaunchPlan({
       ...input,
       runtimeMode: mode,
@@ -571,7 +648,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       if (
         sharedSession &&
         (!peer.capabilities.has(NEOPI_CAPABILITIES.sessionLease) ||
-          !peer.capabilities.has(NEOPI_CAPABILITIES.newSession))
+          (!resume && !peer.capabilities.has(NEOPI_CAPABILITIES.newSession)))
       )
         return yield* new NeoPiRuntimeError({
           code: "startup",
@@ -627,6 +704,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         sessionId: initial.sessionId,
         sessionFile: file,
         sessionDir: launch.sessionDir || dirname(file),
+        sharedSession,
       });
       if (capabilities.has(NEOPI_CAPABILITIES.toolApprovalRequest)) {
         const configured = record(
@@ -714,10 +792,13 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       yield* start;
       pendingMode = false;
     });
+  const prepareForTurn = Effect.gen(function* () {
+    if (pendingMode && (yield* SubscriptionRef.get(state)) === "ready")
+      yield* restart("runtime-mode-change");
+  });
   const startTurn = (turn: NeoPiTurnInput) =>
     Effect.gen(function* () {
-      if (pendingMode && (yield* SubscriptionRef.get(state)) === "ready")
-        yield* restart("runtime-mode-change");
+      yield* prepareForTurn;
       if ((yield* SubscriptionRef.get(state)) !== "ready" || compacting)
         return yield* new NeoPiRuntimeError({
           code: "not_ready",
@@ -783,9 +864,29 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           code: "not_ready",
           message: "NeoPi/OMP has no pending plan proposal for this action",
         });
+      if (response.decision === "withdraw") {
+        proposal.resolving = true;
+        proposal.withdrawing = true;
+        yield* request({ type: "set_mode", mode: "default" }).pipe(
+          Effect.mapError(rpcError),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              proposal.resolving = false;
+              proposal.withdrawing = false;
+            }),
+          ),
+        );
+        yield* Deferred.await(proposal.done);
+        return;
+      }
       const beforeRefinement = continuation
         ? record(yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError))).leafId
         : undefined;
+      if (pendingProposal !== proposal || proposal.resolving)
+        return yield* new NeoPiRuntimeError({
+          code: "not_ready",
+          message: "NeoPi/OMP cancelled this plan before its response could be sent",
+        });
       if (continuation) {
         if (typeof beforeRefinement !== "string")
           return yield* new NeoPiRuntimeError({
@@ -812,14 +913,27 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         });
         active = entry;
         yield* setState("running");
+        if (pendingProposal !== proposal) {
+          yield* rejectProposal(proposal, "NeoPi/OMP cancelled this plan before admission");
+          return yield* new NeoPiRuntimeError({
+            code: "not_ready",
+            message: "NeoPi/OMP cancelled this plan before admission",
+          });
+        }
       } else proposal.resolving = true;
+      const peer = yield* current();
+      if (pendingProposal !== proposal)
+        return yield* new NeoPiRuntimeError({
+          code: "not_ready",
+          message: "NeoPi/OMP cancelled this plan before its response could be sent",
+        });
       const frame: PlanProposalResponseFrame = {
         type: "plan_proposal_response",
         id: proposal.id,
         decision: response.decision,
         ...(response.feedback ? { feedback: response.feedback } : {}),
       };
-      yield* (yield* current()).writeFrame(frame).pipe(
+      yield* peer.writeFrame(frame).pipe(
         Effect.mapError(rpcError),
         Effect.tapError(() =>
           Effect.gen(function* () {
@@ -951,6 +1065,10 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
     threadId: input.threadId,
     state,
     cursor,
+    get processGeneration() {
+      return generation;
+    },
+    prepareForTurn,
     capabilities,
     start,
     startTurn,

@@ -9,6 +9,7 @@ import {
   type NeoPiSettings,
   type ProviderRuntimeEvent,
 } from "@t3tools/contracts";
+import { NeoPiRpcError } from "effect-neopi-rpc/errors";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -280,10 +281,21 @@ for (const capable of [false, true])
         }> = [];
         const writes: unknown[] = [];
         let proposalId = "proposal-1";
+        let generation = 1;
+        let restartBeforeNext = false;
         const turns: string[] = [];
         const capabilities = capable ? new Set(["v2", "set_mode", "get_usage"]) : new Set(["v2"]);
         const runtime: NeoPiSessionRuntimeShape = {
           threadId,
+          get processGeneration() {
+            return generation;
+          },
+          prepareForTurn: Effect.sync(() => {
+            if (restartBeforeNext) {
+              generation++;
+              restartBeforeNext = false;
+            }
+          }),
           state,
           cursor,
           capabilities,
@@ -311,7 +323,7 @@ for (const capable of [false, true])
           request: (command) =>
             Effect.sync(() => {
               requests.push(command);
-              if (command.type === "get_state") return { mode: "default" };
+              if (command.type === "get_state") return { mode: capable ? "plan" : "default" };
               if (command.type === "get_usage") return { provider: "openai", windows: [] };
               return {};
             }),
@@ -412,6 +424,7 @@ for (const capable of [false, true])
           )
             yield* Effect.sleep("10 millis");
           yield* SubscriptionRef.set(state, "ready");
+          restartBeforeNext = true;
           const repeated = yield* adapter.sendTurn({
             threadId,
             input: "plan again",
@@ -462,7 +475,10 @@ for (const capable of [false, true])
         const setModeRequests = requests.filter((command) => command.type === "set_mode");
         const usageRequests = requests.filter((command) => command.type === "get_usage");
         if (capable) {
-          assert.deepEqual(setModeRequests, [{ type: "set_mode", mode: "plan" }]);
+          assert.deepEqual(setModeRequests, [
+            { type: "set_mode", mode: "plan" },
+            { type: "set_mode", mode: "plan" },
+          ]);
           assert.deepEqual(usageRequests, [
             { type: "get_usage", provider: "openai", redact: true },
           ]);
@@ -585,9 +601,380 @@ for (const capable of [false, true])
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
-for (const skipConversationRestore of [false, true])
+it.live("withdraws a pending plan before admitting an ordinary default-mode prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const home = yield* fs.makeTempDirectoryScoped({ prefix: "neopi-plan-exit-" });
+      const hub = yield* makeNeoPiDiscoveryHub();
+      const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+      const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
+      const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
+        v: 1,
+        sessionId: "s",
+        sessionFile: `${home}/session.jsonl`,
+        sessionDir: home,
+        turnBoundaries: [],
+      });
+      const calls: string[] = [];
+      let nativeMode: "default" | "plan" = "plan";
+      let chatMode: "off" | "chat" = "off";
+      const runtime: NeoPiSessionRuntimeShape = {
+        threadId,
+        state,
+        cursor,
+        capabilities: new Set(["v2", "set_mode", "set_chat_mode"]),
+        start: SubscriptionRef.set(state, "ready"),
+        startTurn: (input) =>
+          Effect.sync(() => {
+            calls.push(`prompt:${input.text}`);
+          }).pipe(Effect.as({ turnId: input.turnId })),
+        steer: () => Effect.void,
+        interrupt: Effect.void,
+        compact: () => Effect.void,
+        resolvePlanProposal: (response) =>
+          Effect.sync(() => {
+            calls.push(`proposal:${response.decision}`);
+            if (response.decision === "withdraw") nativeMode = "default";
+          }),
+        respondUi: () => Effect.void,
+        writeFrame: () => Effect.void,
+        request: (cmd) =>
+          Effect.gen(function* () {
+            if (cmd.type === "get_state") return { mode: nativeMode, chatMode };
+            if (cmd.type === "set_mode") {
+              const mode = "mode" in cmd ? cmd.mode : undefined;
+              calls.push(`mode:${String(mode)}`);
+              if (mode === "plan" && chatMode !== "off")
+                return yield* new NeoPiRpcError({
+                  code: "mode_blocked",
+                  command: "set_mode",
+                  message: "Exit chat mode first.",
+                });
+              if (mode === "default" || mode === "plan") nativeMode = mode;
+            }
+            if (cmd.type === "set_chat_mode") {
+              const mode = "mode" in cmd ? cmd.mode : undefined;
+              calls.push(`chat:${String(mode)}`);
+              if (nativeMode === "plan" && mode !== "off")
+                return yield* new NeoPiRpcError({
+                  code: "rpc",
+                  command: "set_chat_mode",
+                  message: "Exit plan mode first.",
+                });
+              if (mode === "off" || mode === "chat") chatMode = mode;
+            }
+            return {};
+          }),
+        frames: Stream.fromQueue(frames),
+        restart: () => Effect.void,
+        stop: Effect.void,
+        setRuntimeMode: () => Effect.void,
+        onSessionIdentityMayHaveChanged: Effect.void,
+        applyModelSelection: () => Effect.void,
+      };
+      const adapter = yield* makeNeoPiAdapter({
+        settings,
+        instanceId,
+        binary: "npi",
+        cwd: home,
+        t3Home: home,
+        attachmentsDir: home,
+        environment: {},
+        spawn: spawner.spawn,
+        discovery: hub,
+        makeRuntime: () => Effect.succeed(runtime),
+      });
+      const observed: ProviderRuntimeEvent[] = [];
+      yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          observed.push(event);
+        }),
+      ).pipe(Effect.forkScoped);
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("neopi"),
+        providerInstanceId: instanceId,
+        cwd: home,
+        runtimeMode: "auto",
+      });
+      yield* Queue.offer(frames, {
+        type: "plan_proposal_request",
+        id: "pending",
+        title: "Plan",
+        planFilePath: "xd://plan",
+        planMarkdown: "# Plan",
+      });
+      for (
+        let attempt = 0;
+        attempt < 100 && !observed.some((event) => event.type === "turn.proposed.completed");
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      assert.ok(observed.some((event) => event.type === "turn.proposed.completed"));
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Forget this plan; answer the question",
+        interactionMode: "default",
+      });
+      assert.deepEqual(calls, [
+        "proposal:withdraw",
+        "prompt:Forget this plan; answer the question",
+      ]);
+      yield* Queue.offer(frames, { type: "t3.turn.outcome", state: "completed" });
+      for (
+        let attempt = 0;
+        attempt < 100 && (yield* adapter.listSessions())[0]?.status !== "ready";
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      yield* adapter.sendTurn({ threadId, input: "/chat chat", interactionMode: "default" });
+      assert.equal(chatMode, "chat");
+      const blocked = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "plan while chatting",
+          interactionMode: "plan",
+        })
+        .pipe(Effect.flip);
+      assert.match(blocked.message, /Exit chat mode first/);
+      assert.equal(nativeMode, "default");
+      assert.equal(
+        calls.some((call) => call === "prompt:plan while chatting"),
+        false,
+      );
+      yield* adapter.sendTurn({ threadId, input: "/chat off", interactionMode: "plan" });
+      assert.equal(chatMode, "off");
+      yield* adapter.sendTurn({ threadId, input: "plan after chat", interactionMode: "plan" });
+      assert.equal(nativeMode, "plan");
+      assert.ok(calls.includes("prompt:plan after chat"));
+      yield* Queue.offer(frames, { type: "t3.turn.outcome", state: "completed" });
+      for (
+        let attempt = 0;
+        attempt < 100 && (yield* adapter.listSessions())[0]?.status !== "ready";
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      const nativeBlockedChat = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "/chat chat",
+        })
+        .pipe(Effect.flip);
+      assert.match(nativeBlockedChat.message, /Exit plan mode first/);
+      assert.equal(chatMode, "off");
+      const blockedChat = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "/chat chat",
+          interactionMode: "plan",
+        })
+        .pipe(Effect.flip);
+      assert.match(blockedChat.message, /Exit Plan mode/);
+      assert.equal(chatMode, "off");
+      assert.equal(nativeMode, "plan");
+      yield* adapter.sendTurn({ threadId, input: "/chat chat", interactionMode: "default" });
+      assert.equal(nativeMode, "default");
+      assert.equal(chatMode, "chat");
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "withdraws a pending proposal before branching and reinstalls Plan on the next prompt",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const home = yield* fs.makeTempDirectoryScoped({ prefix: "neopi-plan-branch-" });
+        const hub = yield* makeNeoPiDiscoveryHub();
+        const state = yield* SubscriptionRef.make<NeoPiRuntimeState>("stopped");
+        const frames = yield* Queue.unbounded<NeoPiRuntimeFrame>();
+        const cursor = yield* SubscriptionRef.make<NeoPiResumeCursor>({
+          v: 1,
+          sessionId: "old",
+          sessionFile: `${home}/old.jsonl`,
+          sessionDir: home,
+          turnBoundaries: [{ turnId: TurnId.make("plan"), userEntryId: "u1" }],
+        });
+        const calls: string[] = [];
+        let branched = false;
+        let nativeMode: "plan" | "default" = "plan";
+        const runtime: NeoPiSessionRuntimeShape = {
+          threadId,
+          state,
+          cursor,
+          capabilities: new Set(["v2", "set_mode"]),
+          start: SubscriptionRef.set(state, "ready"),
+          startTurn: (input) =>
+            Effect.sync(() => {
+              calls.push(`prompt:${input.text}`);
+              return { turnId: input.turnId };
+            }),
+          steer: () => Effect.void,
+          interrupt: Effect.void,
+          compact: () => Effect.void,
+          resolvePlanProposal: (response) =>
+            Effect.gen(function* () {
+              calls.push(`proposal:${response.decision}`);
+              if (response.decision === "withdraw") {
+                nativeMode = "default";
+                yield* Queue.offer(frames, {
+                  type: "plan_proposal_cancel",
+                  id: "pending",
+                  reason: "mode_change",
+                });
+                yield* Queue.offer(frames, { type: "mode_changed", mode: "default" });
+              }
+            }),
+          respondUi: () => Effect.void,
+          writeFrame: () => Effect.void,
+          request: (cmd) =>
+            Effect.gen(function* () {
+              if (cmd.type === "get_state")
+                return {
+                  mode: nativeMode,
+                  sessionId: branched ? "new" : "old",
+                  sessionFile: `${home}/${branched ? "new" : "old"}.jsonl`,
+                };
+              if (cmd.type === "get_entries")
+                return branched
+                  ? { entries: [], leafId: null }
+                  : {
+                      entries: [
+                        {
+                          id: "u1",
+                          parentId: null,
+                          type: "message",
+                          message: { role: "user", content: [{ type: "text", text: "plan" }] },
+                        },
+                      ],
+                      leafId: "u1",
+                    };
+              if (cmd.type === "get_messages_page")
+                return {
+                  messages: branched
+                    ? []
+                    : [{ role: "user", content: [{ type: "text", text: "plan" }] }],
+                };
+              if (cmd.type === "branch") {
+                calls.push("branch");
+                branched = true;
+                nativeMode = "default";
+                yield* Queue.offer(frames, { type: "mode_changed", mode: "default" });
+                return { cancelled: false };
+              }
+              if (cmd.type === "set_mode") {
+                const mode = "mode" in cmd ? cmd.mode : undefined;
+                calls.push(`mode:${String(mode)}`);
+                if (mode === "plan" || mode === "default") {
+                  nativeMode = mode;
+                  yield* Queue.offer(frames, { type: "mode_changed", mode });
+                }
+              }
+              return {};
+            }),
+          frames: Stream.fromQueue(frames),
+          restart: () => Effect.void,
+          stop: Effect.void,
+          setRuntimeMode: () => Effect.void,
+          onSessionIdentityMayHaveChanged: Effect.void,
+          applyModelSelection: () => Effect.void,
+        };
+        const adapter = yield* makeNeoPiAdapter({
+          settings,
+          instanceId,
+          binary: "npi",
+          cwd: home,
+          t3Home: home,
+          attachmentsDir: home,
+          environment: {},
+          spawn: spawner.spawn,
+          discovery: hub,
+          makeRuntime: () => Effect.succeed(runtime),
+        });
+        const observed: ProviderRuntimeEvent[] = [];
+        yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => {
+            observed.push(event);
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* adapter.startSession({
+          threadId,
+          provider: ProviderDriverKind.make("neopi"),
+          providerInstanceId: instanceId,
+          cwd: home,
+          runtimeMode: "auto",
+        });
+        yield* Queue.offer(frames, {
+          type: "plan_proposal_request",
+          id: "pending",
+          title: "Plan",
+          planFilePath: "xd://plan",
+          planMarkdown: "# Plan",
+        });
+        for (
+          let attempt = 0;
+          attempt < 100 && !observed.some((event) => event.type === "turn.proposed.completed");
+          attempt++
+        )
+          yield* Effect.sleep("5 millis");
+        assert.ok(observed.some((event) => event.type === "turn.proposed.completed"));
+        const rolled = yield* adapter.rollbackThread(threadId, 1);
+        assert.deepEqual(rolled.turns, []);
+        assert.ok(calls.indexOf("proposal:withdraw") < calls.indexOf("branch"));
+        assert.equal(nativeMode, "default");
+        for (
+          let attempt = 0;
+          attempt < 100 &&
+          !observed.some(
+            (event) =>
+              event.type === "runtime.warning" &&
+              event.payload.message === "NeoPi/OMP native plan mode: default",
+          );
+          attempt++
+        )
+          yield* Effect.sleep("5 millis");
+        const nativeDefaultAt = observed.findIndex(
+          (event) =>
+            event.type === "runtime.warning" &&
+            event.payload.message === "NeoPi/OMP native plan mode: default",
+        );
+        assert.ok(nativeDefaultAt >= 0);
+        yield* adapter.sendTurn({ threadId, input: "new plan", interactionMode: "plan" });
+        assert.deepEqual(calls.slice(-2), ["mode:plan", "prompt:new plan"]);
+        assert.equal(nativeMode, "plan");
+        for (
+          let attempt = 0;
+          attempt < 100 &&
+          !observed
+            .slice(nativeDefaultAt + 1)
+            .some(
+              (event) =>
+                event.type === "runtime.warning" &&
+                event.payload.message === "NeoPi/OMP native plan mode: plan",
+            );
+          attempt++
+        )
+          yield* Effect.sleep("5 millis");
+        assert.ok(
+          observed
+            .slice(nativeDefaultAt + 1)
+            .some(
+              (event) =>
+                event.type === "runtime.warning" &&
+                event.payload.message === "NeoPi/OMP native plan mode: plan",
+            ),
+        );
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+for (const failure of ["none", "transcript", "state"] as const)
   it.live(
-    `rollback ${skipConversationRestore ? "rejects preserved live messages" : "persists the branched cursor"}`,
+    `rollback ${failure === "none" ? "persists the branched cursor" : `restores the original cursor after ${failure} failure`}`,
     () =>
       Effect.scoped(
         Effect.gen(function* () {
@@ -627,7 +1014,8 @@ for (const skipConversationRestore of [false, true])
             { id: "compact", parentId: "summary", type: "compaction", summary: "compressed" },
           ];
           let branched = false;
-          let preserveLiveMessages = skipConversationRestore;
+          let preserveLiveMessages = failure === "transcript";
+          let failState = failure === "state";
           const resumedSessions: string[] = [];
           const requests: string[] = [];
           let runningTurnId: TurnId | undefined;
@@ -665,8 +1053,13 @@ for (const skipConversationRestore of [false, true])
                   branched = true;
                   return { cancelled: false };
                 }
-                if (cmd.type === "get_state")
+                if (cmd.type === "get_state") {
+                  if (branched && failState) {
+                    failState = false;
+                    throw new Error("state unavailable after branch");
+                  }
                   return { sessionFile: `${home}/new.jsonl`, sessionId: "new" };
+                }
                 return {
                   messages:
                     branched && !preserveLiveMessages
@@ -721,7 +1114,7 @@ for (const skipConversationRestore of [false, true])
           const rewind = yield* Effect.exit(adapter.rollbackThread(threadId, 1));
           assert.ok(requests.indexOf("abort") >= 0);
           assert.ok(requests.indexOf("abort") < requests.indexOf("branch:u1"));
-          if (skipConversationRestore) {
+          if (failure !== "none") {
             assert.equal(rewind._tag, "Failure");
             if (rewind._tag === "Failure")
               assert.match(Cause.pretty(rewind.cause), /rollback integrity error/);

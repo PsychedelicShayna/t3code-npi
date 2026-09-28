@@ -22,10 +22,12 @@ describe("NeoPi extension composer activity projection", () => {
         activity("d", { kind: "status", key: "job", text: "" }),
         activity("e", { kind: "widget", key: "progress", lines: [] }),
         activity("f", { kind: "chat-mode", mode: "erp" }),
+        activity("plan", { kind: "plan-mode", mode: "default" }),
         activity("g", { kind: "editor", text: "suggestion" }),
       ]),
     ).toEqual({
       chatMode: "erp",
+      nativePlanMode: "default",
       labels: ["waiting"],
       editor: { eventId: "g", text: "suggestion" },
     });
@@ -63,6 +65,13 @@ describe("NeoPi extension composer activity projection", () => {
     expect(
       provider.project([activity("mode", { kind: "chat-mode", mode: "erp" })]).displayState,
     ).toBe("Chat: erp");
+    expect(
+      provider.project([
+        activity("chat", { kind: "chat-mode", mode: "off" }),
+        activity("entered", { kind: "plan-mode", mode: "plan" }),
+        activity("branched", { kind: "plan-mode", mode: "default" }),
+      ]).displayState,
+    ).toBe("Chat: off · Native: Build");
     expect(provider.commandSourceLabel("mcp_prompt")).toBe(" · MCP prompt");
     expect(provider.skillReplacement("review")).toBe("/skill:review ");
     expect(composerCapabilitiesForProvider("codex")).toBeUndefined();

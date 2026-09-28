@@ -334,16 +334,25 @@ const isFailedAssistant = (message: unknown): boolean => {
   return typeof message.errorMessage === "string" && message.errorMessage.length > 0;
 };
 
-const textFromAgentEnd = (frame: SessionEventFrame): string => {
+const finalAssistantFromAgentEnd = (
+  frame: SessionEventFrame,
+): { text: string; failure?: string } | undefined => {
   const messages = frame.messages;
-  if (!Array.isArray(messages)) return "";
+  if (!Array.isArray(messages)) return undefined;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (isFailedAssistant(message)) continue;
-    const text = textFromMessage(message);
-    if (text.length > 0) return text;
+    if (!isRecord(message) || message.role !== "assistant") continue;
+    if (isFailedAssistant(message))
+      return {
+        text: "",
+        failure:
+          typeof message.errorMessage === "string" && message.errorMessage
+            ? message.errorMessage
+            : `Final NeoPi/OMP assistant attempt ${String(message.stopReason)}.`,
+      };
+    return { text: textFromMessage(message) };
   }
-  return "";
+  return undefined;
 };
 
 interface AssistantAttempt {
@@ -400,12 +409,16 @@ const collectAssistantText = (
           if (isFailedAssistant(frame.message)) current.failed = true;
         }
         if (isTerminalAgentEnd(frame)) {
-          const authoritative = textFromAgentEnd(frame);
-          const sameAttempt = !current.failed ? current.snapshot || current.deltas : "";
-          yield* Deferred.succeed(
-            settled,
-            authoritative.length > 0 ? authoritative : sameAttempt,
-          ).pipe(Effect.ignore);
+          const final = finalAssistantFromAgentEnd(frame);
+          if (final?.failure) {
+            yield* Deferred.fail(
+              settled,
+              new TextGenerationError({ operation, detail: final.failure }),
+            ).pipe(Effect.ignore);
+          } else {
+            const sameAttempt = !current.failed ? current.snapshot || current.deltas : "";
+            yield* Deferred.succeed(settled, final ? final.text : sameAttempt).pipe(Effect.ignore);
+          }
         }
       }),
     ).pipe(Effect.forkScoped);

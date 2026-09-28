@@ -27,6 +27,8 @@ export type NeoPiResumeCursor = {
   readonly sessionFile: string;
   readonly sessionId: string;
   readonly sessionDir: string;
+  /** Shared native storage requires a cooperating session lease on every reopen. */
+  readonly sharedSession?: boolean;
   readonly turnBoundaries: ReadonlyArray<
     | { readonly turnId: TurnId; readonly userEntryId: string }
     | { readonly turnId: TurnId; readonly kind: "local" | "unknown" }
@@ -60,6 +62,8 @@ export interface NeoPiSessionRuntimeShape {
   readonly threadId: ThreadId;
   readonly state: SubscriptionRef.SubscriptionRef<NeoPiRuntimeState>;
   readonly cursor: SubscriptionRef.SubscriptionRef<NeoPiResumeCursor>;
+  readonly processGeneration?: number;
+  readonly prepareForTurn?: Effect.Effect<void, NeoPiRuntimeError>;
   readonly capabilities: ReadonlySet<string>;
   readonly start: Effect.Effect<void, NeoPiRuntimeError>;
   readonly startTurn: (
@@ -69,7 +73,7 @@ export interface NeoPiSessionRuntimeShape {
   readonly interrupt: Effect.Effect<void, NeoPiRuntimeError>;
   readonly compact: (customInstructions?: string) => Effect.Effect<void, NeoPiRuntimeError>;
   readonly resolvePlanProposal: (
-    response: { readonly decision: "approve" | "refine"; readonly feedback?: string },
+    response: { readonly decision: "approve" | "refine" | "withdraw"; readonly feedback?: string },
     continuation?: NeoPiTurnInput,
   ) => Effect.Effect<void, NeoPiRuntimeError>;
   readonly respondUi: NeoPiRpcClient["respondUi"];

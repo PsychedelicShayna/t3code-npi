@@ -453,6 +453,66 @@ it.live("keeps only the successful retry after a partial JSON draft fails", () =
   ),
 );
 
+it.live("rejects a failed final assistant attempt rather than publishing an earlier draft", () =>
+  withNode(
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const stopReason of ["error", "aborted"]) {
+          const first = jsonText({ title: "Outdated title", needsRefinement: false });
+          const { textGeneration } = yield* makeHarness({
+            peerSource: streamingPeer([
+              { type: "message_start", message: { role: "assistant" }, messageId: "draft" },
+              {
+                type: "message_end",
+                messageId: "draft",
+                message: { role: "assistant", content: [{ type: "text", text: first }] },
+              },
+              { type: "message_start", message: { role: "assistant" }, messageId: "final" },
+              {
+                type: "message_end",
+                messageId: "final",
+                message: {
+                  role: "assistant",
+                  content: [{ type: "text", text: "failed revision" }],
+                  stopReason,
+                  errorMessage: "final attempt failed",
+                },
+              },
+              {
+                type: "agent_end",
+                isTerminal: true,
+                messages: [
+                  { role: "assistant", content: [{ type: "text", text: first }] },
+                  {
+                    role: "assistant",
+                    content: [{ type: "text", text: "failed revision" }],
+                    stopReason,
+                    errorMessage: "final attempt failed",
+                  },
+                ],
+              },
+            ]),
+          });
+          const result = yield* textGeneration
+            .generateThreadTitle({
+              cwd: process.cwd(),
+              message: "Generate a title",
+              modelSelection: TEST_MODEL,
+            })
+            .pipe(
+              Effect.match({
+                onFailure: (error) => ({ error }),
+                onSuccess: (value) => ({ value }),
+              }),
+            );
+          expect("error" in result).toBe(true);
+          if ("error" in result) expect(result.error.detail).toContain("final attempt failed");
+        }
+      }),
+    ),
+  ),
+);
+
 it.live("uses the last complete answer when the model corrects itself", () =>
   withNode(
     Effect.scoped(
