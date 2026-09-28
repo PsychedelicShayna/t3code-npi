@@ -37,6 +37,14 @@ describe("NeoPi command catalog", () => {
       ],
     });
   });
+  it("hides the native builtin model command while keeping T3's model picker distinct", () => {
+    const catalog = toNeoPiCommandCatalog([
+      { name: "model", source: "builtin", description: "Choose a NeoPi model" },
+      { name: "model", source: "extension", description: "Duplicate" },
+      { name: "models", source: "builtin" },
+    ]);
+    expect(catalog.slashCommands.map((command) => command.name)).toEqual(["models"]);
+  });
   it("places chat first only when supported or explicitly listed by the peer", () => {
     expect(
       toNeoPiCommandCatalog(commands).slashCommands.some((command) => command.name === "chat"),

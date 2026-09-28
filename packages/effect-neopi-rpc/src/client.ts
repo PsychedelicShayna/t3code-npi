@@ -127,9 +127,9 @@ export interface PromptHandle {
 }
 
 export type PromptOutcome =
-  | { readonly kind: "local"; readonly agentInvoked: false }
+  | { readonly kind: "local"; readonly agentInvoked: false; readonly userEntryId?: string }
   | { readonly kind: "rejected"; readonly error: string; readonly code?: string }
-  | { readonly kind: "agent" };
+  | { readonly kind: "agent"; readonly userEntryId?: string };
 
 export interface ProcessExit {
   readonly code: number | null;
@@ -146,6 +146,7 @@ interface PromptRecord {
   readonly id: string;
   readonly outcome: Deferred.Deferred<PromptOutcome>;
   acked: boolean;
+  userEntryId?: string;
   sawAgentStart: boolean;
 }
 
@@ -220,6 +221,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
   let ceiling = MAX_RPC_REASSEMBLED_BYTES;
   let fatal: NeoPiRpcError | undefined;
   let closed = false;
+  let promptEntryIds = false;
   let uriListeners = 0;
   let stderrListeners = 0;
   const stderrTail = emptyStderrTail();
@@ -387,15 +389,25 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
         return;
       }
       record.acked = true;
+      const data = isRecord(frame.data) ? frame.data : {};
+      if (typeof data.userEntryId === "string" && data.userEntryId)
+        record.userEntryId = data.userEntryId;
       const agentInvoked = agentInvokedOf(frame.data);
       if (agentInvoked === false) {
-        yield* completePrompt(record, { kind: "local", agentInvoked: false });
+        yield* completePrompt(record, {
+          kind: "local",
+          agentInvoked: false,
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
         yield* Queue.offer(events, { type: "t3.prompt.local", id: record.id }).pipe(Effect.ignore);
         prompts.delete(record.id);
         return;
       }
       if (agentInvoked === true || record.sawAgentStart) {
-        yield* completePrompt(record, { kind: "agent" });
+        yield* completePrompt(record, {
+          kind: "agent",
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
       }
     });
 
@@ -406,7 +418,10 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
         return;
       }
       if (open.acked) {
-        yield* completePrompt(open, { kind: "agent" });
+        yield* completePrompt(open, {
+          kind: "agent",
+          ...(open.userEntryId ? { userEntryId: open.userEntryId } : {}),
+        });
         return;
       }
       open.sawAgentStart = true;
@@ -422,12 +437,20 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
       if (!record) {
         return;
       }
+      if (promptEntryIds && !record.acked) return;
       if (frame.agentInvoked === false) {
-        yield* completePrompt(record, { kind: "local", agentInvoked: false });
+        yield* completePrompt(record, {
+          kind: "local",
+          agentInvoked: false,
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
         return;
       }
       if (frame.agentInvoked === true && record.acked) {
-        yield* completePrompt(record, { kind: "agent" });
+        yield* completePrompt(record, {
+          kind: "agent",
+          ...(record.userEntryId ? { userEntryId: record.userEntryId } : {}),
+        });
       }
     });
 
@@ -470,6 +493,7 @@ export const make = Effect.fn("effect-neopi-rpc/NeoPiRpcClient.make")(function* 
           ceiling = ready.maxReassembledFrameBytes;
           decoder.current = new RpcFrameDecoder(ceiling);
         }
+        promptEntryIds = ready.capabilities?.includes("prompt_entry_ids") === true;
         yield* Deferred.succeed(readyDeferred, ready).pipe(Effect.ignore);
         return;
       }

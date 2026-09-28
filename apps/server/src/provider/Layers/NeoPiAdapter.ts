@@ -676,6 +676,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             entries.entries,
             entries.leafId,
             session.session.resumeCursor as NeoPiResumeCursor,
+            session.runtime.capabilities.has(NEOPI_CAPABILITIES.promptEntryIds),
           ),
         catch: (cause) =>
           new ProviderAdapterRequestError({

@@ -10,6 +10,8 @@ export const NEOPI_CAPABILITIES = {
   sessionLease: "session_lease",
   newSession: "new_session",
   setChatMode: "set_chat_mode",
+  promptEntryIds: "prompt_entry_ids",
+  planProposalCancel: "plan_proposal_cancel",
 } as const;
 
 /** v2 negotiation is the required transport floor; all named features are optional. */

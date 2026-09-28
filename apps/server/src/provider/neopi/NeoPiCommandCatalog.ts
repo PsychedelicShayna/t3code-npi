@@ -53,6 +53,7 @@ export function toNeoPiCommandCatalog(
       name === "compact" ||
       name === "quit" ||
       name === "exit" ||
+      name === "model" ||
       (command.source === "builtin" && SESSION_COMMANDS.has(name))
     )
       continue;

@@ -483,6 +483,158 @@ it.live("expires a native proposal when its unanswered request times out", () =>
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("uses plan cancellation frames only on peers that advertise them", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const advertised of [false, true]) {
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            Effect.gen(function* () {
+              if (cmd.type === "negotiate_protocol")
+                return yield* answer(cmd, emit, { protocolVersion: 2 });
+              if (cmd.type === "prompt") {
+                yield* answer(cmd, emit, { agentInvoked: true });
+                yield* emit({ type: "agent_start" });
+                yield* emit({
+                  type: "plan_proposal_request",
+                  id: "proposal",
+                  planMarkdown: "# Plan",
+                });
+                return;
+              }
+              yield* basicHandler(cmd, emit);
+            }),
+          {
+            ...defaultReady,
+            capabilities: ["rpc-ui", "set_mode", ...(advertised ? ["plan_proposal_cancel"] : [])],
+          },
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("plan"));
+        yield* awaitOutcomes(frames, 1);
+        yield* peer.emit({ type: "plan_proposal_cancel", id: "wrong", reason: "abort" });
+        yield* peer.emit({ type: "agent_end", isTerminal: true });
+        yield* peer.emit({ type: "mode_changed", mode: "default" });
+        yield* peer.emit({ type: "plan_proposal_cancel", id: "proposal", reason: "abort" });
+        for (
+          let attempt = 0;
+          attempt < 100 &&
+          frames.filter((frame) => frame.type === "plan_proposal_cancel").length < 2;
+          attempt++
+        )
+          yield* Effect.sleep("5 millis");
+        NodeAssert.equal(
+          frames.filter((frame) => frame.type === "t3.plan.proposal.closed").length,
+          1,
+        );
+        const closedAt = frames.findIndex((frame) => frame.type === "t3.plan.proposal.closed");
+        const cancelledAt = frames.findIndex(
+          (frame) => frame.type === "plan_proposal_cancel" && frame.id === "proposal",
+        );
+        NodeAssert.equal(closedAt > cancelledAt, advertised);
+        NodeAssert.equal(
+          (yield* Effect.flip(runtime.resolvePlanProposal({ decision: "approve" }))).code,
+          "not_ready",
+        );
+        yield* runtime.stop;
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("takes advertised prompt entry ids rather than inferred ancestry", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const advertised of [false, true]) {
+        let prompted = false;
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            Effect.gen(function* () {
+              if (cmd.type === "negotiate_protocol")
+                return yield* answer(cmd, emit, { protocolVersion: 2 });
+              if (cmd.type === "get_entries")
+                return yield* answer(
+                  cmd,
+                  emit,
+                  prompted
+                    ? {
+                        leafId: "native-user",
+                        entries: [
+                          {
+                            id: "extension-user",
+                            parentId: null,
+                            type: "message",
+                            message: { role: "user" },
+                          },
+                          {
+                            id: "native-user",
+                            parentId: "extension-user",
+                            type: "message",
+                            message: { role: "user" },
+                          },
+                        ],
+                      }
+                    : { leafId: null, entries: [] },
+                );
+              if (cmd.type === "prompt") {
+                prompted = true;
+                yield* answer(cmd, emit, { agentInvoked: true, userEntryId: "native-user" });
+                yield* emit({ type: "agent_start" });
+                yield* emit({ type: "agent_end", isTerminal: true });
+                return;
+              }
+              yield* basicHandler(cmd, emit);
+            }),
+          {
+            ...defaultReady,
+            capabilities: ["rpc-ui", ...(advertised ? ["prompt_entry_ids"] : [])],
+          },
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("prompt"));
+        yield* awaitOutcomes(frames, 1);
+        NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+          { turnId: "prompt", userEntryId: advertised ? "native-user" : "extension-user" },
+        ]);
+        NodeAssert.equal(
+          peer.commands.filter((cmd) => cmd.type === "get_entries").length,
+          advertised ? 1 : 2,
+        );
+        yield* runtime.stop;
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("retains an advertised user entry for a locally handled prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          cmd.type === "negotiate_protocol"
+            ? answer(cmd, emit, { protocolVersion: 2 })
+            : cmd.type === "prompt"
+              ? answer(cmd, emit, { agentInvoked: false, userEntryId: "local-entry" })
+              : basicHandler(cmd, emit),
+        { ...defaultReady, capabilities: ["rpc-ui", "prompt_entry_ids"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("local"));
+      yield* awaitOutcomes(frames, 1);
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+        { turnId: "local", userEntryId: "local-entry" },
+      ]);
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("opts into host tool approvals before prompting only when the peer advertises them", () =>
   Effect.scoped(
     Effect.gen(function* () {

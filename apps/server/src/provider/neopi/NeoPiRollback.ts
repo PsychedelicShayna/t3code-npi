@@ -128,6 +128,7 @@ export function groupNeoPiHistory(
   entriesValue: unknown,
   leafValue: unknown,
   cursor: NeoPiResumeCursor,
+  useMessageEntryIds = false,
 ): Array<{ id: TurnId; items: unknown[] }> {
   if (!Array.isArray(entriesValue) || !(typeof leafValue === "string" || leafValue === null))
     throw new NeoPiRollbackError("NeoPi/OMP did not return a valid transcript ancestry");
@@ -162,6 +163,27 @@ export function groupNeoPiHistory(
       throw new NeoPiRollbackError("NeoPi/OMP plan continuation boundary left the active ancestry");
     const next = ancestry[preceding + 1];
     if (next && typeof next.id === "string") boundaries.set(next.id, boundary.turnId);
+  }
+  if (useMessageEntryIds) {
+    const byEntry = new Map<string, unknown[]>();
+    for (const message of messages) {
+      const entryId = object(message).entryId;
+      if (typeof entryId !== "string" || !seen.has(entryId))
+        throw new NeoPiRollbackError("NeoPi/OMP transcript contains an unmatched native entry id");
+      const items = byEntry.get(entryId);
+      if (items) items.push(message);
+      else byEntry.set(entryId, [message]);
+    }
+    const turns: Array<{ id: TurnId; items: unknown[] }> = [];
+    for (const entry of ancestry) {
+      const turnId = boundaries.get(String(entry.id));
+      if (turnId) turns.push({ id: turnId, items: [] });
+      const items = byEntry.get(String(entry.id));
+      if (!items) continue;
+      if (turns.length === 0) turns.push({ id: TurnId.make("neopi-history-1"), items: [] });
+      turns[turns.length - 1]!.items.push(...items);
+    }
+    return turns;
   }
   const turns: Array<{ id: TurnId; items: unknown[] }> = [];
   let messageIndex = 0;

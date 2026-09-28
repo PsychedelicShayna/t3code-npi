@@ -143,6 +143,12 @@ export interface PlanProposalRequestFrame {
   readonly planMarkdown: string;
 }
 
+export interface PlanProposalCancelFrame {
+  readonly type: "plan_proposal_cancel";
+  readonly id: string;
+  readonly reason: "abort" | "mode_change" | "agent_end" | "shutdown";
+}
+
 export interface PlanProposalResponseFrame {
   readonly type: "plan_proposal_response";
   readonly id: string;
@@ -196,6 +202,7 @@ export type Frame =
   | HostUriRequestFrame
   | ModeChangedFrame
   | PlanProposalRequestFrame
+  | PlanProposalCancelFrame
   | SessionEventFrame;
 
 export interface PromptImage {

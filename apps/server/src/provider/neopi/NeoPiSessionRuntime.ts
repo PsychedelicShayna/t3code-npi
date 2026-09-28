@@ -102,6 +102,7 @@ type ActiveTurn = {
   boundaryStarted: boolean;
   readonly continuation?: boolean;
   promptId?: string;
+  readonly promptReady?: Deferred.Deferred<PromptHandle>;
   agentInvoked: boolean;
   interrupted: boolean;
   error?: { reason: string; message?: string };
@@ -186,6 +187,23 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   });
   const captureBoundary = (turn: ActiveTurn) =>
     Effect.gen(function* () {
+      if (capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) {
+        if (turn.promptReady) {
+          const outcome = yield* Deferred.await((yield* Deferred.await(turn.promptReady)).outcome);
+          if (outcome.kind === "agent") turn.agentInvoked = true;
+          if (outcome.kind !== "rejected" && outcome.userEntryId) {
+            const previous = yield* SubscriptionRef.get(cursor);
+            yield* SubscriptionRef.set(cursor, {
+              ...previous,
+              turnBoundaries: [
+                ...previous.turnBoundaries,
+                { turnId: turn.id, userEntryId: outcome.userEntryId },
+              ],
+            });
+          }
+        }
+        return;
+      }
       for (let attempt = 0; attempt < 3; attempt++) {
         const result = record(
           yield* request({ type: "get_entries" }).pipe(Effect.mapError(rpcError)),
@@ -257,7 +275,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       if (active !== turn) return;
       active = undefined;
       if (
-        turn.agentInvoked &&
+        (turn.agentInvoked || capabilities.has(NEOPI_CAPABILITIES.promptEntryIds)) &&
         !turn.continuation &&
         client &&
         (yield* SubscriptionRef.get(state)) !== "failed"
@@ -266,7 +284,6 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         else yield* rememberBoundary(turn);
       }
       if (
-        !turn.agentInvoked ||
         !(yield* SubscriptionRef.get(cursor)).turnBoundaries.some(
           (boundary) => boundary.turnId === turn.id,
         )
@@ -298,7 +315,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       const outcome = yield* Deferred.await(handle.outcome);
       if (active !== turn || outcome.kind !== "agent") return;
       turn.agentInvoked = true;
-      if (!turn.boundaryStarted) {
+      if (!capabilities.has(NEOPI_CAPABILITIES.promptEntryIds) && !turn.boundaryStarted) {
         turn.boundaryStarted = true;
         yield* rememberBoundary(turn).pipe(Effect.forkIn(lifetime!));
       }
@@ -330,8 +347,13 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
       }
       if (
         pendingProposal &&
-        ((frame.type === "agent_end" && frame.isTerminal !== false) ||
-          (frame.type === "mode_changed" && frame.mode !== "plan" && !pendingProposal.resolving))
+        ((frame.type === "agent_end" && frame.isTerminal !== false && pendingProposal.resolving) ||
+          (capabilities.has(NEOPI_CAPABILITIES.planProposalCancel)
+            ? frame.type === "plan_proposal_cancel" && frame.id === pendingProposal.id
+            : (frame.type === "agent_end" && frame.isTerminal !== false) ||
+              (frame.type === "mode_changed" &&
+                frame.mode !== "plan" &&
+                !pendingProposal.resolving)))
       ) {
         const proposal = pendingProposal;
         pendingProposal = undefined;
@@ -710,6 +732,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         id: turn.turnId,
         baselineLeaf: typeof baseline.leafId === "string" ? baseline.leafId : null,
         boundaryDone: yield* Deferred.make<void>(),
+        promptReady: yield* Deferred.make<PromptHandle>(),
         boundaryStarted: false,
         agentInvoked: false,
         interrupted: false,
@@ -732,6 +755,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
           ),
         );
       entry.promptId = handle.id;
+      yield* Deferred.succeed(entry.promptReady!, handle);
       yield* observePrompt(entry, handle).pipe(Effect.forkIn(lifetime!));
       return { turnId: turn.turnId };
     });

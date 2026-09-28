@@ -378,6 +378,47 @@ it("groups converted custom, branch summary and compacted context without losing
   );
 });
 
+it("groups advertised entry ids even when native message content differs", () => {
+  const custom = { id: "custom", parentId: "a1", type: "custom_message", content: "original" };
+  const summary = { id: "compact", parentId: "custom", type: "compaction", summary: "old" };
+  const next = user("next", "compact", "next prompt");
+  const history = [entries[0]!, entries[1]!, custom, summary, next];
+  const messages = [
+    { entryId: "first", role: "user", content: "expanded prompt" },
+    { entryId: "a1", role: "assistant", content: "transformed" },
+    { entryId: "compact", role: "compactionSummary", summary: "new summary" },
+    { entryId: "next", role: "user", content: "other text" },
+  ];
+  const grouped = groupNeoPiHistory(
+    messages,
+    history,
+    "next",
+    {
+      ...cursor,
+      turnBoundaries: [
+        cursor.turnBoundaries[0]!,
+        { turnId: TurnId.make("next-turn"), userEntryId: "next" },
+      ],
+    },
+    true,
+  );
+  assert.deepEqual(
+    grouped.map((turn) => [turn.id, turn.items.length]),
+    [
+      [TurnId.make("turn-1"), 3],
+      [TurnId.make("next-turn"), 1],
+    ],
+  );
+  assert.throws(
+    () => groupNeoPiHistory([{ role: "user" }], history, "next", cursor, true),
+    /unmatched native entry id/,
+  );
+  assert.throws(
+    () => groupNeoPiHistory(messages, history, "next", cursor),
+    /unmatched native messages/,
+  );
+});
+
 it("rewinds the next prompt without removing a prior steer", async () => {
   const throughSecond = entries.slice(0, 6);
   const twoTurns = { ...cursor, turnBoundaries: cursor.turnBoundaries.slice(0, 2) };
