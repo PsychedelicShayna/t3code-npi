@@ -6,6 +6,7 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   ApprovalRequestId,
+  MessageId,
   ProviderDriverKind,
   ProjectId,
   ProviderInstanceId,
@@ -1604,12 +1605,243 @@ it.live("answers first-session startup UI through ProviderService before v2 nego
           runtimeMode: "approval-required",
         })
         .pipe(Effect.timeout("5 seconds"));
-      NodeAssert.equal(session.status, "ready");
+      NodeAssert.ok(session.status === "ready" || session.status === "connecting");
+      for (
+        let attempt = 0;
+        attempt < 200 &&
+        !(yield* adapter.listSessions()).some(
+          (current) => current.threadId === threadId && current.status === "ready",
+        );
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.equal(
+        (yield* adapter.listSessions()).find((current) => current.threadId === threadId)?.status,
+        "ready",
+      );
       NodeAssert.ok(
         peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.confirmed === true),
       );
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live(
+  "answers first-turn startup dialogs and reports later startup failures through the command reactor",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        for (const kind of ["user-input", "approval", "session-in-use"] as const) {
+          const id = `startup-${kind}`;
+          const threadId = ThreadId.make(`startup-reactor-${kind}`);
+          const sessionFile = `${root}/neopi/sessions/default/${threadId}/session.jsonl`;
+          let startupAnswered = false;
+          let stateRequest: Command | undefined;
+          const peer = yield* testPeer((cmd, emit) => {
+            if (cmd.type === "get_state" && !startupAnswered) {
+              stateRequest = cmd;
+              return emit(
+                kind !== "approval"
+                  ? {
+                      type: "extension_ui_request",
+                      id,
+                      method: "confirm",
+                      title: "Startup check",
+                      message: "Continue startup?",
+                    }
+                  : {
+                      type: "extension_ui_request",
+                      id,
+                      method: "select",
+                      title: "Allow tool: bash\nCommand: echo ready",
+                      options: ["Approve", "Deny"],
+                    },
+              );
+            }
+            if (cmd.type === "extension_ui_response" && stateRequest) {
+              startupAnswered = true;
+              return kind === "session-in-use"
+                ? emit({
+                    type: "response",
+                    id: stateRequest.id,
+                    command: "get_state",
+                    success: false,
+                    code: "session_in_use",
+                    error: "session_in_use: session already owned by PID 42",
+                  })
+                : answer(stateRequest, emit, {
+                    sessionId: "s1",
+                    sessionFile,
+                    messageCount: 0,
+                  });
+            }
+            if (cmd.type === "get_state")
+              return answer(cmd, emit, { sessionId: "s1", sessionFile, messageCount: 0 });
+            if (cmd.type === "prompt")
+              return answer(cmd, emit, { agentInvoked: true }).pipe(
+                Effect.andThen(emit({ type: "agent_start" })),
+                Effect.andThen(emit({ type: "agent_end", isTerminal: true })),
+              );
+            return answer(cmd, emit);
+          });
+          const provider = ProviderDriverKind.make("neopi");
+          const instanceId = ProviderInstanceId.make("neopi");
+          const projectId = ProjectId.make(`startup-reactor-project-${kind}`);
+          let launches = 0;
+          const adapter = yield* makeNeoPiAdapter({
+            settings: {
+              enabled: true,
+              binaryPath: "npi",
+              profile: "",
+              launchArgs: "",
+              customModels: [],
+            },
+            instanceId,
+            binary: "npi",
+            cwd: "/tmp",
+            t3Home: root,
+            attachmentsDir: root,
+            environment: {},
+            spawn: () =>
+              Effect.sync(() => {
+                launches++;
+                return peer.handle;
+              }),
+            discovery: yield* makeNeoPiDiscoveryHub(),
+          });
+          const harness = yield* makeOrchestrationIntegrationHarness({ provider, adapter });
+          yield* Effect.addFinalizer(() => harness.dispose);
+          const createdAt = "2026-09-27T00:00:00.000Z";
+          yield* harness.engine.dispatch({
+            type: "project.create",
+            commandId: CommandId.make(`startup-reactor-project-create-${kind}`),
+            projectId,
+            title: "NeoPi startup",
+            workspaceRoot: harness.workspaceDir,
+            defaultModelSelection: { instanceId, model: "neopi-current" },
+            createdAt,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make(`startup-reactor-thread-create-${kind}`),
+            threadId,
+            projectId,
+            title: "Startup UI",
+            modelSelection: { instanceId, model: "neopi-current" },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: harness.workspaceDir,
+            createdAt,
+          });
+          const opened = yield* Deferred.make<string>();
+          yield* Stream.runForEach(harness.providerService.streamEvents, (event) =>
+            event.requestId === id &&
+            event.type === (kind === "approval" ? "request.opened" : "user-input.requested")
+              ? Deferred.succeed(opened, event.requestId).pipe(Effect.asVoid)
+              : Effect.void,
+          ).pipe(Effect.forkScoped);
+          yield* harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make(`startup-reactor-turn-${kind}`),
+            threadId,
+            message: {
+              messageId: MessageId.make(`startup-reactor-message-${kind}`),
+              role: "user",
+              text: "Run after startup",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt,
+          });
+          NodeAssert.equal(yield* Deferred.await(opened).pipe(Effect.timeout("5 seconds")), id);
+          yield* harness.engine.dispatch(
+            kind !== "approval"
+              ? {
+                  type: "thread.user-input.respond",
+                  commandId: CommandId.make(`startup-reactor-response-${kind}`),
+                  threadId,
+                  requestId: ApprovalRequestId.make(id),
+                  answers: { [id]: "true" },
+                  createdAt,
+                }
+              : {
+                  type: "thread.approval.respond",
+                  commandId: CommandId.make(`startup-reactor-response-${kind}`),
+                  threadId,
+                  requestId: ApprovalRequestId.make(id),
+                  decision: "accept",
+                  createdAt,
+                },
+          );
+          for (
+            let attempt = 0;
+            attempt < 200 &&
+            !peer.commands.some((cmd) => cmd.type === "extension_ui_response" && cmd.id === id);
+            attempt++
+          )
+            yield* Effect.sleep("5 millis");
+          NodeAssert.ok(
+            peer.commands.some(
+              (cmd) =>
+                cmd.type === "extension_ui_response" &&
+                cmd.id === id &&
+                (kind === "approval" ? cmd.value === "Approve" : cmd.confirmed === true),
+            ),
+            `The ${kind} answer did not reach the startup peer`,
+          );
+          if (kind === "session-in-use") {
+            const failed = yield* harness.waitForThread(
+              threadId,
+              (thread) =>
+                thread.activities.some(
+                  (activity) => activity.kind === "provider.turn.start.failed",
+                ),
+              5_000,
+            );
+            const failure = failed.activities.find(
+              (activity) => activity.kind === "provider.turn.start.failed",
+            );
+            NodeAssert.match(
+              String((failure?.payload as { detail?: string } | undefined)?.detail),
+              /session_in_use/,
+            );
+            NodeAssert.equal(launches, 1, "Startup failure must not trigger session recovery");
+            NodeAssert.equal(
+              peer.commands.some((cmd) => cmd.type === "prompt"),
+              false,
+            );
+            continue;
+          }
+          for (
+            let attempt = 0;
+            attempt < 200 && !peer.commands.some((cmd) => cmd.type === "prompt");
+            attempt++
+          )
+            yield* Effect.sleep("5 millis");
+          NodeAssert.ok(peer.commands.some((cmd) => cmd.type === "prompt"));
+          const completed = yield* harness.waitForThread(
+            threadId,
+            (thread) =>
+              thread.session?.status === "ready" &&
+              thread.activities.some(
+                (activity) =>
+                  activity.kind ===
+                  (kind === "user-input" ? "user-input.resolved" : "approval.resolved"),
+              ),
+          );
+          NodeAssert.equal(
+            completed.activities.some(
+              (activity) =>
+                activity.kind === "provider.user-input.respond.failed" ||
+                activity.kind === "provider.approval.respond.failed",
+            ),
+            false,
+          );
+        }
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live("installs host tools without credential frames and suppresses cancelled results", () =>

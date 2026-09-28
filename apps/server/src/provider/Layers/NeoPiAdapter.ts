@@ -17,6 +17,7 @@ import type {
   SetModeCommand,
 } from "effect-neopi-rpc/schema";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -106,6 +107,8 @@ interface Session {
   readonly sessionKey: string;
   readonly mcpProviderSessionId?: string;
   pending: Map<string, PendingUi>;
+  startupDone: Deferred.Deferred<void, ProviderAdapterProcessError>;
+  startupDialog: Deferred.Deferred<void>;
   ui: ReturnType<typeof emptyUiState>;
   activeTurnId?: TurnId;
   lastChatMode?: Exclude<NeoPiChatMode, "off">;
@@ -234,6 +237,8 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         ...ui.events,
         ...proposal.events,
       ]);
+      if (ui.pending && session.session.status === "connecting")
+        yield* Deferred.succeed(session.startupDialog, undefined);
       if (data.type === "t3.turn.outcome") {
         delete session.activeTurnId;
         session.session = {
@@ -244,6 +249,9 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
           resumeCursor: yield* SubscriptionRef.get(session.runtime.cursor),
         };
       } else if (data.type === "t3.session.exited") {
+        // Preserve an unfinished startup until its caller observes the original
+        // failure. Otherwise sendTurn recovers a new session and loses the error.
+        if (session.session.status === "connecting") return;
         if (sessions.get(session.session.threadId) === session) {
           sessions.delete(session.session.threadId);
           yield* stopInternal(session).pipe(Effect.forkIn(scope));
@@ -370,9 +378,13 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         Effect.provideService(FileSystem.FileSystem, fs),
         Effect.provideService(Scope.Scope, sessionScope),
       );
+      const startupDone = yield* Deferred.make<void, ProviderAdapterProcessError>();
+      const startupDialog = yield* Deferred.make<void>();
       const now = DateTime.formatIso(yield* DateTime.now);
       const entry: Session = {
         runtime,
+        startupDone,
+        startupDialog,
         ...(hostBridge && mcpSession ? { mcpProviderSessionId: mcpSession.providerSessionId } : {}),
         scope: sessionScope,
         sessionKey: randomUUID(),
@@ -409,32 +421,56 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
               cause,
             }),
         ),
+        Effect.flatMap(() =>
+          Effect.gen(function* () {
+            entry.ui.capabilities.clear();
+            for (const capability of runtime.capabilities) entry.ui.capabilities.add(capability);
+            // Explicit gate for #102; legacy select approvals remain available on older peers.
+            if (!runtime.capabilities.has(NEOPI_CAP_TOOL_APPROVAL))
+              entry.ui.capabilities.delete(NEOPI_CAP_TOOL_APPROVAL);
+            if (
+              runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) ||
+              runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)
+            ) {
+              const state = yield* runtime.request({ type: "get_state" }).pipe(Effect.option);
+              if (state._tag === "Some")
+                yield* processFrame(entry, { type: "t3.state", state: state.value });
+            }
+            entry.session = {
+              ...entry.session,
+              status: "ready",
+              resumeCursor: yield* SubscriptionRef.get(runtime.cursor),
+              updatedAt: DateTime.formatIso(yield* DateTime.now),
+            };
+          }),
+        ),
+        Effect.tap(() => Deferred.succeed(startupDone, undefined)),
+        Effect.catch((error) => Deferred.fail(startupDone, error).pipe(Effect.asVoid)),
+        Effect.onExit((exit) =>
+          Exit.isFailure(exit)
+            ? Deferred.fail(
+                startupDone,
+                new ProviderAdapterProcessError({
+                  provider: PROVIDER,
+                  threadId: input.threadId,
+                  detail: "NeoPi/OMP session stopped before startup completed",
+                }),
+              ).pipe(Effect.asVoid)
+            : Effect.void,
+        ),
+        Effect.forkIn(sessionScope),
+      );
+      // The reactor processes replies only after startSession returns. Release its
+      // worker as soon as a startup dialog is visible; the first turn waits below.
+      yield* Effect.raceFirst(Deferred.await(startupDone), Deferred.await(startupDialog)).pipe(
         Effect.tapError(() => stopInternal(entry)),
       );
-      entry.ui.capabilities.clear();
-      for (const capability of runtime.capabilities) entry.ui.capabilities.add(capability);
-      // Explicit gate for #102; legacy select approvals remain available on older peers.
-      if (!runtime.capabilities.has(NEOPI_CAP_TOOL_APPROVAL))
-        entry.ui.capabilities.delete(NEOPI_CAP_TOOL_APPROVAL);
-      entry.session = {
-        ...entry.session,
-        status: "ready",
-        resumeCursor: yield* SubscriptionRef.get(runtime.cursor),
-        updatedAt: DateTime.formatIso(yield* DateTime.now),
-      };
-      if (
-        runtime.capabilities.has(NEOPI_CAPABILITIES.setChatMode) ||
-        runtime.capabilities.has(NEOPI_CAPABILITIES.setMode)
-      ) {
-        const state = yield* runtime.request({ type: "get_state" }).pipe(Effect.option);
-        if (state._tag === "Some")
-          yield* processFrame(entry, { type: "t3.state", state: state.value });
-      }
       return entry.session;
     });
   const sendTurn: NeoPiAdapterShape["sendTurn"] = (input) =>
     Effect.gen(function* () {
       const session = yield* requireSession(input.threadId);
+      yield* Deferred.await(session.startupDone).pipe(Effect.tapError(() => stopInternal(session)));
       const images: Array<{ data: string; mimeType: string }> = [];
       const text = [input.input ?? ""];
       for (const attachment of input.attachments ?? []) {
@@ -775,7 +811,10 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
         const session = sessions.get(threadId);
         if (!session) return false;
         const state = yield* SubscriptionRef.get(session.runtime.state);
-        return state !== "failed" && state !== "stopped" && state !== "stopping";
+        return (
+          session.session.status === "connecting" ||
+          (state !== "failed" && state !== "stopped" && state !== "stopping")
+        );
       }),
     readThread,
     getLiveUsage: (activeProvider) =>
