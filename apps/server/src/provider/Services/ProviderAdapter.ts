@@ -52,6 +52,9 @@ export interface ProviderAdapterCapabilities {
   readonly promptlessTurnContinuation?: boolean;
   /** False when native conversation history cannot be rewound. */
   readonly supportsConversationRollback?: boolean;
+  /** Refresh the native cursor on terminal events; "ordered" also reconciles
+      completion with a send whose admission write has not landed yet. */
+  readonly terminalResumeCursor?: "refresh" | "ordered";
 }
 
 export interface ProviderThreadTurnSnapshot {

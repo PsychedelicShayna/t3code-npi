@@ -328,9 +328,14 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         yield* settle(turn, "completed");
         return;
       }
-      if (frame.type === "agent_end" && frame.isTerminal !== false && pendingProposal?.resolving) {
+      if (
+        pendingProposal &&
+        ((frame.type === "agent_end" && frame.isTerminal !== false) ||
+          (frame.type === "mode_changed" && frame.mode !== "plan" && !pendingProposal.resolving))
+      ) {
         const proposal = pendingProposal;
         pendingProposal = undefined;
+        yield* emit({ type: "t3.plan.proposal.closed", id: proposal.id });
         yield* Deferred.succeed(proposal.done, undefined).pipe(Effect.ignore);
       }
       if (!turn) return;
@@ -601,6 +606,18 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
         sessionFile: file,
         sessionDir: launch.sessionDir || dirname(file),
       });
+      if (capabilities.has(NEOPI_CAPABILITIES.toolApprovalRequest)) {
+        const configured = record(
+          yield* peer
+            .request({ type: "set_approval_handler", handler: "host" })
+            .pipe(Effect.mapError(rpcError)),
+        );
+        if (configured.handler !== "host")
+          return yield* new NeoPiRuntimeError({
+            code: "startup",
+            message: "NeoPi/OMP did not activate its host approval handler",
+          });
+      }
       if (input.hostBridge)
         yield* peer
           .request({ type: "set_host_tools", tools: input.hostBridge.definitions })
@@ -737,7 +754,7 @@ export const makeNeoPiSessionRuntime = Effect.fn("NeoPiSessionRuntime.make")(fun
   ) =>
     Effect.gen(function* () {
       const proposal = pendingProposal;
-      if (!proposal || proposal.resolving || (continuation && response.decision !== "refine"))
+      if (!proposal || proposal.resolving)
         return yield* new NeoPiRuntimeError({
           code: "not_ready",
           message: "NeoPi/OMP has no pending plan proposal for this action",

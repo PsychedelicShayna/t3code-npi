@@ -446,7 +446,7 @@ for (const capable of [false, true])
           )
             yield* Effect.sleep("10 millis");
         }
-        yield* adapter.sendTurn({
+        const implementation = yield* adapter.sendTurn({
           threadId,
           input: capable
             ? "PLEASE IMPLEMENT THIS PLAN:\n# Plan\n\n- Implement it"
@@ -455,18 +455,14 @@ for (const capable of [false, true])
         });
         assert.deepEqual(
           turns,
-          capable
-            ? ["plan this", "plan again", "PLEASE IMPLEMENT THIS PLAN:\n# Plan\n\n- Implement it"]
-            : ["plan this", "implement this"],
+          capable ? ["plan this", "plan again"] : ["plan this", "implement this"],
+          "approval continues the native plan instead of sending another prompt",
         );
 
         const setModeRequests = requests.filter((command) => command.type === "set_mode");
         const usageRequests = requests.filter((command) => command.type === "get_usage");
         if (capable) {
-          assert.deepEqual(setModeRequests, [
-            { type: "set_mode", mode: "plan" },
-            { type: "set_mode", mode: "default" },
-          ]);
+          assert.deepEqual(setModeRequests, [{ type: "set_mode", mode: "plan" }]);
           assert.deepEqual(usageRequests, [
             { type: "get_usage", provider: "openai", redact: true },
           ]);
@@ -485,6 +481,95 @@ for (const capable of [false, true])
               .planMarkdown,
             "# Plan\n\n- Implement it",
           );
+          yield* Queue.offer(frames, {
+            type: "tool_execution_start",
+            toolCallId: "implementation-tool",
+            toolName: "bash",
+            args: { command: "implement" },
+            turnId: implementation.turnId,
+          });
+          yield* Queue.offer(frames, {
+            type: "message_end",
+            message: { role: "assistant", content: [], usage: { input: 12, output: 7 } },
+            turnId: implementation.turnId,
+          });
+          yield* Queue.offer(frames, {
+            type: "t3.turn.outcome",
+            state: "completed",
+            turnId: implementation.turnId,
+          });
+          for (
+            let attempt = 0;
+            attempt < 100 && observed.filter((event) => event.type === "turn.completed").length < 4;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+          assert.isTrue(
+            observed.some(
+              (event) =>
+                event.type === "item.started" &&
+                event.turnId === implementation.turnId &&
+                event.payload.itemType === "command_execution",
+            ),
+            "tools from the approved native run belong to the implementation turn",
+          );
+          const implementationEnd = observed.find(
+            (event) => event.type === "turn.completed" && event.turnId === implementation.turnId,
+          );
+          assert.equal(implementationEnd?.type, "turn.completed");
+          if (implementationEnd?.type === "turn.completed")
+            assert.deepEqual(implementationEnd.payload.tokenUsage, {
+              usageScope: "main_agent",
+              hasSubagents: false,
+              usageStatus: "complete",
+              cachedInputTokens: 0,
+              cacheCreationTokens: 0,
+              inputTokens: 12,
+              outputTokens: 7,
+            });
+          yield* SubscriptionRef.set(state, "ready");
+          const timedOut = yield* adapter.sendTurn({
+            threadId,
+            input: "another plan",
+            interactionMode: "plan",
+          });
+          yield* Queue.offer(frames, {
+            type: "plan_proposal_request",
+            id: "proposal-expired",
+            planMarkdown: "# Expired",
+            turnId: timedOut.turnId,
+          });
+          for (
+            let attempt = 0;
+            attempt < 100 &&
+            observed.filter((event) => event.type === "turn.proposed.completed").length < 3;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+          yield* Queue.offer(frames, {
+            type: "t3.turn.outcome",
+            state: "completed",
+            turnId: timedOut.turnId,
+          });
+          yield* Queue.offer(frames, { type: "t3.plan.proposal.closed", id: "proposal-expired" });
+          for (
+            let attempt = 0;
+            attempt < 100 && observed.filter((event) => event.type === "turn.completed").length < 5;
+            attempt++
+          )
+            yield* Effect.sleep("10 millis");
+          yield* SubscriptionRef.set(state, "ready");
+          yield* adapter.sendTurn({
+            threadId,
+            input: "PLEASE IMPLEMENT THIS PLAN:\n# Expired",
+            interactionMode: "default",
+          });
+          assert.deepEqual(
+            turns,
+            ["plan this", "plan again", "another plan", "PLEASE IMPLEMENT THIS PLAN:\n# Expired"],
+            "expired requests must admit a deliberate fresh prompt without writing a stale response",
+          );
+          assert.equal(writes.length, 2);
         } else {
           assert.deepEqual(setModeRequests, []);
           assert.deepEqual(usageRequests, []);

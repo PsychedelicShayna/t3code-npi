@@ -45,3 +45,44 @@ export function projectNeoPiComposerUi(
   }
   return { chatMode, editor, labels: [...status.values(), ...widgets.values()] };
 }
+
+// Persist acknowledgement for the lifetime of the loaded app, not the composer
+// component: navigation and provider switches must not replay old activities.
+const acknowledgedEditorByTarget = new Map<string, string | null>();
+
+export function consumeNeoPiEditorAction(
+  target: string,
+  editor: NeoPiComposerUi["editor"],
+  prompt: string,
+): string | null {
+  if (!acknowledgedEditorByTarget.has(target)) {
+    acknowledgedEditorByTarget.set(target, editor?.eventId ?? null);
+    return null; // Existing persisted activities predate this consumer.
+  }
+  if (!editor || acknowledgedEditorByTarget.get(target) === editor.eventId) return null;
+  acknowledgedEditorByTarget.set(target, editor.eventId);
+  return prompt.length === 0 ? editor.text : null;
+}
+
+/** Provider-owned registrations; absent providers retain upstream composer behavior. */
+export const composerProviderCapabilities = {
+  neopi: {
+    project: (activities: ReadonlyArray<OrchestrationThreadActivity>) => {
+      const ui = projectNeoPiComposerUi(activities);
+      return {
+        editor: ui.editor,
+        displayState: [ui.chatMode ? `Chat: ${ui.chatMode}` : "", ...ui.labels]
+          .filter(Boolean)
+          .join(" · "),
+      };
+    },
+    consumeEditor: consumeNeoPiEditorAction,
+    commandSourceLabel: (source: string | undefined) =>
+      source ? ` · ${source === "mcp_prompt" ? "MCP prompt" : source}` : "",
+    skillReplacement: (name: string) => `/skill:${name} `,
+  },
+} as const;
+
+export function composerCapabilitiesForProvider(provider: string) {
+  return provider === "neopi" ? composerProviderCapabilities.neopi : undefined;
+}

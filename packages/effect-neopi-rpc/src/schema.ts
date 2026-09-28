@@ -109,6 +109,18 @@ export interface SetModeResult {
   readonly planFilePath?: string;
 }
 
+/** Who answers tool approvals. `"ui"` is the legacy select dialog. */
+export type NeoPiApprovalHandler = "host" | "ui";
+
+export interface SetApprovalHandlerCommand {
+  readonly type: "set_approval_handler";
+  readonly handler: NeoPiApprovalHandler;
+}
+
+export interface SetApprovalHandlerResult {
+  readonly handler: NeoPiApprovalHandler;
+}
+
 export interface ModeChangedFrame {
   readonly type: "mode_changed";
   readonly mode: NeoPiInteractionMode;

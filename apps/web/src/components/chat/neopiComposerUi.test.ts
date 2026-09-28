@@ -1,6 +1,6 @@
 import { EventId, type OrchestrationThreadActivity } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { projectNeoPiComposerUi } from "./neopiComposerUi";
+import { composerCapabilitiesForProvider, projectNeoPiComposerUi } from "./neopiComposerUi";
 
 const activity = (id: string, ui: Record<string, unknown>): OrchestrationThreadActivity => ({
   id: EventId.make(id),
@@ -29,5 +29,43 @@ describe("NeoPi extension composer activity projection", () => {
       labels: ["waiting"],
       editor: { eventId: "g", text: "suggestion" },
     });
+  });
+
+  it("consumes fresh editor actions once across target switches and composer remounts", () => {
+    const provider = composerCapabilitiesForProvider("neopi")!;
+    const target = "neopi-editor-regression-thread";
+    const other = "neopi-editor-regression-other";
+    const project = (events: OrchestrationThreadActivity[]) => provider.project(events).editor;
+    expect(
+      provider.consumeEditor(target, project([activity("old", { kind: "editor", text: "X" })]), ""),
+    ).toBeNull();
+    expect(
+      provider.consumeEditor(target, project([activity("new", { kind: "editor", text: "Y" })]), ""),
+    ).toBe("Y");
+    expect(provider.consumeEditor(other, null, "")).toBeNull();
+    expect(
+      provider.consumeEditor(target, project([activity("new", { kind: "editor", text: "Y" })]), ""),
+    ).toBeNull();
+    expect(
+      provider.consumeEditor(
+        target,
+        project([activity("later", { kind: "editor", text: "Z" })]),
+        "my draft",
+      ),
+    ).toBeNull();
+    expect(
+      provider.consumeEditor(
+        target,
+        project([activity("later", { kind: "editor", text: "Z" })]),
+        "",
+      ),
+    ).toBeNull();
+    expect(
+      provider.project([activity("mode", { kind: "chat-mode", mode: "erp" })]).displayState,
+    ).toBe("Chat: erp");
+    expect(provider.commandSourceLabel("mcp_prompt")).toBe(" · MCP prompt");
+    expect(provider.skillReplacement("review")).toBe("/skill:review ");
+    expect(composerCapabilitiesForProvider("codex")).toBeUndefined();
+    expect(composerCapabilitiesForProvider("claudeAgent")).toBeUndefined();
   });
 });

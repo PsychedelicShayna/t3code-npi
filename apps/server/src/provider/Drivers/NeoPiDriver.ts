@@ -19,6 +19,7 @@ import {
 import { applyUsageLimits } from "../Layers/neopiUsageLimits.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { makeNeoPiDiscoveryHub } from "../neopi/NeoPiDiscovery.ts";
+import { neoPiUsageProviderId } from "../neopi/NeoPiModelCatalog.ts";
 import { makeNeoPiDiscoveryProbe } from "../neopi/NeoPiDiscoveryProbe.ts";
 import { makeNeoPiHostToolBridge } from "../neopi/NeoPiHostToolBridge.ts";
 import {
@@ -139,8 +140,7 @@ export const NeoPiDriver: ProviderDriver<NeoPiSettings, NeoPiDriverEnv> = {
         enrichSnapshot: ({ snapshot: probed, getSnapshot, publishSnapshot }) =>
           Effect.gen(function* () {
             if (!probed.installed || probed.status === "error") return;
-            const activeProvider =
-              probed.models.find((model) => model.isDefault)?.subProvider ?? "";
+            const activeProvider = neoPiUsageProviderId(probed.models);
             if (!activeProvider && probed.status === "warning") return;
             const previous = (yield* getSnapshot).usageLimits;
             const usageLimits = yield* applyUsageLimits({

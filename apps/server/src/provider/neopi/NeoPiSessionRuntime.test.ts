@@ -342,6 +342,242 @@ it.live("holds a plan proposal until refine feedback continues a new T3 turn", (
   ).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.live("continues approved plan work in the implementation turn without a second prompt", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      let prompted = false;
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "get_entries")
+              return yield* answer(
+                cmd,
+                emit,
+                prompted
+                  ? {
+                      leafId: "plan-leaf",
+                      entries: [
+                        {
+                          id: "plan-leaf",
+                          parentId: null,
+                          type: "message",
+                          message: { role: "user", content: [{ type: "text", text: "plan" }] },
+                        },
+                      ],
+                    }
+                  : { leafId: null, entries: [] },
+              );
+            if (cmd.type === "prompt") {
+              prompted = true;
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "plan_proposal_request", id: "plan-1", planMarkdown: "# Plan" });
+              return;
+            }
+            if (cmd.type === "plan_proposal_response") {
+              yield* emit({ type: "mode_changed", mode: "default" });
+              yield* emit({
+                type: "tool_execution_start",
+                toolCallId: "implement-tool",
+                toolName: "bash",
+              });
+              yield* emit({
+                type: "message_end",
+                message: { role: "assistant", content: [], usage: { input: 12, output: 7 } },
+              });
+              yield* emit({ type: "agent_end", isTerminal: true });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("plan"));
+      yield* awaitOutcomes(frames, 1);
+      yield* runtime.resolvePlanProposal({ decision: "approve" }, turn("implementation"));
+      yield* awaitOutcomes(frames, 2);
+      NodeAssert.equal(peer.commands.filter((cmd) => cmd.type === "prompt").length, 1);
+      NodeAssert.ok(
+        frames.some(
+          (frame) => frame.type === "tool_execution_start" && frame.turnId === "implementation",
+        ),
+      );
+      NodeAssert.deepEqual((yield* SubscriptionRef.get(runtime.cursor)).turnBoundaries, [
+        { turnId: "plan", userEntryId: "plan-leaf" },
+        { turnId: "implementation", kind: "continuation", afterEntryId: "plan-leaf" },
+      ]);
+      NodeAssert.ok(
+        frames.some((frame) => frame.type === "message_end" && frame.turnId === "implementation"),
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("expires a native proposal when its unanswered request times out", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peer = yield* testPeer(
+        (cmd, emit) =>
+          Effect.gen(function* () {
+            if (cmd.type === "negotiate_protocol")
+              return yield* answer(cmd, emit, { protocolVersion: 2 });
+            if (cmd.type === "prompt") {
+              yield* answer(cmd, emit, { agentInvoked: true });
+              yield* emit({ type: "agent_start" });
+              yield* emit({ type: "plan_proposal_request", id: "expired", planMarkdown: "# Plan" });
+              return;
+            }
+            yield* basicHandler(cmd, emit);
+          }),
+        { ...defaultReady, capabilities: ["rpc-ui", "set_mode"] },
+      );
+      const runtime = yield* make(() => Effect.succeed(peer.handle));
+      const frames = yield* capture(runtime);
+      yield* runtime.start;
+      yield* runtime.startTurn(turn("plan"));
+      yield* awaitOutcomes(frames, 1);
+      yield* peer.emit({ type: "agent_end", isTerminal: true });
+      for (
+        let attempt = 0;
+        attempt < 100 && !frames.some((frame) => frame.type === "t3.plan.proposal.closed");
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.ok(frames.some((frame) => frame.type === "t3.plan.proposal.closed"));
+      const failure = yield* Effect.flip(
+        runtime.resolvePlanProposal({ decision: "approve" }, turn("implement")),
+      );
+      NodeAssert.equal(failure.code, "not_ready");
+      NodeAssert.equal(
+        peer.commands.filter((cmd) => cmd.type === "plan_proposal_response").length,
+        0,
+      );
+      yield* runtime.startTurn(turn("mode-cancelled"));
+      yield* awaitOutcomes(frames, 2);
+      yield* peer.emit({ type: "mode_changed", mode: "default" });
+      for (
+        let attempt = 0;
+        attempt < 100 &&
+        frames.filter((frame) => frame.type === "t3.plan.proposal.closed").length < 2;
+        attempt++
+      )
+        yield* Effect.sleep("5 millis");
+      NodeAssert.equal(
+        frames.filter((frame) => frame.type === "t3.plan.proposal.closed").length,
+        2,
+      );
+      NodeAssert.equal(
+        (yield* Effect.flip(
+          runtime.resolvePlanProposal({ decision: "approve" }, turn("cancelled-implement")),
+        )).code,
+        "not_ready",
+      );
+      yield* runtime.stop;
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("opts into host tool approvals before prompting only when the peer advertises them", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const supported of [false, true]) {
+        let handlerSelected = false;
+        const peer = yield* testPeer(
+          (cmd, emit) =>
+            Effect.gen(function* () {
+              if (cmd.type === "negotiate_protocol")
+                return yield* answer(cmd, emit, { protocolVersion: 2 });
+              if (cmd.type === "set_approval_handler") {
+                handlerSelected = cmd.handler === "host";
+                return yield* answer(cmd, emit, { handler: "host" });
+              }
+              if (cmd.type === "prompt") {
+                yield* answer(cmd, emit, { agentInvoked: true });
+                if (handlerSelected)
+                  yield* emit({
+                    type: "tool_approval_request",
+                    id: "approval-1",
+                    toolName: "bash",
+                    toolCallId: "tool-1",
+                    args: { command: "echo yes" },
+                  });
+                return;
+              }
+              yield* basicHandler(cmd, emit);
+            }),
+          {
+            ...defaultReady,
+            capabilities: supported ? ["rpc-ui", "tool_approval_request"] : ["rpc-ui"],
+          },
+        );
+        const runtime = yield* make(() => Effect.succeed(peer.handle));
+        const frames = yield* capture(runtime);
+        yield* runtime.start;
+        yield* runtime.startTurn(turn("approval"));
+        if (supported)
+          for (
+            let i = 0;
+            i < 100 && !frames.some((frame) => frame.type === "tool_approval_request");
+            i++
+          )
+            yield* Effect.sleep("5 millis");
+        NodeAssert.equal(handlerSelected, supported);
+        NodeAssert.equal(
+          frames.some((frame) => frame.type === "tool_approval_request"),
+          supported,
+        );
+        NodeAssert.equal(
+          peer.commands.filter((cmd) => cmd.type === "set_approval_handler").length,
+          supported ? 1 : 0,
+        );
+        yield* runtime.stop;
+      }
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("reapplies structured approval after restart and rejects a declined handler", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const peerFor = (handler: "host" | "ui") =>
+        testPeer(
+          (cmd, emit) =>
+            cmd.type === "negotiate_protocol"
+              ? answer(cmd, emit, { protocolVersion: 2 })
+              : cmd.type === "set_approval_handler"
+                ? answer(cmd, emit, { handler })
+                : basicHandler(cmd, emit),
+          { ...defaultReady, capabilities: ["rpc-ui", "tool_approval_request"] },
+        );
+      const first = yield* peerFor("host");
+      const second = yield* peerFor("host");
+      const declined = yield* peerFor("ui");
+      const peers = [first, second];
+      let launches = 0;
+      const runtime = yield* make(() => Effect.succeed(peers[launches++]!.handle));
+      yield* runtime.start;
+      yield* runtime.restart("runtime-mode-change");
+      NodeAssert.equal(launches, 2);
+      for (const peer of peers)
+        NodeAssert.equal(
+          peer.commands.filter((command) => command.type === "set_approval_handler").length,
+          1,
+        );
+      yield* runtime.stop;
+      const unsupported = yield* make(() => Effect.succeed(declined.handle));
+      const failure = yield* Effect.flip(unsupported.start);
+      NodeAssert.equal(failure.code, "startup");
+      NodeAssert.match(failure.message, /did not activate its host approval handler/);
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.live("interrupting a pending plan proposal refuses it without approval", () =>
   Effect.scoped(
     Effect.gen(function* () {

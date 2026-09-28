@@ -57,6 +57,7 @@ it.effect(
             name: "Luna",
             shortName: "gpt-6-luna",
             subProvider: "openai-codex",
+            quotaProvider: "openai-codex",
             isCustom: false,
             capabilities: {
               optionDescriptors: [

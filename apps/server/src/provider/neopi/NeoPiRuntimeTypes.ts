@@ -46,6 +46,7 @@ export type NeoPiRuntimeFrame = (
   | UiRequestFrame
   | HostToolCallFrame
   | HostToolCancelFrame
+  | { readonly type: "t3.plan.proposal.closed"; readonly id: string }
 ) & { readonly turnId?: TurnId };
 
 export interface NeoPiTurnInput {

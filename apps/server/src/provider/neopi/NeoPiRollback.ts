@@ -29,7 +29,7 @@ export async function rollbackNeoPiConversation(input: {
   );
   if (!target && removed.some((turn) => "kind" in turn && turn.kind === "continuation"))
     throw new NeoPiRollbackError(
-      "rollback unavailable for a plan refinement without its original native turn",
+      "rollback unavailable for a plan continuation without its original native turn",
     );
   if (!target) return { ...cursor, turnBoundaries: cursor.turnBoundaries.slice(0, -numTurns) };
   const { entries, leafId } = object(await request({ type: "get_entries" }));
@@ -159,7 +159,7 @@ export function groupNeoPiHistory(
     if (!("kind" in boundary) || boundary.kind !== "continuation") continue;
     const preceding = ancestry.findIndex((entry) => entry.id === boundary.afterEntryId);
     if (preceding < 0)
-      throw new NeoPiRollbackError("NeoPi/OMP plan refinement boundary left the active ancestry");
+      throw new NeoPiRollbackError("NeoPi/OMP plan continuation boundary left the active ancestry");
     const next = ancestry[preceding + 1];
     if (next && typeof next.id === "string") boundaries.set(next.id, boundary.turnId);
   }

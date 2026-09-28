@@ -220,6 +220,8 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       subagentState.set(session, subagents.state);
       const proposal = mapPlanProposal(ctx, frame, session.runtime.capabilities);
       if (proposal.proposal) session.pendingPlan = proposal.proposal;
+      if (data.type === "t3.plan.proposal.closed" && session.pendingPlan?.id === data.id)
+        delete session.pendingPlan;
       yield* publish([
         ...core.events,
         ...tools.events,
@@ -473,20 +475,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
           input.interactionMode === "default" &&
           prompt.images.length === 0 &&
           prompt.text === `PLEASE IMPLEMENT THIS PLAN:\n${session.pendingPlan.planMarkdown}`;
-        if (implement) {
-          yield* session.runtime
-            .resolvePlanProposal({ decision: "approve" })
-            .pipe(
-              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
-            );
-          delete session.pendingPlan;
-        } else if (input.interactionMode === "plan") {
-          yield* session.runtime
-            .resolvePlanProposal({ decision: "refine", feedback: prompt.text }, prompt)
-            .pipe(
-              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
-            );
-          delete session.pendingPlan;
+        if (implement || input.interactionMode === "plan") {
           session.activeTurnId = turnId;
           session.session = {
             ...session.session,
@@ -494,6 +483,25 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
             activeTurnId: turnId,
             updatedAt: DateTime.formatIso(yield* DateTime.now),
           };
+          yield* session.runtime
+            .resolvePlanProposal(
+              implement ? { decision: "approve" } : { decision: "refine", feedback: prompt.text },
+              prompt,
+            )
+            .pipe(
+              Effect.mapError((cause) => rpcError(input.threadId, "plan_proposal_response", cause)),
+              Effect.tapError(() =>
+                Effect.sync(() => {
+                  delete session.activeTurnId;
+                  session.session = {
+                    ...session.session,
+                    status: "ready",
+                    activeTurnId: undefined,
+                  };
+                }),
+              ),
+            );
+          delete session.pendingPlan;
           return {
             threadId: input.threadId,
             turnId,
@@ -687,6 +695,7 @@ export const makeNeoPiAdapter = Effect.fn("NeoPiAdapter.make")(function* (
       sessionModelSwitch: "in-session",
       promptlessTurnContinuation: false,
       supportsConversationRollback: true,
+      terminalResumeCursor: "ordered",
     },
     compaction: {
       type: "native",
