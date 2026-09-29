@@ -49,13 +49,15 @@ export interface ToolState {
 }
 
 /** Wire `toolSource` for T3-owned host tools. Key is the plan's `"t3-code"`. */
-export const T3_CODE_TOOL_SOURCE = {
+const T3_CODE_TOOL_SOURCE = {
   key: "t3-code",
   name: "T3 Code",
   kind: "integration",
 } as const satisfies ToolActivitySource;
 
 const FILE_CHANGE_TOOLS = new Set(["edit", "write", "delete", "move"]);
+const MAX_COMMAND_DISPLAY_CHARS = 2048;
+const OMITTED_COMMAND_OUTPUT = "[earlier output omitted]\n";
 
 export function emptyToolState(): ToolState {
   return {
@@ -72,10 +74,6 @@ export function withHostToolNames(state: ToolState, names: Iterable<string>): To
     if (name.length > 0) hostToolNames.add(name);
   }
   return hostToolNames.size === state.hostToolNames.size ? state : { ...state, hostToolNames };
-}
-
-export function inFlightToolList(state: ToolState): ReadonlyArray<InFlightTool> {
-  return Object.values(state.inFlightTools);
 }
 
 export function mapToolFrame(
@@ -330,6 +328,15 @@ function completedData(call: InFlightTool, result: unknown): unknown {
     // The completing result is authoritative, including when it replaces a tail window.
     const output = text !== undefined ? text : call.bashSnapshot;
     Object.assign(data, commandData(call, output, integerField(details?.exitCode)));
+    if (output) {
+      data.displayOutput =
+        output.length <= MAX_COMMAND_DISPLAY_CHARS
+          ? output
+          : OMITTED_COMMAND_OUTPUT +
+            Array.from(
+              output.slice(OMITTED_COMMAND_OUTPUT.length - MAX_COMMAND_DISPLAY_CHARS),
+            ).join("");
+    }
   } else if (diff !== undefined) {
     data.diff = diff;
     data.rawOutput = { content: diff };

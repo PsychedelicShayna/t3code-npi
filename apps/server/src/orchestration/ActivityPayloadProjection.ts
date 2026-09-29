@@ -21,6 +21,8 @@ function asTrimmedString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+const MAX_DISPLAY_OUTPUT_CHARS = 2048;
+
 function pushChangedFile(target: string[], seen: Set<string>, value: unknown): void {
   const normalized = asTrimmedString(value);
   if (!normalized || seen.has(normalized)) {
@@ -453,6 +455,15 @@ export function projectActivityPayload(
   }
 
   const projectedData: Record<string, unknown> = { ...questionInput };
+  // Providers may opt into a bounded expanded-row snippet without sending
+  // their full persisted tool output to every connected client.
+  const displayOutput = asTrimmedString(data.displayOutput);
+  if (displayOutput) {
+    projectedData.displayOutput =
+      displayOutput.length <= MAX_DISPLAY_OUTPUT_CHARS
+        ? displayOutput
+        : Array.from(displayOutput.slice(-MAX_DISPLAY_OUTPUT_CHARS)).join("");
+  }
   const item = projectCommandData(data);
   if (item) {
     projectedData.item = item;

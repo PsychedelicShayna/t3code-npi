@@ -70,6 +70,11 @@ The `.deb` updates itself like the other desktop builds. It asks for your
 password to install each update. If your desktop has no password prompt, the
 update fails. Download the new `.deb` and install it the same way.
 
+The [NeoPi-enabled Linux AppImage](https://github.com/PsychedelicShayna/t3code-npi/releases)
+includes `npi` and runs it without a separate installation. To use its terminal
+agent, run `./T3-Code-npi.AppImage --npi --help` (or replace `--help` with any
+`npi` arguments). Authenticate with `npi` before using accounts that require it.
+
 ### Windows Subsystem for Linux
 
 Choose a WSL distro in **Settings → Connections** to run agents and projects
@@ -111,19 +116,21 @@ and enable the provider you want. Installation, login, and configuration belong
 to that environment's machine, even when you connect from a phone or another
 computer.
 
-| Provider                        | Install and authenticate                                                                     |
-| ------------------------------- | -------------------------------------------------------------------------------------------- |
-| Codex                           | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.        |
-| Claude                          | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`. |
-| Cursor                          | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                        |
-| Grok Build                      | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                           |
-| OpenCode                        | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                     |
-| NeoPi/OMP (oh-my-pi compatible) | Install the NeoPi `npi` CLI or a compatible `omp` CLI; configure authentication in that CLI. |
-| Antigravity                     | Install and sign in with Google from T3 Code's provider settings.                            |
+| Provider                        | Install and authenticate                                                                                                                                    |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Codex                           | Install [Codex CLI](https://developers.openai.com/codex/cli), then run `codex login`.                                                                       |
+| Claude                          | Install [Claude Code](https://claude.com/product/claude-code), then run `claude auth login`.                                                                |
+| Cursor                          | Install [Cursor CLI](https://cursor.com/cli), then run `agent login`.                                                                                       |
+| Grok Build                      | Install [Grok Build CLI](https://x.ai/cli), then run `grok login`.                                                                                          |
+| OpenCode                        | Install [OpenCode](https://opencode.ai), then run `opencode auth login`.                                                                                    |
+| NeoPi/OMP (oh-my-pi compatible) | On Linux, the NeoPi-enabled AppImage includes `npi`; elsewhere install the NeoPi `npi` CLI or a compatible `omp` CLI. Configure authentication in that CLI. |
+| Antigravity                     | Install and sign in with Google from T3 Code's provider settings.                                                                                           |
 
-NeoPi/OMP uses `npi` on the server's PATH, or `omp` only if `npi` is not found.
-Set **Binary path** for a specific executable; a broken configured path never
-falls back to another installation. Set **Profile** to select an `OMP_PROFILE`.
+NeoPi/OMP prefers `npi` on the server's PATH, then the `npi` bundled with the
+NeoPi-enabled Linux desktop app, then `omp` on PATH. A PATH `npi` overrides the
+bundled one. Set **Binary path** for a specific executable; a broken configured
+path never falls back to another installation. Set **Profile** to select an
+`OMP_PROFILE`.
 T3 reads OAuth login status but cannot log you in; API-key and local models can
 work even when the card reports authentication as unknown. Model, thinking level,
 and fast mode are selected in the composer when the CLI advertises them. NeoPi

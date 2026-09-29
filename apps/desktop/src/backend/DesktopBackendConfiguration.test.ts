@@ -112,6 +112,7 @@ const withHarness = <A, E, R>(
     | FileSystem.FileSystem
     | DesktopBackendConfiguration.DesktopBackendConfiguration
   >,
+  environmentOptions?: Parameters<typeof makeEnvironmentLayer>[1],
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -126,7 +127,7 @@ const withHarness = <A, E, R>(
           Layer.provideMerge(DesktopAppSettings.layerTest()),
           Layer.provideMerge(DesktopWslEnvironment.layerTest()),
           Layer.provideMerge(DesktopWslServerTree.layerTest()),
-          Layer.provideMerge(makeEnvironmentLayer(baseDir)),
+          Layer.provideMerge(makeEnvironmentLayer(baseDir, environmentOptions)),
         ),
       ),
     );
@@ -259,6 +260,28 @@ describe("DesktopBackendConfiguration", () => {
         assert.equal(second.bootstrap.desktopBootstrapToken, first.bootstrap.desktopBootstrapToken);
       }),
     ),
+  );
+
+  it.effect("provides packaged Linux resources to the server without affecting other builds", () =>
+    Effect.gen(function* () {
+      const packaged = yield* withHarness(
+        Effect.gen(function* () {
+          const config = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+          return yield* config.resolvePrimary;
+        }),
+        { platform: "linux", resourcesPath: "/packaged/resources" },
+      );
+      assert.equal(packaged.env.T3CODE_DESKTOP_RESOURCES_PATH, "/packaged/resources");
+
+      const development = yield* withHarness(
+        Effect.gen(function* () {
+          const config = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
+          return yield* config.resolvePrimary;
+        }),
+        { platform: "linux", isPackaged: false },
+      );
+      assert.isUndefined(development.env.T3CODE_DESKTOP_RESOURCES_PATH);
+    }),
   );
 
   it.effect("resolvePrimary starts from server.asar without materializing the WSL tree", () =>

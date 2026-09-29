@@ -440,6 +440,18 @@ export class ResourceMonitorBuildOutputMissingError extends Schema.TaggedError<R
   }
 }
 
+export class NpiBundleSourceInvalidError extends Schema.TaggedError<NpiBundleSourceInvalidError>()(
+  "NpiBundleSourceInvalidError",
+  {
+    sourcePath: Schema.String,
+    reason: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `T3CODE_NPI_BUNDLE_SOURCE (${this.sourcePath}) must be a readable executable file: ${this.reason}`;
+  }
+}
+
 const desktopIconPlatformNames = {
   mac: "macOS",
   linux: "Linux",
@@ -919,6 +931,7 @@ interface ResolvedBuildOptions {
   readonly mockUpdates: boolean;
   readonly mockUpdateServerPort: number | undefined;
   readonly wslRuntime: string | undefined;
+  readonly npiBundleSource: string | undefined;
 }
 
 interface StagePackageJson {
@@ -1060,6 +1073,16 @@ export const bundlesWslRuntime = (input: {
   readonly platform: typeof BuildPlatform.Type;
   readonly runtimeArchivePath: string | undefined;
 }): boolean => input.platform === "win" && input.runtimeArchivePath !== undefined;
+
+export const bundlesNpi = (input: {
+  readonly platform: typeof BuildPlatform.Type;
+  readonly sourcePath: string | undefined;
+}): boolean => input.platform === "linux" && input.sourcePath !== undefined;
+
+export const NPI_BUNDLE_EXTRA_RESOURCE = {
+  from: "apps/desktop/prod-resources/bin/npi",
+  to: "bin/npi",
+} as const;
 
 export const WSL_RUNTIME_EXTRA_RESOURCES = [
   WSL_RUNTIME_ARCHIVE_EXTRA_RESOURCE,
@@ -1554,6 +1577,8 @@ const BuildEnvConfig = Config.all({
   // by the build_linux_cli CI job. The Windows build embeds it verbatim as the
   // WSL runtime.
   wslRuntime: Config.String("T3CODE_DESKTOP_WSL_RUNTIME").pipe(Config.option),
+  // Optional portable Linux npi executable supplied by the release build.
+  npiBundleSource: Config.String("T3CODE_NPI_BUNDLE_SOURCE").pipe(Config.option),
 });
 
 const MockUpdateServerPortSchema = Schema.NumberFromString.check(
@@ -1661,6 +1686,7 @@ export const resolveBuildOptions = Effect.fn("resolveBuildOptions")(function* (
     mockUpdates,
     mockUpdateServerPort,
     wslRuntime,
+    npiBundleSource: Option.getOrUndefined(env.npiBundleSource),
   } satisfies ResolvedBuildOptions;
 });
 
@@ -2637,6 +2663,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   // source file was never written fails the electron-builder step.
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
+  npiBundled = false,
 ) {
   const buildConfig: Record<string, unknown> = {
     appId: DESKTOP_APP_ID,
@@ -2664,6 +2691,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       ...DESKTOP_EXTRA_RESOURCES,
       ...(platform === "linux" ? LINUX_CAPTURE_EXTRA_RESOURCES : []),
       ...(platform === "linux" ? LINUX_BROWSER_SECRET_EXTRA_RESOURCES : []),
+      ...(platform === "linux" && npiBundled ? [NPI_BUNDLE_EXTRA_RESOURCE] : []),
       ...(platform === "win" ? WINDOWS_SERVER_EXTRA_RESOURCES : []),
       ...(platform === "win" && wslRuntimeBundled ? WSL_RUNTIME_EXTRA_RESOURCES : []),
     ],
@@ -2821,6 +2849,33 @@ const assertPlatformBuildResources = Effect.fn("assertPlatformBuildResources")(f
   if (platform === "win") {
     yield* stageWindowsIcons(stageResourcesDir, iconAssets.windowsIconIco);
   }
+});
+
+export const stageNpiBundle = Effect.fn("stageNpiBundle")(function* (input: {
+  readonly sourcePath: string;
+  readonly destinationPath: string;
+}) {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const stat = yield* fs.stat(input.sourcePath).pipe(Effect.orElseSucceed(() => null));
+  if (stat?.type !== "File" || (stat.mode & 0o111) === 0) {
+    return yield* new NpiBundleSourceInvalidError({
+      sourcePath: input.sourcePath,
+      reason:
+        stat?.type !== "File" ? "file is missing or not a regular file" : "file is not executable",
+    });
+  }
+  yield* Effect.tryPromise({
+    try: () => NodeFSP.access(input.sourcePath, NodeFSP.constants.R_OK | NodeFSP.constants.X_OK),
+    catch: (cause) =>
+      new NpiBundleSourceInvalidError({
+        sourcePath: input.sourcePath,
+        reason: `cannot read or execute file (${String(cause)})`,
+      }),
+  });
+  yield* fs.makeDirectory(path.dirname(input.destinationPath), { recursive: true });
+  yield* fs.copyFile(input.sourcePath, input.destinationPath);
+  yield* fs.chmod(input.destinationPath, stat.mode & 0o777);
 });
 
 // Copy the Linux CLI release archive into the stage verbatim and record its
@@ -3611,6 +3666,12 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   // electron-builder is filtering out stageResourcesDir directory in the AppImage for production
   const stageProdResourcesDir = path.join(stageAppDir, "apps/desktop/prod-resources");
   yield* fs.copy(stageResourcesDir, stageProdResourcesDir);
+  if (bundlesNpi({ platform: options.platform, sourcePath: options.npiBundleSource })) {
+    yield* stageNpiBundle({
+      sourcePath: options.npiBundleSource!,
+      destinationPath: path.join(stageAppDir, NPI_BUNDLE_EXTRA_RESOURCE.from),
+    });
+  }
 
   const configuredMacPasskeySigning =
     options.platform === "mac" && options.signed
@@ -3689,6 +3750,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
         : undefined,
       bundlesWslRuntime({ platform: options.platform, runtimeArchivePath: options.wslRuntime }),
       options.arch,
+      bundlesNpi({ platform: options.platform, sourcePath: options.npiBundleSource }),
     ),
     dependencies: stageDependencies,
     devDependencies: {
